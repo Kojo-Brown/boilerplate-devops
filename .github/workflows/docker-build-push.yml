@@ -1,0 +1,52 @@
+name: Docker Build & Push to ECR
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        required: true
+        type: string
+      aws-region:
+        type: string
+        default: us-east-1
+      dockerfile:
+        type: string
+        default: Dockerfile
+    secrets:
+      AWS_ROLE_ARN:
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    outputs:
+      image-uri: ${{ steps.build.outputs.image-uri }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push
+        id: build
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE: ${{ inputs.image-name }}
+          SHA: ${{ github.sha }}
+        run: |
+          IMAGE_URI="$REGISTRY/$IMAGE:$SHA"
+          docker build -f ${{ inputs.dockerfile }} -t "$IMAGE_URI" -t "$REGISTRY/$IMAGE:latest" .
+          docker push "$IMAGE_URI"
+          docker push "$REGISTRY/$IMAGE:latest"
+          echo "image-uri=$IMAGE_URI" >> $GITHUB_OUTPUT

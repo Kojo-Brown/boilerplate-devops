@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        type: string
+        default: "22"
+      package-manager:
+        type: string
+        default: "pnpm"
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        if: inputs.package-manager == 'pnpm'
+        with:
+          version: latest
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+
+      - name: Install
+        run: ${{ inputs.package-manager }} install --frozen-lockfile
+
+      - name: Typecheck
+        run: ${{ inputs.package-manager }} typecheck
+
+      - name: Lint
+        run: ${{ inputs.package-manager }} lint
+
+      - name: Test
+        run: ${{ inputs.package-manager }} test
+
+      - name: Build
+        run: ${{ inputs.package-manager }} build
