@@ -10,7 +10,7 @@
 - [x] Dependabot config for npm + Docker + GitHub Actions
 
 ## Phase 2 — AWS Infrastructure (CDK / CloudFormation)
-- [ ] VPC with public + private subnets, NAT Gateway
+- [x] VPC with public + private subnets, NAT Gateway
 - [ ] ECS Fargate service + ALB + HTTPS (ACM)
 - [ ] RDS PostgreSQL (Multi-AZ) + Secrets Manager rotation
 - [ ] ElastiCache Redis cluster
