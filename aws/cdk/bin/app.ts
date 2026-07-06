@@ -3,6 +3,7 @@ import 'source-map-support/register';
 import * as cdk from 'aws-cdk-lib';
 import { VpcStack } from '../lib/vpc-stack';
 import { EcsStack } from '../lib/ecs-stack';
+import { RdsStack } from '../lib/rds-stack';
 
 const app = new cdk.App();
 
@@ -34,7 +35,7 @@ const vpcStackStaging = new VpcStack(app, 'VpcStack-Staging', {
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
 
-new EcsStack(app, 'EcsStack-Staging', {
+const ecsStackStaging = new EcsStack(app, 'EcsStack-Staging', {
   vpc: vpcStackStaging.vpc,
   envName: 'staging',
   certificateArn: stagingCertArn,
@@ -48,6 +49,21 @@ new EcsStack(app, 'EcsStack-Staging', {
     region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
   },
   description: 'Staging ECS Fargate service + ALB + HTTPS',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+new RdsStack(app, 'RdsStack-Staging', {
+  vpc: vpcStackStaging.vpc,
+  envName: 'staging',
+  multiAz: false, // single-AZ for cost-optimised staging
+  allocatedStorageGiB: 20,
+  maxAllocatedStorageGiB: 100,
+  allowedSecurityGroups: [ecsStackStaging.taskSecurityGroup],
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Staging RDS PostgreSQL (single-AZ) + Secrets Manager rotation',
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
 
@@ -65,7 +81,7 @@ const vpcStackProduction = new VpcStack(app, 'VpcStack-Production', {
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
 
-new EcsStack(app, 'EcsStack-Production', {
+const ecsStackProduction = new EcsStack(app, 'EcsStack-Production', {
   vpc: vpcStackProduction.vpc,
   envName: 'production',
   certificateArn: productionCertArn,
@@ -79,5 +95,20 @@ new EcsStack(app, 'EcsStack-Production', {
     region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
   },
   description: 'Production ECS Fargate service + ALB + HTTPS (deletion-protected)',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+new RdsStack(app, 'RdsStack-Production', {
+  vpc: vpcStackProduction.vpc,
+  envName: 'production',
+  multiAz: true, // Multi-AZ standby for production HA
+  allocatedStorageGiB: 100,
+  maxAllocatedStorageGiB: 500,
+  allowedSecurityGroups: [ecsStackProduction.taskSecurityGroup],
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Production RDS PostgreSQL (Multi-AZ) + Secrets Manager rotation',
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });

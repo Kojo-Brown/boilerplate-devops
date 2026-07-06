@@ -52,6 +52,8 @@ export class EcsStack extends cdk.Stack {
   public readonly alb: elbv2.ApplicationLoadBalancer;
   public readonly httpsListener: elbv2.ApplicationListener;
   public readonly targetGroup: elbv2.ApplicationTargetGroup;
+  /** Security group attached to Fargate tasks — pass to RdsStack.allowedSecurityGroups */
+  public readonly taskSecurityGroup: ec2.SecurityGroup;
 
   constructor(scope: Construct, id: string, props: EcsStackProps) {
     super(scope, id, props);
@@ -159,12 +161,13 @@ export class EcsStack extends cdk.Stack {
     albSg.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.tcp(443), 'HTTPS from internet');
     albSg.addIngressRule(ec2.Peer.anyIpv6(), ec2.Port.tcp(443), 'HTTPS from internet IPv6');
 
-    const taskSg = new ec2.SecurityGroup(this, 'TaskSecurityGroup', {
+    this.taskSecurityGroup = new ec2.SecurityGroup(this, 'TaskSecurityGroup', {
       securityGroupName: `${envName}-ecs-task-sg`,
       vpc: props.vpc,
       description: 'ECS Fargate tasks: allow inbound from ALB on container port',
       allowAllOutbound: true,
     });
+    const taskSg = this.taskSecurityGroup;
     taskSg.addIngressRule(
       albSg,
       ec2.Port.tcp(containerPort),
