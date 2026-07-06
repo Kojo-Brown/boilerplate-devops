@@ -12,7 +12,7 @@
 ## Phase 2 — AWS Infrastructure (CDK / CloudFormation)
 - [x] VPC with public + private subnets, NAT Gateway
 - [x] ECS Fargate service + ALB + HTTPS (ACM)
-- [ ] RDS PostgreSQL (Multi-AZ) + Secrets Manager rotation
+- [x] RDS PostgreSQL (Multi-AZ) + Secrets Manager rotation
 - [ ] ElastiCache Redis cluster
 - [ ] ECR repository with lifecycle policy
 
