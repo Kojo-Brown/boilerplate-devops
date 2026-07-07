@@ -5,6 +5,7 @@ import { VpcStack } from '../lib/vpc-stack';
 import { EcsStack } from '../lib/ecs-stack';
 import { RdsStack } from '../lib/rds-stack';
 import { ElastiCacheStack } from '../lib/elasticache-stack';
+import { EcrStack } from '../lib/ecr-stack';
 
 const app = new cdk.App();
 
@@ -21,6 +22,33 @@ const productionCertArn =
   (app.node.tryGetContext('productionCertificateArn') as string | undefined) ??
   process.env.PRODUCTION_ACM_CERTIFICATE_ARN ??
   'arn:aws:acm:REGION:ACCOUNT:certificate/REPLACE-ME-PRODUCTION';
+
+// ── ECR (shared; repositories exist once per AWS account, not per environment) ─
+new EcrStack(app, 'EcrStack-Staging', {
+  envName: 'staging',
+  repositoryName: 'staging-app',
+  maxTaggedImageCount: 20,
+  untaggedImageExpiryDays: 7,
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Staging ECR repository with lifecycle policy',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+new EcrStack(app, 'EcrStack-Production', {
+  envName: 'production',
+  repositoryName: 'production-app',
+  maxTaggedImageCount: 30,
+  untaggedImageExpiryDays: 7,
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Production ECR repository with lifecycle policy (images retained)',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
 
 // ── Staging ───────────────────────────────────────────────────────────────────
 const vpcStackStaging = new VpcStack(app, 'VpcStack-Staging', {
