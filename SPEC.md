@@ -14,7 +14,7 @@
 - [x] ECS Fargate service + ALB + HTTPS (ACM)
 - [x] RDS PostgreSQL (Multi-AZ) + Secrets Manager rotation
 - [x] ElastiCache Redis cluster
-- [ ] ECR repository with lifecycle policy
+- [x] ECR repository with lifecycle policy
 
 ## Phase 3 — Secrets & Config
 - [ ] AWS Secrets Manager integration pattern
