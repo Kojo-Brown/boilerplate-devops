@@ -4,6 +4,7 @@ import * as cdk from 'aws-cdk-lib';
 import { VpcStack } from '../lib/vpc-stack';
 import { EcsStack } from '../lib/ecs-stack';
 import { RdsStack } from '../lib/rds-stack';
+import { ElastiCacheStack } from '../lib/elasticache-stack';
 
 const app = new cdk.App();
 
@@ -67,6 +68,21 @@ new RdsStack(app, 'RdsStack-Staging', {
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
 
+new ElastiCacheStack(app, 'ElastiCacheStack-Staging', {
+  vpc: vpcStackStaging.vpc,
+  envName: 'staging',
+  // Single node (no replicas) for cost-optimised staging
+  numReadReplicas: 0,
+  cacheNodeType: 'cache.t3.micro',
+  allowedSecurityGroups: [ecsStackStaging.taskSecurityGroup],
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Staging ElastiCache Redis (single-node)',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
 // ── Production ────────────────────────────────────────────────────────────────
 const vpcStackProduction = new VpcStack(app, 'VpcStack-Production', {
   envName: 'production',
@@ -110,5 +126,20 @@ new RdsStack(app, 'RdsStack-Production', {
     region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
   },
   description: 'Production RDS PostgreSQL (Multi-AZ) + Secrets Manager rotation',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+new ElastiCacheStack(app, 'ElastiCacheStack-Production', {
+  vpc: vpcStackProduction.vpc,
+  envName: 'production',
+  // 1 replica → Multi-AZ automatic failover in ~20 s
+  numReadReplicas: 1,
+  cacheNodeType: 'cache.t3.small',
+  allowedSecurityGroups: [ecsStackProduction.taskSecurityGroup],
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Production ElastiCache Redis (Multi-AZ, 1 replica)',
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
