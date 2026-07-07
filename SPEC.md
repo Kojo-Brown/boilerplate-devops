@@ -13,7 +13,7 @@
 - [x] VPC with public + private subnets, NAT Gateway
 - [x] ECS Fargate service + ALB + HTTPS (ACM)
 - [x] RDS PostgreSQL (Multi-AZ) + Secrets Manager rotation
-- [ ] ElastiCache Redis cluster
+- [x] ElastiCache Redis cluster
 - [ ] ECR repository with lifecycle policy
 
 ## Phase 3 — Secrets & Config
