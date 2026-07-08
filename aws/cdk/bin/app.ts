@@ -6,6 +6,7 @@ import { EcsStack } from '../lib/ecs-stack';
 import { RdsStack } from '../lib/rds-stack';
 import { ElastiCacheStack } from '../lib/elasticache-stack';
 import { EcrStack } from '../lib/ecr-stack';
+import { SecretsManagerStack } from '../lib/secrets-manager-stack';
 
 const app = new cdk.App();
 
@@ -47,6 +48,62 @@ new EcrStack(app, 'EcrStack-Production', {
     region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
   },
   description: 'Production ECR repository with lifecycle policy (images retained)',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+// ── Secrets Manager ───────────────────────────────────────────────────────────
+// Manages application-level secrets (API keys, OAuth tokens, etc.) separate from
+// the database credentials that live in RdsStack.  Deploy this stack first, then
+// populate secret values via the AWS Console or CLI before deploying ECS tasks.
+//
+// After deployment, grant ECS task roles access:
+//   secretsStackStaging.grantRead(ecsTaskDef.executionRole)
+//   taskDef.addContainer('App', {
+//     secrets: secretsStackStaging.toEcsSecrets(['stripe-api-key']),
+//   });
+
+const commonSecrets = [
+  {
+    key: 'stripe-api-key',
+    description: 'Stripe secret key for payment processing',
+  },
+  {
+    key: 'sendgrid-api-key',
+    description: 'SendGrid API key for transactional email',
+  },
+  {
+    key: 'jwt-signing-secret',
+    description: 'HMAC secret for signing JWTs',
+    generateRandomPassword: true,
+    passwordLength: 64,
+  },
+  {
+    key: 'oauth-client-secret',
+    description: 'OAuth 2.0 client secret for third-party SSO',
+  },
+];
+
+new SecretsManagerStack(app, 'SecretsManagerStack-Staging', {
+  envName: 'staging',
+  secrets: commonSecrets,
+  enableKmsEncryption: true,
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Staging application secrets — KMS encrypted, REPLACE_ME placeholders',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+new SecretsManagerStack(app, 'SecretsManagerStack-Production', {
+  envName: 'production',
+  secrets: commonSecrets,
+  enableKmsEncryption: true,
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Production application secrets — KMS encrypted, retention enabled',
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
 
