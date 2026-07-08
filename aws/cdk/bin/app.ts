@@ -7,6 +7,7 @@ import { RdsStack } from '../lib/rds-stack';
 import { ElastiCacheStack } from '../lib/elasticache-stack';
 import { EcrStack } from '../lib/ecr-stack';
 import { SecretsManagerStack } from '../lib/secrets-manager-stack';
+import { ParameterStoreStack } from '../lib/parameter-store-stack';
 
 const app = new cdk.App();
 
@@ -104,6 +105,75 @@ new SecretsManagerStack(app, 'SecretsManagerStack-Production', {
     region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
   },
   description: 'Production application secrets — KMS encrypted, retention enabled',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+// ── Parameter Store ───────────────────────────────────────────────────────────
+// Runtime configuration values (non-secret) stored under /app/{env}/{key}.
+// Deploy before ECS tasks; populate real values via the AWS Console or CLI.
+// Grant task roles access: paramStoreStaging.grantRead(ecsTaskDef.taskRole)
+//
+// Load all parameters at runtime:
+//   aws ssm get-parameters-by-path \
+//     --path /app/staging/ \
+//     --with-decryption \
+//     --recursive
+
+const commonParameters = [
+  {
+    key: 'log-level',
+    description: 'Application log level (error | warn | info | debug)',
+    value: 'info',
+  },
+  {
+    key: 'api-endpoint',
+    description: 'Base URL for the internal API service',
+    value: 'https://api.example.com',
+  },
+  {
+    key: 'db-pool-size',
+    description: 'PostgreSQL connection pool size',
+    value: '10',
+  },
+  {
+    key: 'cache-ttl-seconds',
+    description: 'Default Redis cache TTL in seconds',
+    value: '300',
+  },
+  {
+    key: 'allowed-origins',
+    description: 'Comma-separated CORS allowed origins',
+    type: 'StringList' as const,
+    value: 'https://app.example.com,https://admin.example.com',
+  },
+  {
+    key: 'feature/dark-mode',
+    description: 'Feature flag: enable dark mode UI',
+    value: 'false',
+  },
+];
+
+new ParameterStoreStack(app, 'ParameterStoreStack-Staging', {
+  envName: 'staging',
+  parameters: commonParameters,
+  enableKmsEncryption: true,
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Staging SSM Parameter Store hierarchy — /app/staging/* with KMS encryption',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+new ParameterStoreStack(app, 'ParameterStoreStack-Production', {
+  envName: 'production',
+  parameters: commonParameters,
+  enableKmsEncryption: true,
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Production SSM Parameter Store hierarchy — /app/production/* with KMS encryption',
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
 
