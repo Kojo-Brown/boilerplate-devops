@@ -17,7 +17,7 @@
 - [x] ECR repository with lifecycle policy
 
 ## Phase 3 — Secrets & Config
-- [ ] AWS Secrets Manager integration pattern
+- [x] AWS Secrets Manager integration pattern
 - [ ] Parameter Store hierarchy: `/app/{env}/{key}`
 - [ ] OIDC GitHub → AWS role assumption (no long-lived keys)
 - [ ] Secret scanning workflow (trufflehog)
