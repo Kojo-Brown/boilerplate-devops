@@ -18,7 +18,7 @@
 
 ## Phase 3 — Secrets & Config
 - [x] AWS Secrets Manager integration pattern
-- [ ] Parameter Store hierarchy: `/app/{env}/{key}`
+- [x] Parameter Store hierarchy: `/app/{env}/{key}`
 - [ ] OIDC GitHub → AWS role assumption (no long-lived keys)
 - [ ] Secret scanning workflow (trufflehog)
 
