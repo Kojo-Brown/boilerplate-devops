@@ -20,7 +20,7 @@
 - [x] AWS Secrets Manager integration pattern
 - [x] Parameter Store hierarchy: `/app/{env}/{key}`
 - [x] OIDC GitHub → AWS role assumption (no long-lived keys)
-- [ ] Secret scanning workflow (trufflehog)
+- [x] Secret scanning workflow (trufflehog)
 
 ## Phase 4 — Monitoring
 - [ ] CloudWatch dashboard: ECS CPU/memory, ALB 5xx, RDS connections
