@@ -8,6 +8,7 @@ import { ElastiCacheStack } from '../lib/elasticache-stack';
 import { EcrStack } from '../lib/ecr-stack';
 import { SecretsManagerStack } from '../lib/secrets-manager-stack';
 import { ParameterStoreStack } from '../lib/parameter-store-stack';
+import { GitHubOidcStack } from '../lib/github-oidc-stack';
 
 const app = new cdk.App();
 
@@ -49,6 +50,38 @@ new EcrStack(app, 'EcrStack-Production', {
     region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
   },
   description: 'Production ECR repository with lifecycle policy (images retained)',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+// ── GitHub OIDC ───────────────────────────────────────────────────────────────
+// Provisions a GitHub Actions OIDC identity provider and scoped IAM roles.
+// Deploy once per environment; one OIDC provider is shared across all stacks.
+// Replace YOUR_ORG/YOUR_REPO with your actual GitHub organisation and repo.
+//
+// After deployment, add the CloudFormation outputs to GitHub Secrets:
+//   STAGING_CI_ROLE_ARN     ← GitHubOidcStack-Staging.CIRoleArn
+//   STAGING_DEPLOY_ROLE_ARN ← GitHubOidcStack-Staging.DeployRoleArn
+//   PROD_DEPLOY_ROLE_ARN    ← GitHubOidcStack-Production.DeployRoleArn
+
+new GitHubOidcStack(app, 'GitHubOidcStack-Staging', {
+  envName: 'staging',
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'GitHub Actions OIDC provider + IAM roles for staging (no long-lived keys)',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+new GitHubOidcStack(app, 'GitHubOidcStack-Production', {
+  envName: 'production',
+  createOidcProvider: false, // provider already created by the staging stack (one per account)
+  existingOidcProviderArn: `arn:aws:iam::${process.env.CDK_DEFAULT_ACCOUNT ?? 'ACCOUNT_ID'}:oidc-provider/token.actions.githubusercontent.com`,
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'GitHub Actions IAM roles for production (reuses staging OIDC provider)',
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
 

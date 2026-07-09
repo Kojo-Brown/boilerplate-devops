@@ -1,0 +1,183 @@
+name: Assume AWS Role via OIDC
+
+# Reusable workflow — authenticates to AWS using GitHub OIDC federation so that
+# no long-lived AWS access keys are stored in GitHub Secrets.
+#
+# GitHub issues a short-lived OIDC token to the running job.  AWS STS verifies
+# the token against the IAM OIDC identity provider and returns temporary
+# credentials scoped to the assumed role.
+#
+# Prerequisites (one-time setup per AWS account):
+#   1. Deploy the GitHubOidcStack CDK stack in aws/cdk/lib/github-oidc-stack.ts.
+#      It creates the IAM OIDC provider and the default CI/Deploy/ReadOnly roles.
+#
+#      cdk deploy GitHubOidcStack-Staging
+#      cdk deploy GitHubOidcStack-Production
+#
+#   2. Copy the CloudFormation outputs into GitHub Actions secrets:
+#      STAGING_CI_ROLE_ARN      ← GitHubOidcStack-Staging.CIRoleArn
+#      STAGING_DEPLOY_ROLE_ARN  ← GitHubOidcStack-Staging.DeployRoleArn
+#      PROD_DEPLOY_ROLE_ARN     ← GitHubOidcStack-Production.DeployRoleArn
+#
+#      aws cloudformation describe-stacks \
+#        --stack-name GitHubOidcStack-Staging \
+#        --query 'Stacks[0].Outputs'
+#
+# Usage example — caller workflow:
+#
+#   jobs:
+#     build:
+#       uses: ./.github/workflows/assume-role.yml
+#       with:
+#         role-to-assume: ${{ secrets.STAGING_CI_ROLE_ARN }}
+#         aws-region: us-east-1
+#         role-session-name: ci-build-${{ github.run_id }}
+#       secrets: inherit
+#
+# Trust policy on the IAM role controls which repos/branches/environments can
+# assume it — see github-oidc-stack.ts for the condition structure.
+
+on:
+  workflow_call:
+    inputs:
+      role-to-assume:
+        required: true
+        type: string
+        description: "IAM role ARN to assume via OIDC (from GitHubOidcStack CfnOutput)"
+      aws-region:
+        type: string
+        default: "us-east-1"
+        description: "AWS region for the STS call and subsequent API calls"
+      role-session-name:
+        type: string
+        default: "github-actions"
+        description: "STS session name — visible in CloudTrail for auditing"
+      role-duration-seconds:
+        type: number
+        default: 3600
+        description: "Session duration in seconds (max set on the IAM role, default 3600)"
+    outputs:
+      aws-account-id:
+        description: "AWS account ID the role belongs to"
+        value: ${{ jobs.assume.outputs.aws-account-id }}
+      assumed-role-arn:
+        description: "Full ARN of the assumed role session"
+        value: ${{ jobs.assume.outputs.assumed-role-arn }}
+
+# id-token: write is required for OIDC token requests.
+# contents: read is required for actions/checkout if downstream jobs need source.
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  assume:
+    name: Verify OIDC role assumption
+    runs-on: ubuntu-latest
+    outputs:
+      aws-account-id: ${{ steps.identity.outputs.account-id }}
+      assumed-role-arn: ${{ steps.identity.outputs.assumed-role-arn }}
+
+    steps:
+      - name: Configure AWS credentials via OIDC
+        id: credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.role-to-assume }}
+          aws-region: ${{ inputs.aws-region }}
+          role-session-name: ${{ inputs.role-session-name }}
+          role-duration-seconds: ${{ inputs.role-duration-seconds }}
+
+      - name: Verify caller identity
+        id: identity
+        run: |
+          set -euo pipefail
+          IDENTITY=$(aws sts get-caller-identity --output json)
+
+          ACCOUNT_ID=$(echo "$IDENTITY" | python3 -c "import sys,json; print(json.load(sys.stdin)['Account'])")
+          ROLE_ARN=$(echo   "$IDENTITY" | python3 -c "import sys,json; print(json.load(sys.stdin)['Arn'])")
+
+          echo "account-id=$ACCOUNT_ID"     >> "$GITHUB_OUTPUT"
+          echo "assumed-role-arn=$ROLE_ARN" >> "$GITHUB_OUTPUT"
+
+          echo "✅ Assumed role: $ROLE_ARN"
+          echo "   Account    : $ACCOUNT_ID"
+          echo "   Region     : ${{ inputs.aws-region }}"
+          echo "   Session    : ${{ inputs.role-session-name }}"
+
+# ── Inline example workflows ───────────────────────────────────────────────────
+# Copy and adapt these snippets into your own caller workflows.
+
+# 1. CI workflow — assume the CI role on every pull request
+# ──────────────────────────────────────────────────────────
+#
+# name: CI
+# on:
+#   pull_request:
+#     branches: [main]
+#
+# jobs:
+#   ci:
+#     permissions:
+#       id-token: write
+#       contents: read
+#     runs-on: ubuntu-latest
+#     environment: staging          # must match the sub condition on the IAM role
+#     steps:
+#       - uses: actions/checkout@v4
+#
+#       - name: Configure AWS (OIDC)
+#         uses: aws-actions/configure-aws-credentials@v4
+#         with:
+#           role-to-assume: ${{ secrets.STAGING_CI_ROLE_ARN }}
+#           aws-region: us-east-1
+#           role-session-name: ci-${{ github.run_id }}
+#
+#       - run: pnpm install && pnpm test
+#
+# 2. Deploy workflow — assume the Deploy role on push to main
+# ────────────────────────────────────────────────────────────
+#
+# name: Deploy
+# on:
+#   push:
+#     branches: [main]
+#
+# jobs:
+#   deploy:
+#     permissions:
+#       id-token: write
+#       contents: read
+#     runs-on: ubuntu-latest
+#     environment: staging          # must match the sub condition on the IAM role
+#     steps:
+#       - uses: actions/checkout@v4
+#
+#       - name: Configure AWS (OIDC)
+#         uses: aws-actions/configure-aws-credentials@v4
+#         with:
+#           role-to-assume: ${{ secrets.STAGING_DEPLOY_ROLE_ARN }}
+#           aws-region: us-east-1
+#           role-session-name: deploy-${{ github.sha }}
+#           role-duration-seconds: 7200
+#
+#       - name: Login to ECR
+#         uses: aws-actions/amazon-ecr-login@v2
+#
+#       - name: Build and push image
+#         uses: ./.github/workflows/docker-build-push.yml
+#         with:
+#           image-name: my-app
+#           aws-region: us-east-1
+#         secrets:
+#           AWS_ROLE_ARN: ${{ secrets.STAGING_DEPLOY_ROLE_ARN }}
+#
+#       - name: Deploy to ECS
+#         uses: ./.github/workflows/deploy-ecs.yml
+#         with:
+#           service: my-app
+#           cluster: staging
+#           container: app
+#           image-uri: ${{ needs.build.outputs.image-uri }}
+#         secrets:
+#           AWS_ROLE_ARN: ${{ secrets.STAGING_DEPLOY_ROLE_ARN }}
