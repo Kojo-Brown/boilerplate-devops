@@ -10,6 +10,7 @@ import { SecretsManagerStack } from '../lib/secrets-manager-stack';
 import { ParameterStoreStack } from '../lib/parameter-store-stack';
 import { GitHubOidcStack } from '../lib/github-oidc-stack';
 import { CloudWatchDashboardStack } from '../lib/cloudwatch-dashboard-stack';
+import { CloudWatchAlarmsStack } from '../lib/cloudwatch-alarms-stack';
 
 const app = new cdk.App();
 
@@ -358,5 +359,59 @@ new CloudWatchDashboardStack(app, 'CloudWatchDashboardStack-Production', {
     region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
   },
   description: 'Production CloudWatch Dashboard — ECS CPU/memory, ALB 5xx, RDS connections',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+// ── CloudWatch Alarms → SNS → PagerDuty ─────────────────────────────────────
+// Each alarm publishes ALARM and OK events to an SNS topic.  Supply the
+// PagerDuty Events API v2 HTTPS endpoint via CDK context or environment
+// variable to wire up the SNS subscription automatically:
+//
+//   cdk deploy --context stagingPagerDutyUrl=https://events.pagerduty.com/integration/<key>/enqueue
+//   STAGING_PAGERDUTY_URL=https://...  cdk deploy
+//
+// Without a URL the SNS topic is created and its ARN is exported; wire the
+// subscription manually via the AWS Console, CLI, or a separate PagerDuty CDK construct.
+
+const stagingPagerDutyUrl =
+  (app.node.tryGetContext('stagingPagerDutyUrl') as string | undefined) ??
+  process.env.STAGING_PAGERDUTY_URL;
+
+const productionPagerDutyUrl =
+  (app.node.tryGetContext('productionPagerDutyUrl') as string | undefined) ??
+  process.env.PRODUCTION_PAGERDUTY_URL;
+
+new CloudWatchAlarmsStack(app, 'CloudWatchAlarmsStack-Staging', {
+  envName: 'staging',
+  clusterName: ecsStackStaging.cluster.clusterName,
+  serviceName: ecsStackStaging.service.serviceName,
+  albFullName: ecsStackStaging.alb.loadBalancerFullName,
+  rdsInstanceId: rdsStackStaging.instance.instanceIdentifier,
+  pagerDutyIntegrationUrl: stagingPagerDutyUrl,
+  // Relaxed thresholds for staging — alert earlier to catch regressions
+  ecsCpuThreshold: 70,
+  ecsMemoryThreshold: 70,
+  alb5xxThreshold: 5,
+  rdsConnectionsThreshold: 50,
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Staging CloudWatch Alarms → SNS → PagerDuty',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+new CloudWatchAlarmsStack(app, 'CloudWatchAlarmsStack-Production', {
+  envName: 'production',
+  clusterName: ecsStackProduction.cluster.clusterName,
+  serviceName: ecsStackProduction.service.serviceName,
+  albFullName: ecsStackProduction.alb.loadBalancerFullName,
+  rdsInstanceId: rdsStackProduction.instance.instanceIdentifier,
+  pagerDutyIntegrationUrl: productionPagerDutyUrl,
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Production CloudWatch Alarms → SNS → PagerDuty',
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
