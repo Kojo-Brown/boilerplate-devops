@@ -9,6 +9,7 @@ import { EcrStack } from '../lib/ecr-stack';
 import { SecretsManagerStack } from '../lib/secrets-manager-stack';
 import { ParameterStoreStack } from '../lib/parameter-store-stack';
 import { GitHubOidcStack } from '../lib/github-oidc-stack';
+import { CloudWatchDashboardStack } from '../lib/cloudwatch-dashboard-stack';
 
 const app = new cdk.App();
 
@@ -241,7 +242,7 @@ const ecsStackStaging = new EcsStack(app, 'EcsStack-Staging', {
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
 
-new RdsStack(app, 'RdsStack-Staging', {
+const rdsStackStaging = new RdsStack(app, 'RdsStack-Staging', {
   vpc: vpcStackStaging.vpc,
   envName: 'staging',
   multiAz: false, // single-AZ for cost-optimised staging
@@ -268,6 +269,20 @@ new ElastiCacheStack(app, 'ElastiCacheStack-Staging', {
     region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
   },
   description: 'Staging ElastiCache Redis (single-node)',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+new CloudWatchDashboardStack(app, 'CloudWatchDashboardStack-Staging', {
+  envName: 'staging',
+  clusterName: ecsStackStaging.cluster.clusterName,
+  serviceName: ecsStackStaging.service.serviceName,
+  albFullName: ecsStackStaging.alb.loadBalancerFullName,
+  rdsInstanceId: rdsStackStaging.instance.instanceIdentifier,
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Staging CloudWatch Dashboard — ECS CPU/memory, ALB 5xx, RDS connections',
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
 
@@ -302,7 +317,7 @@ const ecsStackProduction = new EcsStack(app, 'EcsStack-Production', {
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
 
-new RdsStack(app, 'RdsStack-Production', {
+const rdsStackProduction = new RdsStack(app, 'RdsStack-Production', {
   vpc: vpcStackProduction.vpc,
   envName: 'production',
   multiAz: true, // Multi-AZ standby for production HA
@@ -329,5 +344,19 @@ new ElastiCacheStack(app, 'ElastiCacheStack-Production', {
     region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
   },
   description: 'Production ElastiCache Redis (Multi-AZ, 1 replica)',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+new CloudWatchDashboardStack(app, 'CloudWatchDashboardStack-Production', {
+  envName: 'production',
+  clusterName: ecsStackProduction.cluster.clusterName,
+  serviceName: ecsStackProduction.service.serviceName,
+  albFullName: ecsStackProduction.alb.loadBalancerFullName,
+  rdsInstanceId: rdsStackProduction.instance.instanceIdentifier,
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Production CloudWatch Dashboard — ECS CPU/memory, ALB 5xx, RDS connections',
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
