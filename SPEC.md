@@ -23,7 +23,7 @@
 - [x] Secret scanning workflow (trufflehog)
 
 ## Phase 4 — Monitoring
-- [ ] CloudWatch dashboard: ECS CPU/memory, ALB 5xx, RDS connections
+- [x] CloudWatch dashboard: ECS CPU/memory, ALB 5xx, RDS connections
 - [ ] CloudWatch Alarms → SNS → PagerDuty
 - [ ] X-Ray tracing integration (Express + FastAPI)
 - [ ] Log Insights queries for error analysis
