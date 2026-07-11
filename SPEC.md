@@ -26,7 +26,7 @@
 - [x] CloudWatch dashboard: ECS CPU/memory, ALB 5xx, RDS connections
 - [x] CloudWatch Alarms → SNS → PagerDuty
 - [x] X-Ray tracing integration (Express + FastAPI)
-- [ ] Log Insights queries for error analysis
+- [x] Log Insights queries for error analysis
 
 ## Phase 5 — Advanced Deployment
 - [ ] Blue/green deployment via ECS with CodeDeploy

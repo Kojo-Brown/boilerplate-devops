@@ -11,6 +11,7 @@ import { ParameterStoreStack } from '../lib/parameter-store-stack';
 import { GitHubOidcStack } from '../lib/github-oidc-stack';
 import { CloudWatchDashboardStack } from '../lib/cloudwatch-dashboard-stack';
 import { CloudWatchAlarmsStack } from '../lib/cloudwatch-alarms-stack';
+import { LogInsightsStack } from '../lib/log-insights-stack';
 
 const app = new cdk.App();
 
@@ -413,5 +414,43 @@ new CloudWatchAlarmsStack(app, 'CloudWatchAlarmsStack-Production', {
     region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
   },
   description: 'Production CloudWatch Alarms → SNS → PagerDuty',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+// ── CloudWatch Logs Insights saved queries ────────────────────────────────────
+// Pre-built error-analysis queries visible in the CloudWatch console under
+// "Saved queries".  Supply accessLogGroupName / rdsLogGroupName to enable the
+// access-log and RDS query groups automatically.
+//
+// Log group naming conventions:
+//   app    /ecs/{envName}/{serviceName}      (awslogs driver default)
+//   access /aws/elasticloadbalancing/{albName}  (ALB → Firehose → CW Logs)
+//   rds    /aws/rds/instance/{id}/postgresql (enabled in RDS Parameter Group)
+
+new LogInsightsStack(app, 'LogInsightsStack-Staging', {
+  envName: 'staging',
+  appLogGroupName: `/ecs/staging/${ecsStackStaging.service.serviceName}`,
+  accessLogGroupName: process.env.STAGING_ACCESS_LOG_GROUP,
+  rdsLogGroupName: `/aws/rds/instance/${rdsStackStaging.instance.instanceIdentifier}/postgresql`,
+  slowRequestThresholdSeconds: 1.0,
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Staging CloudWatch Logs Insights saved queries for error analysis',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+new LogInsightsStack(app, 'LogInsightsStack-Production', {
+  envName: 'production',
+  appLogGroupName: `/ecs/production/${ecsStackProduction.service.serviceName}`,
+  accessLogGroupName: process.env.PRODUCTION_ACCESS_LOG_GROUP,
+  rdsLogGroupName: `/aws/rds/instance/${rdsStackProduction.instance.instanceIdentifier}/postgresql`,
+  slowRequestThresholdSeconds: 1.0,
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Production CloudWatch Logs Insights saved queries for error analysis',
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
