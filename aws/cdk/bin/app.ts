@@ -12,6 +12,7 @@ import { GitHubOidcStack } from '../lib/github-oidc-stack';
 import { CloudWatchDashboardStack } from '../lib/cloudwatch-dashboard-stack';
 import { CloudWatchAlarmsStack } from '../lib/cloudwatch-alarms-stack';
 import { LogInsightsStack } from '../lib/log-insights-stack';
+import { BlueGreenDeployStack } from '../lib/blue-green-deploy-stack';
 
 const app = new cdk.App();
 
@@ -452,5 +453,59 @@ new LogInsightsStack(app, 'LogInsightsStack-Production', {
     region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
   },
   description: 'Production CloudWatch Logs Insights saved queries for error analysis',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+// ── Blue/Green Deployment via CodeDeploy ──────────────────────────────────────
+// Separate ECS service (CODE_DEPLOY controller) with two ALB target groups and
+// listeners.  Shift traffic gradually with Linear/Canary config; auto-rollback on
+// ALB 5xx alarm.  Use workflow-templates/blue-green-deploy.yml in CI/CD.
+//
+// Outputs after deployment:
+//   BlueGreenDeployStack-Staging.CodeDeployApplicationName  → CODEDEPLOY_APP secret
+//   BlueGreenDeployStack-Staging.CodeDeployDeploymentGroupName → CODEDEPLOY_DG secret
+//   BlueGreenDeployStack-Staging.ClusterName               → ECS_CLUSTER secret
+//   BlueGreenDeployStack-Staging.ServiceName               → ECS_SERVICE secret
+//
+// Port 8443 (test listener) must be opened in your firewall / security group for
+// smoke-testing the Green environment before CodeDeploy completes the cutover.
+
+new BlueGreenDeployStack(app, 'BlueGreenDeployStack-Staging', {
+  vpc: vpcStackStaging.vpc,
+  envName: 'staging',
+  certificateArn: stagingCertArn,
+  containerImage: process.env.CONTAINER_IMAGE,
+  containerPort: 3000,
+  cpu: 512,
+  memoryLimitMiB: 1024,
+  desiredCount: 1,
+  deploymentConfigType: 'Linear10Percent1Minute',
+  terminationWaitMinutes: 5,
+  deploymentApprovalWaitMinutes: 0,
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Staging blue/green ECS service via CodeDeploy (linear traffic shift)',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+new BlueGreenDeployStack(app, 'BlueGreenDeployStack-Production', {
+  vpc: vpcStackProduction.vpc,
+  envName: 'production',
+  certificateArn: productionCertArn,
+  containerImage: process.env.CONTAINER_IMAGE,
+  containerPort: 3000,
+  cpu: 1024,
+  memoryLimitMiB: 2048,
+  desiredCount: 2,
+  deploymentConfigType: 'Canary10Percent5Minutes',
+  terminationWaitMinutes: 15,
+  deploymentApprovalWaitMinutes: 0,
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Production blue/green ECS service via CodeDeploy (canary traffic shift)',
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });

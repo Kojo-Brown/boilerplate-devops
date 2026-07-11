@@ -1,0 +1,147 @@
+name: Blue/Green Deploy to ECS via CodeDeploy
+
+# Reusable workflow: triggers a CodeDeploy blue/green deployment for an ECS service.
+#
+# How it works:
+#   1. Renders a new task definition with the provided image URI.
+#   2. Generates an appspec.yaml pointing at the new task def + container.
+#   3. Triggers a CodeDeploy deployment which:
+#        a. Starts new tasks in the Green target group.
+#        b. Routes test traffic to :8443 for smoke-testing.
+#        c. Shifts production traffic from Blue → Green per deploymentConfig.
+#        d. Terminates old Blue tasks after terminationWaitMinutes.
+#        e. Auto-rolls back on ALB 5xx alarm or deployment failure.
+#
+# Prerequisites (set as GitHub Secrets / Variables):
+#   AWS_ROLE_ARN          — IAM role with codedeploy:CreateDeployment + ecs:* permissions
+#   Outputs from BlueGreenDeployStack:
+#     CODEDEPLOY_APP      — CodeDeploy application name  (${envName}-ecs-app)
+#     CODEDEPLOY_DG       — Deployment group name        (${envName}-ecs-dg)
+#     ECS_CLUSTER         — ECS cluster name             (${envName}-bg-cluster)
+#     ECS_SERVICE         — ECS service name             (${envName}-bg-service)
+#     TASK_DEFINITION     — Task definition family name  (${envName}-bg-task)
+
+on:
+  workflow_call:
+    inputs:
+      image-uri:
+        description: Full ECR image URI including tag (e.g. 123456789.dkr.ecr.us-east-1.amazonaws.com/app:sha-abc123)
+        required: true
+        type: string
+      cluster:
+        description: ECS cluster name (BlueGreenDeployStack output ClusterName)
+        required: true
+        type: string
+      service:
+        description: ECS service name (BlueGreenDeployStack output ServiceName)
+        required: true
+        type: string
+      task-definition:
+        description: Task definition family name (e.g. production-bg-task)
+        required: true
+        type: string
+      container-name:
+        description: Container name inside the task definition (default AppContainer)
+        required: false
+        type: string
+        default: AppContainer
+      codedeploy-application:
+        description: CodeDeploy application name (BlueGreenDeployStack output CodeDeployApplicationName)
+        required: true
+        type: string
+      codedeploy-deployment-group:
+        description: CodeDeploy deployment group name (BlueGreenDeployStack output CodeDeployDeploymentGroupName)
+        required: true
+        type: string
+      aws-region:
+        description: AWS region (default us-east-1)
+        required: false
+        type: string
+        default: us-east-1
+      wait-for-service-stability:
+        description: Block until the deployment completes (default true)
+        required: false
+        type: boolean
+        default: true
+    secrets:
+      AWS_ROLE_ARN:
+        description: IAM role ARN with CodeDeploy + ECS deploy permissions
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  blue-green-deploy:
+    name: Blue/Green Deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      # Download the current task definition and strip read-only fields so we
+      # can register a new revision with the updated image.
+      - name: Download current task definition
+        id: download-taskdef
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "${{ inputs.task-definition }}" \
+            --query taskDefinition \
+            --output json > task-definition.json
+          echo "Task definition downloaded"
+          cat task-definition.json | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          # Remove fields that cannot be present when registering a new revision
+          for key in ['taskDefinitionArn', 'revision', 'status', 'requiresAttributes',
+                      'placementConstraints', 'compatibilities', 'registeredAt',
+                      'registeredBy', 'deregisteredAt']:
+              d.pop(key, None)
+          print(json.dumps(d, indent=2))
+          " > task-definition-clean.json
+          mv task-definition-clean.json task-definition.json
+
+      # Render a new task definition revision with the updated container image.
+      - name: Render new task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ inputs.container-name }}
+          image: ${{ inputs.image-uri }}
+
+      # Generate appspec.yaml consumed by the CodeDeploy ECS deployment.
+      # The <TASK_DEFINITION> placeholder is replaced by the action in the next step.
+      - name: Generate appspec.yaml
+        run: |
+          cat > appspec.yaml << 'EOF'
+          version: 0.0
+          Resources:
+            - TargetService:
+                Type: AWS::ECS::Service
+                Properties:
+                  TaskDefinition: <TASK_DEFINITION>
+                  LoadBalancerInfo:
+                    ContainerName: "${{ inputs.container-name }}"
+                    ContainerPort: 3000
+          EOF
+          echo "Generated appspec.yaml:"
+          cat appspec.yaml
+
+      # Trigger the CodeDeploy blue/green deployment.
+      # The action registers the new task definition, fills in <TASK_DEFINITION>
+      # in appspec.yaml, and creates the CodeDeploy deployment.
+      - name: Deploy via CodeDeploy (Blue/Green)
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ inputs.service }}
+          cluster: ${{ inputs.cluster }}
+          wait-for-service-stability: ${{ inputs.wait-for-service-stability }}
+          codedeploy-appspec: appspec.yaml
+          codedeploy-application: ${{ inputs.codedeploy-application }}
+          codedeploy-deployment-group: ${{ inputs.codedeploy-deployment-group }}
