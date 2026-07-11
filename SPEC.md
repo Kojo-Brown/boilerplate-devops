@@ -25,7 +25,7 @@
 ## Phase 4 — Monitoring
 - [x] CloudWatch dashboard: ECS CPU/memory, ALB 5xx, RDS connections
 - [x] CloudWatch Alarms → SNS → PagerDuty
-- [ ] X-Ray tracing integration (Express + FastAPI)
+- [x] X-Ray tracing integration (Express + FastAPI)
 - [ ] Log Insights queries for error analysis
 
 ## Phase 5 — Advanced Deployment
