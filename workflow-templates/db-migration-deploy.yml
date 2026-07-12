@@ -1,0 +1,295 @@
+name: Database Migration (run before traffic shift)
+
+# Reusable workflow: runs the migration ECS task and waits for it to complete
+# before allowing deployment to proceed.  Combine with blue-green-deploy.yml:
+#
+#   jobs:
+#     migrate:
+#       uses: Kojo-Brown/boilerplate-devops/.github/workflows/db-migration-deploy.yml@main
+#       with:
+#         cluster: production-migration-cluster     # DbMigrationStack.MigrationClusterName
+#         task-definition: production-migration-task
+#         subnets: subnet-aaa,subnet-bbb            # private subnet IDs
+#         security-groups: sg-xxxxxxxx              # DbMigrationStack.MigrationSecurityGroupId
+#       secrets:
+#         AWS_ROLE_ARN: ${{ secrets.PROD_DEPLOY_ROLE_ARN }}
+#
+#     blue-green-deploy:
+#       needs: migrate                              # ← only runs if migration succeeds
+#       uses: Kojo-Brown/boilerplate-devops/.github/workflows/blue-green-deploy.yml@main
+#       with:
+#         ...
+#
+# Safety contract:
+#   If the migration ECS task exits non-zero, the workflow job fails and the
+#   deploy job is skipped.  The live (Blue) environment never receives traffic
+#   from the new (Green) tasks that rely on the migrated schema.
+#
+# Prerequisites:
+#   AWS_ROLE_ARN — IAM role with ecs:RunTask, ecs:DescribeTasks, ecs:StopTask
+#                  permissions on the migration cluster.
+#   Outputs from DbMigrationStack:
+#     MigrationClusterName      → cluster input
+#     MigrationTaskDefinitionArn (family name) → task-definition input
+#     MigrationSecurityGroupId  → security-groups input
+#     Private subnet IDs        → subnets input (from VpcStack)
+
+on:
+  workflow_call:
+    inputs:
+      cluster:
+        description: ECS cluster name for migration tasks (DbMigrationStack.MigrationClusterName)
+        required: true
+        type: string
+      task-definition:
+        description: ECS task definition family name (e.g. production-migration-task)
+        required: true
+        type: string
+      subnets:
+        description: Comma-separated private subnet IDs for the migration Fargate task
+        required: true
+        type: string
+      security-groups:
+        description: Comma-separated security group IDs for the migration Fargate task
+        required: true
+        type: string
+      aws-region:
+        description: AWS region (default us-east-1)
+        required: false
+        type: string
+        default: us-east-1
+      timeout-minutes:
+        description: Maximum minutes to wait for the migration task to complete (default 15)
+        required: false
+        type: number
+        default: 15
+      container-name:
+        description: Name of the migration container — used to resolve its exit code (default MigrationContainer)
+        required: false
+        type: string
+        default: MigrationContainer
+      log-group-prefix:
+        description: CloudWatch log group prefix — logs fetched as <prefix>/migration (default /ecs)
+        required: false
+        type: string
+        default: /ecs
+    secrets:
+      AWS_ROLE_ARN:
+        description: IAM role ARN with ecs:RunTask + ecs:DescribeTasks + ecs:StopTask permissions
+        required: true
+    outputs:
+      task-arn:
+        description: ARN of the ECS migration task that ran
+        value: ${{ jobs.migrate.outputs.task-arn }}
+      migration-status:
+        description: "Succeeded or Failed"
+        value: ${{ jobs.migrate.outputs.migration-status }}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  migrate:
+    name: Run Database Migrations
+    runs-on: ubuntu-latest
+    # Extra minutes on top of the migration timeout for AWS API call overhead
+    timeout-minutes: 20
+    outputs:
+      task-arn: ${{ steps.run-task.outputs.task-arn }}
+      migration-status: ${{ steps.check-result.outputs.status }}
+
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      # ── Start migration ECS task ────────────────────────────────────────────────
+      - name: Start migration ECS task
+        id: run-task
+        run: |
+          set -euo pipefail
+
+          # Build JSON arrays from comma-separated inputs
+          SUBNETS=$(python3 -c "
+          import json, sys
+          parts = '${{ inputs.subnets }}'.split(',')
+          print(json.dumps([p.strip() for p in parts if p.strip()]))
+          ")
+          SGS=$(python3 -c "
+          import json, sys
+          parts = '${{ inputs.security-groups }}'.split(',')
+          print(json.dumps([p.strip() for p in parts if p.strip()]))
+          ")
+
+          echo "Starting migration ECS task on cluster: ${{ inputs.cluster }}"
+          echo "  Task definition : ${{ inputs.task-definition }}"
+          echo "  Subnets         : ${SUBNETS}"
+          echo "  Security groups : ${SGS}"
+
+          RUN_OUTPUT=$(aws ecs run-task \
+            --cluster "${{ inputs.cluster }}" \
+            --task-definition "${{ inputs.task-definition }}" \
+            --launch-type FARGATE \
+            --count 1 \
+            --network-configuration \
+              "awsvpcConfiguration={subnets=${SUBNETS},securityGroups=${SGS},assignPublicIp=DISABLED}" \
+            --output json)
+
+          FAILURES=$(echo "$RUN_OUTPUT" | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          failures = d.get('failures', [])
+          print(json.dumps(failures))
+          ")
+
+          if [ "$FAILURES" != "[]" ]; then
+            echo "::error::ECS RunTask reported failures: ${FAILURES}"
+            exit 1
+          fi
+
+          TASK_ARN=$(echo "$RUN_OUTPUT" | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          tasks = d.get('tasks', [])
+          if not tasks:
+              raise SystemExit('No tasks in RunTask response')
+          print(tasks[0]['taskArn'])
+          ")
+
+          echo "Migration ECS task started: ${TASK_ARN}"
+          echo "task-arn=${TASK_ARN}" >> "$GITHUB_OUTPUT"
+
+      # ── Poll until STOPPED ──────────────────────────────────────────────────────
+      - name: Wait for migration task to complete
+        id: wait-task
+        run: |
+          set -euo pipefail
+
+          TASK_ARN="${{ steps.run-task.outputs.task-arn }}"
+          CLUSTER="${{ inputs.cluster }}"
+          TIMEOUT_SECS=$(( ${{ inputs.timeout-minutes }} * 60 ))
+          POLL_INTERVAL=15
+          ELAPSED=0
+
+          echo "Waiting for task to complete (timeout: ${{ inputs.timeout-minutes }}m)"
+          echo "Task ARN: ${TASK_ARN}"
+
+          while true; do
+            STATUS=$(aws ecs describe-tasks \
+              --cluster "$CLUSTER" \
+              --tasks "$TASK_ARN" \
+              --query 'tasks[0].lastStatus' \
+              --output text 2>/dev/null || echo "UNKNOWN")
+
+            ELAPSED_MIN=$(( ELAPSED / 60 ))
+            ELAPSED_SEC=$(( ELAPSED % 60 ))
+            printf "[%02dm%02ds] Task status: %s\n" "$ELAPSED_MIN" "$ELAPSED_SEC" "$STATUS"
+
+            if [ "$STATUS" = "STOPPED" ]; then
+              echo "Task reached STOPPED state."
+              break
+            fi
+
+            if [ "$ELAPSED" -ge "$TIMEOUT_SECS" ]; then
+              echo "::error::Migration task timed out after ${{ inputs.timeout-minutes }} minutes"
+              # Stop the runaway task so it doesn't keep consuming resources
+              aws ecs stop-task \
+                --cluster "$CLUSTER" \
+                --task "$TASK_ARN" \
+                --reason "GitHub Actions migration timeout" \
+                > /dev/null || true
+              exit 1
+            fi
+
+            sleep "$POLL_INTERVAL"
+            ELAPSED=$(( ELAPSED + POLL_INTERVAL ))
+          done
+
+      # ── Inspect exit code ───────────────────────────────────────────────────────
+      - name: Check migration result
+        id: check-result
+        run: |
+          set -euo pipefail
+
+          TASK_ARN="${{ steps.run-task.outputs.task-arn }}"
+          CLUSTER="${{ inputs.cluster }}"
+          CONTAINER="${{ inputs.container-name }}"
+
+          DESCRIBE=$(aws ecs describe-tasks \
+            --cluster "$CLUSTER" \
+            --tasks "$TASK_ARN" \
+            --output json)
+
+          # Resolve exit code for the named container; fall back to worst exit code
+          EXIT_CODE=$(echo "$DESCRIBE" | python3 -c "
+          import sys, json
+
+          d = json.load(sys.stdin)
+          task = d['tasks'][0]
+          containers = task.get('containers', [])
+
+          named = [c for c in containers if c.get('name') == '$CONTAINER']
+          target = named[0] if named else (containers[0] if containers else None)
+
+          if target is None:
+              print(1)
+              sys.exit(0)
+
+          exit_code = target.get('exitCode')
+          print(exit_code if isinstance(exit_code, int) else 1)
+          ")
+
+          STOPPED_REASON=$(echo "$DESCRIBE" | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          print(d['tasks'][0].get('stoppedReason', 'unknown'))
+          ")
+
+          echo "Migration container exit code : ${EXIT_CODE}"
+          echo "Task stopped reason           : ${STOPPED_REASON}"
+
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo "status=Failed" >> "$GITHUB_OUTPUT"
+            echo "::error::Migration failed — container exited with code ${EXIT_CODE}. Reason: ${STOPPED_REASON}"
+            exit 1
+          fi
+
+          echo "status=Succeeded" >> "$GITHUB_OUTPUT"
+          echo "Migration completed successfully."
+
+      # ── Always print CloudWatch logs for observability ──────────────────────────
+      - name: Print migration logs from CloudWatch
+        if: always() && steps.run-task.outputs.task-arn != ''
+        run: |
+          set -uo pipefail  # no -e: best-effort log fetch should not fail the step
+
+          TASK_ARN="${{ steps.run-task.outputs.task-arn }}"
+          CLUSTER="${{ inputs.cluster }}"
+          TASK_ID="${TASK_ARN##*/}"
+          LOG_GROUP="${{ inputs.log-group-prefix }}/${CLUSTER}/migration"
+          LOG_STREAM="migration/${TASK_ID}"
+
+          echo "=== CloudWatch Logs: ${LOG_GROUP}/${LOG_STREAM} ==="
+          aws logs get-log-events \
+            --log-group-name "$LOG_GROUP" \
+            --log-stream-name "$LOG_STREAM" \
+            --start-from-head \
+            --output json 2>/dev/null \
+          | python3 -c "
+          import sys, json, datetime
+
+          try:
+              events = json.load(sys.stdin).get('events', [])
+              if not events:
+                  print('(no log events found)')
+              for e in events:
+                  ts = datetime.datetime.fromtimestamp(
+                      e['timestamp'] / 1000, tz=datetime.timezone.utc
+                  )
+                  print(f\"{ts.strftime('%H:%M:%S.%f')[:-3]} {e['message'].rstrip()}\")
+          except Exception as ex:
+              print(f'Could not parse log events: {ex}')
+          " || echo "(could not retrieve CloudWatch logs — they may not be available yet)"
