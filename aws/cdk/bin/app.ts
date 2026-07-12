@@ -13,6 +13,7 @@ import { CloudWatchDashboardStack } from '../lib/cloudwatch-dashboard-stack';
 import { CloudWatchAlarmsStack } from '../lib/cloudwatch-alarms-stack';
 import { LogInsightsStack } from '../lib/log-insights-stack';
 import { BlueGreenDeployStack } from '../lib/blue-green-deploy-stack';
+import { AppConfigStack } from '../lib/appconfig-stack';
 
 const app = new cdk.App();
 
@@ -507,5 +508,45 @@ new BlueGreenDeployStack(app, 'BlueGreenDeployStack-Production', {
     region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
   },
   description: 'Production blue/green ECS service via CodeDeploy (canary traffic shift)',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+// ── Feature Flags via AWS AppConfig ──────────────────────────────────────────
+// Deploys feature flags gradually using a linear traffic-shift strategy so
+// any misconfiguration can be caught by CloudWatch alarms and rolled back
+// automatically before all users are affected.
+//
+// After CDK deploy, copy the stack outputs into GitHub Secrets / Variables:
+//   APP_ID       ← AppConfigStack.ApplicationId
+//   PROFILE_ID   ← AppConfigStack.ConfigProfileId
+//   PROD_ENV_ID  ← AppConfigStack.EnvIdProduction
+//   STG_ENV_ID   ← AppConfigStack.EnvIdStaging
+//
+// Then call workflow-templates/deploy-feature-flags.yml from your CI pipeline:
+//   jobs:
+//     deploy-flags:
+//       uses: Kojo-Brown/boilerplate-devops/.github/workflows/deploy-feature-flags.yml@main
+//       with:
+//         config-file: aws/appconfig/feature-flags.json
+//         app-id: ${{ vars.APP_ID }}
+//         profile-id: ${{ vars.PROFILE_ID }}
+//         env-id: ${{ vars.PROD_ENV_ID }}
+//       secrets:
+//         AWS_ROLE_ARN: ${{ secrets.APPCONFIG_DEPLOY_ROLE_ARN }}
+//
+// ECS task runtime reads:
+//   Attach AppConfigReadPolicyArn to the ECS task role, then call:
+//     StartConfigurationSession → GetLatestConfiguration (poll every 30–60 s)
+
+new AppConfigStack(app, 'AppConfigStack', {
+  appName: 'boilerplate',
+  deploymentGrowthFactor: 10,
+  deploymentDurationMinutes: 10,
+  finalBakeTimeMinutes: 5,
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'AppConfig feature flags — gradual rollout with auto-rollback on alarm',
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });

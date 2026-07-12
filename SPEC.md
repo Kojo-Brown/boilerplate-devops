@@ -30,7 +30,7 @@
 
 ## Phase 5 — Advanced Deployment
 - [x] Blue/green deployment via ECS with CodeDeploy
-- [ ] Feature flag deployment with AWS AppConfig
+- [x] Feature flag deployment with AWS AppConfig
 - [ ] Database migration safety: run before traffic shift
 - [ ] Rollback automation on alarm breach
 
