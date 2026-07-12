@@ -1,0 +1,258 @@
+name: Deploy Feature Flags via AWS AppConfig
+
+# Reusable workflow: validates a JSON feature flag file and deploys it to
+# a target AppConfig environment using a gradual linear rollout strategy.
+#
+# How it works:
+#   1. Validates the JSON file syntax with python3.
+#   2. Creates a new HostedConfigurationVersion from the file content.
+#   3. Starts an AppConfig deployment with the chosen strategy.
+#   4. Polls until the deployment reaches Complete or RolledBack.
+#
+# AppConfig runtime reads (application side):
+#   Applications should use the AppConfig Data client
+#   (StartConfigurationSession + GetLatestConfiguration) to poll for
+#   flag updates without redeploying containers.
+#
+# Prerequisites:
+#   AWS_ROLE_ARN — IAM role with AppConfig write permissions:
+#     appconfig:CreateHostedConfigurationVersion
+#     appconfig:StartDeployment
+#     appconfig:GetDeployment
+#     appconfig:ListDeploymentStrategies
+#
+# All IDs are output from AppConfigStack:
+#   app-id          ← ApplicationId output
+#   profile-id      ← ConfigProfileId output
+#   env-id          ← EnvId{Production|Staging} output
+#   strategy-id     ← DeploymentStrategyId output (or a built-in AWS ID)
+
+on:
+  workflow_call:
+    inputs:
+      config-file:
+        description: >
+          Repo-relative path to the feature flags JSON file
+          (e.g. aws/appconfig/feature-flags.json)
+        required: true
+        type: string
+      app-id:
+        description: >
+          AppConfig Application ID.
+          Copy from AppConfigStack CloudFormation output ApplicationId.
+        required: true
+        type: string
+      profile-id:
+        description: >
+          Configuration Profile ID.
+          Copy from AppConfigStack CloudFormation output ConfigProfileId.
+        required: true
+        type: string
+      env-id:
+        description: >
+          AppConfig Environment ID to deploy to.
+          Copy from AppConfigStack output EnvIdProduction or EnvIdStaging.
+        required: true
+        type: string
+      strategy-id:
+        description: >
+          AppConfig Deployment Strategy ID. Defaults to the stack-managed
+          gradual strategy (looked up by name). Set to
+          'AppConfig.AllAtOnce' for instant rollout or a built-in AWS
+          strategy ID for predefined linear/canary options.
+        required: false
+        type: string
+        default: ''
+      aws-region:
+        description: AWS region where AppConfig resources live (default us-east-1)
+        required: false
+        type: string
+        default: us-east-1
+      dry-run:
+        description: >
+          Validate and preview the deployment without actually creating a
+          configuration version or starting a deployment.
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      AWS_ROLE_ARN:
+        description: IAM role ARN with AppConfig CreateHostedConfigurationVersion + StartDeployment permissions
+        required: true
+    outputs:
+      version-number:
+        description: The newly created configuration version number
+        value: ${{ jobs.deploy-flags.outputs.version-number }}
+      deployment-number:
+        description: The AppConfig deployment number started by this run
+        value: ${{ jobs.deploy-flags.outputs.deployment-number }}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy-flags:
+    name: Deploy Feature Flags
+    runs-on: ubuntu-latest
+    outputs:
+      version-number: ${{ steps.create-version.outputs.version-number }}
+      deployment-number: ${{ steps.start-deployment.outputs.deployment-number }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # ── Validate JSON ─────────────────────────────────────────────────────────
+      - name: Validate feature flags JSON
+        run: |
+          python3 - <<'EOF'
+          import json, sys
+
+          path = "${{ inputs.config-file }}"
+          try:
+              with open(path) as f:
+                  data = json.load(f)
+          except FileNotFoundError:
+              print(f"ERROR: File not found: {path}", file=sys.stderr)
+              sys.exit(1)
+          except json.JSONDecodeError as exc:
+              print(f"ERROR: Invalid JSON in {path}: {exc}", file=sys.stderr)
+              sys.exit(1)
+
+          if not isinstance(data, dict):
+              print("ERROR: Feature flags file must be a JSON object ({})", file=sys.stderr)
+              sys.exit(1)
+
+          print(f"✓  Valid JSON — {len(data)} flag(s):")
+          for key, value in data.items():
+              print(f"   {key}: {json.dumps(value)}")
+          EOF
+
+      # ── AWS credentials ───────────────────────────────────────────────────────
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      # ── Dry-run summary (skip actual deployment) ───────────────────────────────
+      - name: Dry-run summary
+        if: ${{ inputs.dry-run }}
+        run: |
+          echo "====== DRY RUN — no changes deployed ======"
+          echo "  Config file : ${{ inputs.config-file }}"
+          echo "  App ID      : ${{ inputs.app-id }}"
+          echo "  Profile ID  : ${{ inputs.profile-id }}"
+          echo "  Env ID      : ${{ inputs.env-id }}"
+          echo "  Strategy    : ${STRATEGY:-<stack-managed gradual strategy>}"
+          echo "  Region      : ${{ inputs.aws-region }}"
+          echo ""
+          echo "Content preview:"
+          python3 -c "
+          import json
+          with open('${{ inputs.config-file }}') as f:
+              print(json.dumps(json.load(f), indent=2))
+          "
+        env:
+          STRATEGY: ${{ inputs.strategy-id }}
+
+      # ── Create new configuration version ─────────────────────────────────────
+      - name: Create hosted configuration version
+        id: create-version
+        if: ${{ !inputs.dry-run }}
+        run: |
+          VERSION=$(aws appconfig create-hosted-configuration-version \
+            --application-id "${{ inputs.app-id }}" \
+            --configuration-profile-id "${{ inputs.profile-id }}" \
+            --content-type "application/json" \
+            --content "fileb://${{ inputs.config-file }}" \
+            --query VersionNumber \
+            --output text)
+          echo "version-number=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "✓  Created configuration version $VERSION"
+
+      # ── Resolve deployment strategy ───────────────────────────────────────────
+      - name: Resolve deployment strategy
+        id: strategy
+        if: ${{ !inputs.dry-run }}
+        run: |
+          STRATEGY_ID="${{ inputs.strategy-id }}"
+          if [ -z "$STRATEGY_ID" ]; then
+            # Look for the stack-managed gradual strategy (name contains 'linear')
+            STRATEGY_ID=$(aws appconfig list-deployment-strategies \
+              --query "Items[?contains(Name, 'linear')].Id | [0]" \
+              --output text 2>/dev/null || true)
+            if [ -z "$STRATEGY_ID" ] || [ "$STRATEGY_ID" = "None" ]; then
+              STRATEGY_ID="AppConfig.Linear10PercentEvery1Minute"
+              echo "Stack-managed strategy not found — using built-in: $STRATEGY_ID"
+            else
+              echo "Resolved stack-managed strategy: $STRATEGY_ID"
+            fi
+          fi
+          echo "strategy-id=$STRATEGY_ID" >> "$GITHUB_OUTPUT"
+          echo "Using deployment strategy: $STRATEGY_ID"
+
+      # ── Start deployment ──────────────────────────────────────────────────────
+      - name: Start AppConfig deployment
+        id: start-deployment
+        if: ${{ !inputs.dry-run }}
+        run: |
+          RESULT=$(aws appconfig start-deployment \
+            --application-id "${{ inputs.app-id }}" \
+            --environment-id "${{ inputs.env-id }}" \
+            --deployment-strategy-id "${{ steps.strategy.outputs.strategy-id }}" \
+            --configuration-profile-id "${{ inputs.profile-id }}" \
+            --configuration-version "${{ steps.create-version.outputs.version-number }}" \
+            --description "GitHub Actions run #${{ github.run_number }} — ${{ github.sha }}" \
+            --output json)
+          DEPLOYMENT_NUMBER=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['DeploymentNumber'])")
+          echo "deployment-number=$DEPLOYMENT_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "✓  Started deployment #$DEPLOYMENT_NUMBER"
+
+      # ── Poll until complete ───────────────────────────────────────────────────
+      - name: Wait for deployment to complete
+        if: ${{ !inputs.dry-run }}
+        env:
+          APP_ID: ${{ inputs.app-id }}
+          ENV_ID: ${{ inputs.env-id }}
+          DEPLOYMENT_NUMBER: ${{ steps.start-deployment.outputs.deployment-number }}
+        run: |
+          # Poll for up to 25 minutes (30 s intervals × 50 = 25 min).
+          # A linear 10%/min strategy completes in 10 min + 5 min bake = 15 min.
+          MAX_POLLS=50
+          INTERVAL=30
+          for i in $(seq 1 "$MAX_POLLS"); do
+            STATE=$(aws appconfig get-deployment \
+              --application-id "$APP_ID" \
+              --environment-id "$ENV_ID" \
+              --deployment-number "$DEPLOYMENT_NUMBER" \
+              --query State \
+              --output text)
+            PROGRESS=$(aws appconfig get-deployment \
+              --application-id "$APP_ID" \
+              --environment-id "$ENV_ID" \
+              --deployment-number "$DEPLOYMENT_NUMBER" \
+              --query PercentageComplete \
+              --output text 2>/dev/null || echo "0")
+            echo "  [$i/$MAX_POLLS] State: $STATE  Progress: ${PROGRESS}%"
+            case "$STATE" in
+              Complete)
+                echo "✓  Deployment #$DEPLOYMENT_NUMBER complete (100%)"
+                exit 0
+                ;;
+              RolledBack | RollbackComplete)
+                echo "✗  Deployment #$DEPLOYMENT_NUMBER rolled back"
+                exit 1
+                ;;
+              Baking)
+                echo "  → Baking period — monitoring alarms before marking Complete..."
+                ;;
+              Growing)
+                echo "  → Traffic shifting at ${PROGRESS}%..."
+                ;;
+            esac
+            sleep "$INTERVAL"
+          done
+          echo "✗  Timed out waiting for deployment #$DEPLOYMENT_NUMBER after $((MAX_POLLS * INTERVAL / 60)) minutes"
+          exit 1

@@ -1,0 +1,7 @@
+{
+  "newDashboard": false,
+  "darkModeDefault": true,
+  "maintenanceMode": false,
+  "betaFeatures": false,
+  "rateLimitRequestsPerMinute": 100
+}
