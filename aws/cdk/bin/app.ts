@@ -14,6 +14,7 @@ import { CloudWatchAlarmsStack } from '../lib/cloudwatch-alarms-stack';
 import { LogInsightsStack } from '../lib/log-insights-stack';
 import { BlueGreenDeployStack } from '../lib/blue-green-deploy-stack';
 import { AppConfigStack } from '../lib/appconfig-stack';
+import { DbMigrationStack } from '../lib/db-migration-stack';
 
 const app = new cdk.App();
 
@@ -548,5 +549,82 @@ new AppConfigStack(app, 'AppConfigStack', {
     region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
   },
   description: 'AppConfig feature flags — gradual rollout with auto-rollback on alarm',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+// ── Database Migration Safety ─────────────────────────────────────────────────
+// Provisions the CodeDeploy BeforeAllowTraffic lifecycle hook Lambda and the
+// migration ECS task definition.  The Lambda runs the migration task and only
+// reports Succeeded once it exits 0; CodeDeploy shifts traffic from Blue → Green
+// only after receiving Succeeded.  If the migration fails, CodeDeploy rolls back.
+//
+// After deploying this stack:
+//   1. Register MigrationHookLambdaArn as the BeforeAllowTraffic hook in the
+//      CodeDeploy deployment group (BlueGreenDeployStack):
+//
+//        aws deploy update-deployment-group \
+//          --application-name <CodeDeployApplicationName> \
+//          --current-deployment-group-name <DeploymentGroupName> \
+//          # ... existing params ... \
+//          # In Console: Deployment Group → Edit → Lifecycle event hooks → BeforeAllowTraffic
+//
+//   2. Alternatively, use workflow-templates/db-migration-deploy.yml as a
+//      GitHub Actions job that runs BEFORE blue-green-deploy.yml:
+//
+//        jobs:
+//          migrate:
+//            uses: ./.github/workflows/db-migration-deploy.yml
+//            with:
+//              cluster: <MigrationClusterName>
+//              task-definition: <task-definition-family>
+//              subnets: <private-subnet-ids>
+//              security-groups: <MigrationSecurityGroupId>
+//            secrets:
+//              AWS_ROLE_ARN: ${{ secrets.DEPLOY_ROLE_ARN }}
+//          deploy:
+//            needs: migrate
+//            uses: ./.github/workflows/blue-green-deploy.yml
+//            ...
+//
+// Replace MIGRATION_IMAGE_URI with your actual ECR migration image URI.
+// The image must run the migration on startup (e.g. `npm run migrate`, `alembic upgrade head`).
+
+new DbMigrationStack(app, 'DbMigrationStack-Staging', {
+  vpc: vpcStackStaging.vpc,
+  envName: 'staging',
+  migrationImageUri:
+    process.env.MIGRATION_IMAGE_URI ??
+    '123456789012.dkr.ecr.us-east-1.amazonaws.com/app:migrate-latest',
+  dbSecretArn: rdsStackStaging.secret.secretArn,
+  dbSecurityGroup: rdsStackStaging.securityGroup,
+  migrationCommand: ['npm', 'run', 'migrate'],
+  cpu: 256,
+  memoryLimitMiB: 512,
+  migrationTimeoutMinutes: 14,
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Staging DB migration — BeforeAllowTraffic hook + ECS task definition',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+new DbMigrationStack(app, 'DbMigrationStack-Production', {
+  vpc: vpcStackProduction.vpc,
+  envName: 'production',
+  migrationImageUri:
+    process.env.MIGRATION_IMAGE_URI ??
+    '123456789012.dkr.ecr.us-east-1.amazonaws.com/app:migrate-latest',
+  dbSecretArn: rdsStackProduction.secret.secretArn,
+  dbSecurityGroup: rdsStackProduction.securityGroup,
+  migrationCommand: ['npm', 'run', 'migrate'],
+  cpu: 256,
+  memoryLimitMiB: 512,
+  migrationTimeoutMinutes: 14,
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Production DB migration — BeforeAllowTraffic hook + ECS task definition',
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
