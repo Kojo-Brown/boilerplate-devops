@@ -16,6 +16,7 @@ import { BlueGreenDeployStack } from '../lib/blue-green-deploy-stack';
 import { AppConfigStack } from '../lib/appconfig-stack';
 import { DbMigrationStack } from '../lib/db-migration-stack';
 import { RollbackAutomationStack } from '../lib/rollback-automation-stack';
+import { CostAnomalyStack } from '../lib/cost-anomaly-stack';
 
 const app = new cdk.App();
 
@@ -707,5 +708,59 @@ new DbMigrationStack(app, 'DbMigrationStack-Production', {
     region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
   },
   description: 'Production DB migration — BeforeAllowTraffic hook + ECS task definition',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+// ── Cost Anomaly Detection + Budget Alerts ────────────────────────────────────
+// Cost Anomaly Detection is account-wide; deploy in us-east-1.
+// Set a monthly budget and get alerted when actual or forecasted spend crosses
+// the threshold, or when an AI-detected spending anomaly exceeds a dollar amount.
+//
+// After deployment:
+//   - Confirm the SNS email subscription sent to each notificationEmail address.
+//   - Export CostAnomalyStack-Staging.CostAlertTopicArn to your ops runbook.
+//   - Subscribe additional endpoints (Slack, PagerDuty) to the SNS topic.
+//
+// Usage:
+//   STAGING_NOTIFY_EMAIL=ops@example.com  cdk deploy CostAnomalyStack-Staging
+//   PRODUCTION_NOTIFY_EMAIL=cto@example.com  cdk deploy CostAnomalyStack-Production
+
+const stagingNotifyEmails = process.env.STAGING_NOTIFY_EMAIL
+  ? [process.env.STAGING_NOTIFY_EMAIL]
+  : [];
+
+const productionNotifyEmails = process.env.PRODUCTION_NOTIFY_EMAIL
+  ? [process.env.PRODUCTION_NOTIFY_EMAIL]
+  : [];
+
+new CostAnomalyStack(app, 'CostAnomalyStack-Staging', {
+  envName: 'staging',
+  monthlyBudgetUsd: 500,
+  actualThresholdPercent: 80,
+  forecastedThresholdPercent: 100,
+  anomalyThresholdUsd: 50,
+  anomalyFrequency: 'DAILY',
+  notificationEmails: stagingNotifyEmails,
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: 'us-east-1',
+  },
+  description: 'Staging cost anomaly detection + $500/month budget alerts',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+new CostAnomalyStack(app, 'CostAnomalyStack-Production', {
+  envName: 'production',
+  monthlyBudgetUsd: 2000,
+  actualThresholdPercent: 80,
+  forecastedThresholdPercent: 100,
+  anomalyThresholdUsd: 100,
+  anomalyFrequency: 'IMMEDIATE',
+  notificationEmails: productionNotifyEmails,
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: 'us-east-1',
+  },
+  description: 'Production cost anomaly detection + $2000/month budget alerts (immediate notifications)',
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
