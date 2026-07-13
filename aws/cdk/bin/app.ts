@@ -15,6 +15,7 @@ import { LogInsightsStack } from '../lib/log-insights-stack';
 import { BlueGreenDeployStack } from '../lib/blue-green-deploy-stack';
 import { AppConfigStack } from '../lib/appconfig-stack';
 import { DbMigrationStack } from '../lib/db-migration-stack';
+import { RollbackAutomationStack } from '../lib/rollback-automation-stack';
 
 const app = new cdk.App();
 
@@ -606,6 +607,86 @@ new DbMigrationStack(app, 'DbMigrationStack-Staging', {
     region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
   },
   description: 'Staging DB migration — BeforeAllowTraffic hook + ECS task definition',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+// ── Rollback Automation ───────────────────────────────────────────────────────
+// Watches CloudWatch alarms via EventBridge and automatically rolls back ECS
+// services when any monitored alarm enters ALARM state.
+//
+// How it works:
+//   CloudWatch Alarm → ALARM
+//     → EventBridge rule (alarm-state-change)
+//       → Lambda
+//           ├─ Rolling ECS: UpdateService(previousTaskDefRevision)
+//           ├─ CodeDeploy ECS: StopDeployment (CodeDeploy autoRollback restores Blue)
+//           └─ SNS notification email / PagerDuty
+//
+// After deployment:
+//   - Confirm the SNS email subscription sent to each notificationEmail address.
+//   - Export RollbackAutomationStack-Staging.RollbackLambdaArn to your ops runbook.
+//   - For additional alarm coverage, add alarm ARNs from CloudWatchAlarmsStack outputs
+//     to the triggerAlarmArns array and redeploy.
+
+const stagingAlarmsAlb5xxArn = `arn:aws:cloudwatch:${process.env.CDK_DEFAULT_REGION ?? 'us-east-1'}:${process.env.CDK_DEFAULT_ACCOUNT ?? '123456789012'}:alarm:staging-alb-5xx-elb`;
+const stagingAlarmsEcsCpuArn = `arn:aws:cloudwatch:${process.env.CDK_DEFAULT_REGION ?? 'us-east-1'}:${process.env.CDK_DEFAULT_ACCOUNT ?? '123456789012'}:alarm:staging-ecs-cpu-high`;
+
+new RollbackAutomationStack(app, 'RollbackAutomationStack-Staging', {
+  envName: 'staging',
+  triggerAlarmArns: [stagingAlarmsAlb5xxArn, stagingAlarmsEcsCpuArn],
+  rollbackTargets: [
+    // Rolling ECS service (EcsStack)
+    {
+      clusterName: ecsStackStaging.cluster.clusterName,
+      serviceName: ecsStackStaging.service.serviceName,
+    },
+    // Blue/green ECS service (BlueGreenDeployStack) — CodeDeploy mode
+    {
+      clusterName: `staging-bg-cluster`,
+      serviceName: `staging-bg-service`,
+      codeDeployApplication: `staging-ecs-app`,
+      codeDeployDeploymentGroup: `staging-ecs-dg`,
+    },
+  ],
+  notificationEmails: process.env.STAGING_ROLLBACK_NOTIFY_EMAIL
+    ? [process.env.STAGING_ROLLBACK_NOTIFY_EMAIL]
+    : [],
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Staging rollback automation — EventBridge alarm → Lambda → ECS/CodeDeploy rollback',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+const productionAlarmsAlb5xxArn = `arn:aws:cloudwatch:${process.env.CDK_DEFAULT_REGION ?? 'us-east-1'}:${process.env.CDK_DEFAULT_ACCOUNT ?? '123456789012'}:alarm:production-alb-5xx-elb`;
+const productionAlarmsEcsCpuArn = `arn:aws:cloudwatch:${process.env.CDK_DEFAULT_REGION ?? 'us-east-1'}:${process.env.CDK_DEFAULT_ACCOUNT ?? '123456789012'}:alarm:production-ecs-cpu-high`;
+
+new RollbackAutomationStack(app, 'RollbackAutomationStack-Production', {
+  envName: 'production',
+  triggerAlarmArns: [productionAlarmsAlb5xxArn, productionAlarmsEcsCpuArn],
+  rollbackTargets: [
+    // Rolling ECS service (EcsStack)
+    {
+      clusterName: ecsStackProduction.cluster.clusterName,
+      serviceName: ecsStackProduction.service.serviceName,
+    },
+    // Blue/green ECS service (BlueGreenDeployStack) — CodeDeploy mode
+    {
+      clusterName: `production-bg-cluster`,
+      serviceName: `production-bg-service`,
+      codeDeployApplication: `production-ecs-app`,
+      codeDeployDeploymentGroup: `production-ecs-dg`,
+    },
+  ],
+  notificationEmails: process.env.PRODUCTION_ROLLBACK_NOTIFY_EMAIL
+    ? [process.env.PRODUCTION_ROLLBACK_NOTIFY_EMAIL]
+    : [],
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Production rollback automation — EventBridge alarm → Lambda → ECS/CodeDeploy rollback',
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
 

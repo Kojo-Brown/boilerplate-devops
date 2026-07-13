@@ -1,0 +1,235 @@
+name: Manual Rollback
+
+# Reusable workflow: manually rolls back an ECS service to the previous task-definition
+# revision (rolling-update services) or stops an in-progress CodeDeploy deployment
+# (blue/green services, which triggers CodeDeploy's autoRollback policy).
+#
+# Automatic rollback on alarm breach is handled by the RollbackAutomationStack Lambda
+# (alarm → EventBridge → Lambda).  Use this workflow when you need an immediate,
+# human-initiated rollback outside of alarm conditions — e.g. after a bad release that
+# has not yet triggered alarms, or to test the rollback path in staging.
+#
+# Prerequisites (GitHub Secrets / Variables):
+#   AWS_ROLE_ARN   — IAM role with ecs:UpdateService, ecs:DescribeServices,
+#                    codedeploy:ListDeployments, codedeploy:StopDeployment permissions
+#
+# Usage examples:
+#
+#   # Rollback a rolling-update ECS service:
+#   jobs:
+#     rollback:
+#       uses: Kojo-Brown/boilerplate-devops/.github/workflows/rollback.yml@main
+#       with:
+#         cluster: production-cluster
+#         service: production-service
+#       secrets:
+#         AWS_ROLE_ARN: ${{ secrets.PROD_DEPLOY_ROLE_ARN }}
+#
+#   # Rollback a CodeDeploy blue/green ECS service:
+#   jobs:
+#     rollback:
+#       uses: Kojo-Brown/boilerplate-devops/.github/workflows/rollback.yml@main
+#       with:
+#         cluster: production-bg-cluster
+#         service: production-bg-service
+#         codedeploy-application: production-ecs-app
+#         codedeploy-deployment-group: production-ecs-dg
+#       secrets:
+#         AWS_ROLE_ARN: ${{ secrets.PROD_DEPLOY_ROLE_ARN }}
+
+on:
+  workflow_call:
+    inputs:
+      cluster:
+        description: ECS cluster name
+        required: true
+        type: string
+      service:
+        description: ECS service name
+        required: true
+        type: string
+      codedeploy-application:
+        description: |
+          CodeDeploy application name (BlueGreenDeployStack output CodeDeployApplicationName).
+          Leave empty for rolling-update services; set for blue/green CodeDeploy services.
+        required: false
+        type: string
+        default: ''
+      codedeploy-deployment-group:
+        description: |
+          CodeDeploy deployment group name (BlueGreenDeployStack output CodeDeployDeploymentGroupName).
+          Required when codedeploy-application is set.
+        required: false
+        type: string
+        default: ''
+      aws-region:
+        description: AWS region (default us-east-1)
+        required: false
+        type: string
+        default: us-east-1
+      reason:
+        description: Human-readable reason for the rollback (recorded in the job summary)
+        required: false
+        type: string
+        default: Manual rollback triggered via GitHub Actions
+    secrets:
+      AWS_ROLE_ARN:
+        description: IAM role ARN with ECS and CodeDeploy rollback permissions
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  rollback:
+    name: Rollback — ${{ inputs.cluster }}/${{ inputs.service }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      # ── Rolling ECS service rollback ─────────────────────────────────────────
+      # Fetches the current task-definition ARN, derives the previous revision,
+      # and calls UpdateService to force ECS to deploy the previous image.
+      - name: Rolling ECS rollback
+        if: inputs.codedeploy-application == ''
+        id: rolling-rollback
+        run: |
+          set -euo pipefail
+          echo "Reason: ${{ inputs.reason }}"
+
+          # Fetch the current task definition ARN registered to the service
+          CURRENT_TASK_DEF=$(aws ecs describe-services \
+            --cluster "${{ inputs.cluster }}" \
+            --services "${{ inputs.service }}" \
+            --query 'services[0].taskDefinition' \
+            --output text)
+
+          echo "Current task definition: $CURRENT_TASK_DEF"
+
+          # Extract the family and revision number from the ARN
+          # ARN format: arn:aws:ecs:<region>:<account>:task-definition/<family>:<revision>
+          FAMILY=$(echo "$CURRENT_TASK_DEF" | sed 's/.*task-definition\///' | cut -d: -f1)
+          REVISION=$(echo "$CURRENT_TASK_DEF" | awk -F: '{print $NF}')
+
+          echo "Family: $FAMILY  |  Current revision: $REVISION"
+
+          if [ "$REVISION" -le 1 ]; then
+            echo "::warning::Service is already at revision 1; no previous revision to roll back to."
+            echo "rolled_back=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          PREV_REVISION=$(( REVISION - 1 ))
+          PREV_TASK_DEF="${FAMILY}:${PREV_REVISION}"
+          echo "Rolling back to: $PREV_TASK_DEF"
+
+          aws ecs update-service \
+            --cluster "${{ inputs.cluster }}" \
+            --service  "${{ inputs.service }}" \
+            --task-definition "$PREV_TASK_DEF" \
+            --force-new-deployment \
+            --output text \
+            --query 'service.deployments[0].status'
+
+          echo "rolled_back=true"   >> "$GITHUB_OUTPUT"
+          echo "prev_task_def=$PREV_TASK_DEF" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for rolling rollback to stabilise
+        if: inputs.codedeploy-application == '' && steps.rolling-rollback.outputs.rolled_back == 'true'
+        run: |
+          echo "Waiting for ECS service to reach steady state..."
+          aws ecs wait services-stable \
+            --cluster "${{ inputs.cluster }}" \
+            --services "${{ inputs.service }}"
+          echo "Service is stable."
+
+      # ── CodeDeploy blue/green rollback ───────────────────────────────────────
+      # Finds in-progress CodeDeploy deployments for the group and stops them
+      # with autoRollbackEnabled=true.  CodeDeploy then restores Blue traffic.
+      - name: CodeDeploy blue/green rollback
+        if: inputs.codedeploy-application != ''
+        id: codedeploy-rollback
+        run: |
+          set -euo pipefail
+          echo "Reason: ${{ inputs.reason }}"
+
+          # List in-progress deployments
+          DEPLOYMENT_IDS=$(aws deploy list-deployments \
+            --application-name     "${{ inputs.codedeploy-application }}" \
+            --deployment-group-name "${{ inputs.codedeploy-deployment-group }}" \
+            --include-only-statuses InProgress \
+            --query 'deployments[]' \
+            --output text)
+
+          if [ -z "$DEPLOYMENT_IDS" ]; then
+            echo "::warning::No in-progress CodeDeploy deployments found for ${{ inputs.codedeploy-application }}/${{ inputs.codedeploy-deployment-group }}."
+            echo "rolled_back=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "In-progress deployments: $DEPLOYMENT_IDS"
+
+          for DEPLOYMENT_ID in $DEPLOYMENT_IDS; do
+            echo "Stopping deployment: $DEPLOYMENT_ID"
+            aws deploy stop-deployment \
+              --deployment-id "$DEPLOYMENT_ID" \
+              --auto-rollback-enabled
+            echo "Stopped: $DEPLOYMENT_ID"
+          done
+
+          echo "rolled_back=true" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for CodeDeploy rollback to complete
+        if: inputs.codedeploy-application != '' && steps.codedeploy-rollback.outputs.rolled_back == 'true'
+        run: |
+          # Poll until all deployments leave InProgress status (Stopped or Succeeded)
+          echo "Polling deployment status..."
+          MAX_WAIT=300  # 5 minutes
+          ELAPSED=0
+          INTERVAL=15
+
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            IN_PROGRESS=$(aws deploy list-deployments \
+              --application-name      "${{ inputs.codedeploy-application }}" \
+              --deployment-group-name "${{ inputs.codedeploy-deployment-group }}" \
+              --include-only-statuses InProgress \
+              --query 'length(deployments)' \
+              --output text)
+
+            echo "In-progress deployments remaining: $IN_PROGRESS (${ELAPSED}s elapsed)"
+
+            if [ "$IN_PROGRESS" -eq 0 ]; then
+              echo "All deployments have exited InProgress state."
+              break
+            fi
+
+            sleep $INTERVAL
+            ELAPSED=$(( ELAPSED + INTERVAL ))
+          done
+
+          if [ "$IN_PROGRESS" -ne 0 ]; then
+            echo "::warning::Deployments still in progress after ${MAX_WAIT}s; check the CodeDeploy console."
+          fi
+
+      # ── Job Summary ──────────────────────────────────────────────────────────
+      - name: Write job summary
+        if: always()
+        run: |
+          {
+            echo "## Rollback Summary"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Cluster | \`${{ inputs.cluster }}\` |"
+            echo "| Service | \`${{ inputs.service }}\` |"
+            echo "| Reason | ${{ inputs.reason }} |"
+            echo "| Mode | ${{ inputs.codedeploy-application != '' && 'CodeDeploy blue/green' || 'ECS rolling update' }} |"
+            if [ -n "${{ steps.rolling-rollback.outputs.prev_task_def || '' }}" ]; then
+              echo "| Rolled back to | \`${{ steps.rolling-rollback.outputs.prev_task_def }}\` |"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
