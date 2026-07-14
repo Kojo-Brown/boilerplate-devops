@@ -36,6 +36,6 @@
 
 ## Phase 6 — Cost & Security
 - [x] AWS Cost Anomaly Detection + budget alerts
-- [ ] GuardDuty + Security Hub baseline config
+- [x] GuardDuty + Security Hub baseline config
 - [ ] WAF rules for OWASP top 10
 - [ ] S3 static site + CloudFront + Route53
