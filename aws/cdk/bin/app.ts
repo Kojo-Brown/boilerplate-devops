@@ -18,6 +18,7 @@ import { DbMigrationStack } from '../lib/db-migration-stack';
 import { RollbackAutomationStack } from '../lib/rollback-automation-stack';
 import { CostAnomalyStack } from '../lib/cost-anomaly-stack';
 import { SecurityHubStack } from '../lib/security-hub-stack';
+import { WafStack } from '../lib/waf-stack';
 
 const app = new cdk.App();
 
@@ -824,5 +825,80 @@ new CostAnomalyStack(app, 'CostAnomalyStack-Production', {
     region: 'us-east-1',
   },
   description: 'Production cost anomaly detection + $2000/month budget alerts (immediate notifications)',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+// ── WAF: OWASP Top 10 Rules ───────────────────────────────────────────────────
+// Attaches a WAFv2 Web ACL containing AWS managed rule groups that collectively
+// cover the OWASP Top 10:
+//   A1  Injection           — AWSManagedRulesCommonRuleSet + AWSManagedRulesSQLiRuleSet
+//   A2  Broken Auth         — rate-based rule (per-IP, 2,000 req/5 min)
+//   A3  Sensitive Exposure  — AWSManagedRulesLinuxRuleSet (path traversal)
+//   A5  Broken Access Ctrl  — AWSManagedRulesAdminProtectionRuleSet
+//   A6  Security Misconfig  — AWSManagedRulesKnownBadInputsRuleSet (log4j, SSRF)
+//   A7  XSS                 — AWSManagedRulesCommonRuleSet
+//   A8  Insecure Deserial.  — AWSManagedRulesKnownBadInputsRuleSet
+//  Reputation               — AWSManagedRulesAmazonIpReputationList
+//
+// REGIONAL scope covers ALB and API Gateway.  To protect a CloudFront distribution:
+//   - Set scope: 'CLOUDFRONT' and deploy the stack to us-east-1.
+//   - Set associatedResourceArn to the CloudFront distribution ARN.
+//
+// To associate with an ALB set associatedResourceArn to the ALB's ARN after
+// the ECS stack has deployed.
+//
+// Usage:
+//   STAGING_WAF_EMAIL=sec@example.com  cdk deploy WafStack-Staging
+//   PRODUCTION_WAF_EMAIL=ciso@example.com  cdk deploy WafStack-Production
+//
+// To evaluate rules before enforcing them, override individual rules to COUNT:
+//   coreRuleSetOverrides: [{ ruleName: 'SizeRestrictions_BODY', action: 'COUNT' }]
+
+const stagingWafEmails = process.env.STAGING_WAF_EMAIL ? [process.env.STAGING_WAF_EMAIL] : [];
+const productionWafEmails = process.env.PRODUCTION_WAF_EMAIL
+  ? [process.env.PRODUCTION_WAF_EMAIL]
+  : [];
+
+new WafStack(app, 'WafStack-Staging', {
+  envName: 'staging',
+  scope: 'REGIONAL',
+  enableCoreRuleSet: true,
+  enableKnownBadInputs: true,
+  enableSqlDatabase: true,
+  enableLinuxRuleSet: true,
+  enablePhpRuleSet: true,
+  enableAdminProtection: true,
+  enableAmazonIpReputation: true,
+  enableAnonymousIpList: false,
+  rateLimitPerIp: 2000,
+  blockedRequestsAlarmThreshold: 100,
+  notificationEmails: stagingWafEmails,
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Staging WAFv2 Web ACL — OWASP Top 10 managed rule groups on ALB',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+new WafStack(app, 'WafStack-Production', {
+  envName: 'production',
+  scope: 'REGIONAL',
+  enableCoreRuleSet: true,
+  enableKnownBadInputs: true,
+  enableSqlDatabase: true,
+  enableLinuxRuleSet: true,
+  enablePhpRuleSet: true,
+  enableAdminProtection: true,
+  enableAmazonIpReputation: true,
+  enableAnonymousIpList: true,
+  rateLimitPerIp: 2000,
+  blockedRequestsAlarmThreshold: 100,
+  notificationEmails: productionWafEmails,
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Production WAFv2 Web ACL — OWASP Top 10 + Anonymous IP managed rule groups on ALB',
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
