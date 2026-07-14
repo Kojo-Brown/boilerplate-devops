@@ -17,6 +17,7 @@ import { AppConfigStack } from '../lib/appconfig-stack';
 import { DbMigrationStack } from '../lib/db-migration-stack';
 import { RollbackAutomationStack } from '../lib/rollback-automation-stack';
 import { CostAnomalyStack } from '../lib/cost-anomaly-stack';
+import { SecurityHubStack } from '../lib/security-hub-stack';
 
 const app = new cdk.App();
 
@@ -746,6 +747,67 @@ new CostAnomalyStack(app, 'CostAnomalyStack-Staging', {
     region: 'us-east-1',
   },
   description: 'Staging cost anomaly detection + $500/month budget alerts',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+// ── GuardDuty + Security Hub ──────────────────────────────────────────────────
+// Enables threat detection (GuardDuty) and security posture management (Security Hub)
+// with FSBP and CIS Benchmark standards.  Deploy once per region.
+//
+// Only one GuardDuty detector can exist per account per region — if you already
+// have a detector, set enableGuardDuty: false and import the existing detector.
+//
+// After deployment:
+//   - Confirm SNS email subscriptions (sent to each notificationEmail).
+//   - Wire SecurityFindingsTopicArn to your incident response runbook / PagerDuty.
+//   - Export GuardDutyDetectorId for reference in ops playbooks.
+//
+// Usage:
+//   STAGING_SECURITY_EMAIL=sec@example.com  cdk deploy SecurityHubStack-Staging
+//   PRODUCTION_SECURITY_EMAIL=ciso@example.com  cdk deploy SecurityHubStack-Production
+
+const stagingSecurityEmails = process.env.STAGING_SECURITY_EMAIL
+  ? [process.env.STAGING_SECURITY_EMAIL]
+  : [];
+
+const productionSecurityEmails = process.env.PRODUCTION_SECURITY_EMAIL
+  ? [process.env.PRODUCTION_SECURITY_EMAIL]
+  : [];
+
+new SecurityHubStack(app, 'SecurityHubStack-Staging', {
+  envName: 'staging',
+  enableGuardDuty: true,
+  enableGuardDutyCloudTrail: true,
+  enableGuardDutyS3Logs: true,
+  enableFsbpStandard: true,
+  enableCisStandard: true,
+  enablePciStandard: false,
+  findingAlertSeverity: 'HIGH',
+  notificationEmails: stagingSecurityEmails,
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Staging GuardDuty + Security Hub baseline (FSBP + CIS), HIGH+ alerts',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+new SecurityHubStack(app, 'SecurityHubStack-Production', {
+  envName: 'production',
+  enableGuardDuty: true,
+  enableGuardDutyCloudTrail: true,
+  enableGuardDutyS3Logs: true,
+  enableFsbpStandard: true,
+  enableCisStandard: true,
+  enablePciStandard: false,
+  findingAlertSeverity: 'HIGH',
+  guardDutyPublishingFrequency: 'ONE_HOUR',
+  notificationEmails: productionSecurityEmails,
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Production GuardDuty + Security Hub baseline (FSBP + CIS), HIGH+ alerts, 1-hour publishing',
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
 
