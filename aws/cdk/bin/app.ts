@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import 'source-map-support/register';
 import * as cdk from 'aws-cdk-lib';
+import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
 import { VpcStack } from '../lib/vpc-stack';
 import { EcsStack } from '../lib/ecs-stack';
 import { RdsStack } from '../lib/rds-stack';
@@ -19,6 +20,7 @@ import { RollbackAutomationStack } from '../lib/rollback-automation-stack';
 import { CostAnomalyStack } from '../lib/cost-anomaly-stack';
 import { SecurityHubStack } from '../lib/security-hub-stack';
 import { WafStack } from '../lib/waf-stack';
+import { StaticSiteStack } from '../lib/static-site-stack';
 
 const app = new cdk.App();
 
@@ -900,5 +902,111 @@ new WafStack(app, 'WafStack-Production', {
     region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
   },
   description: 'Production WAFv2 Web ACL — OWASP Top 10 + Anonymous IP managed rule groups on ALB',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+// ── S3 Static Site + CloudFront + Route 53 ───────────────────────────────────
+// Hosts a static web application (React, Vue, Next.js static export, etc.) on
+// S3 behind a CloudFront distribution with HTTPS and optional Route 53 DNS.
+//
+// Architecture:
+//   Browser → CloudFront (HTTPS, OAC, gzip/brotli) → S3 bucket (private)
+//
+// Deployment workflow:
+//   Use workflow-templates/deploy-static-site.yml to build and sync your app:
+//
+//   jobs:
+//     deploy:
+//       uses: Kojo-Brown/boilerplate-devops/.github/workflows/deploy-static-site.yml@main
+//       with:
+//         environment: staging
+//         build-command: pnpm build
+//         build-output-dir: dist
+//         s3-bucket: ${{ vars.STAGING_S3_BUCKET_NAME }}       # StaticSiteStack output
+//         cloudfront-dist-id: ${{ vars.STAGING_CF_DIST_ID }} # StaticSiteStack output
+//       secrets:
+//         aws-role-arn: ${{ secrets.STAGING_STATIC_SITE_ROLE_ARN }}
+//
+// Custom domain (optional):
+//   1. Create an ACM certificate in us-east-1 for your domain.
+//   2. Set domainName + certificateArn below.
+//   3. Set hostedZoneId (preferred) or hostedZoneName for Route 53 auto-wiring.
+//   4. After deploy, verify A/AAAA records point at the CloudFront distribution.
+//
+// Stack must be deployed to us-east-1 (CloudFront ACM certificate requirement).
+//
+// Outputs to capture in GitHub Secrets / Variables:
+//   STAGING_S3_BUCKET_NAME   ← StaticSiteStack-Staging.SiteBucketName
+//   STAGING_CF_DIST_ID       ← StaticSiteStack-Staging.DistributionId
+//   PRODUCTION_S3_BUCKET_NAME ← StaticSiteStack-Production.SiteBucketName
+//   PRODUCTION_CF_DIST_ID     ← StaticSiteStack-Production.DistributionId
+
+const stagingStaticSiteCertArn =
+  (app.node.tryGetContext('stagingStaticSiteCertificateArn') as string | undefined) ??
+  process.env.STAGING_STATIC_SITE_CERTIFICATE_ARN;
+
+const productionStaticSiteCertArn =
+  (app.node.tryGetContext('productionStaticSiteCertificateArn') as string | undefined) ??
+  process.env.PRODUCTION_STATIC_SITE_CERTIFICATE_ARN;
+
+const stagingStaticSiteDomain =
+  (app.node.tryGetContext('stagingStaticSiteDomain') as string | undefined) ??
+  process.env.STAGING_STATIC_SITE_DOMAIN;
+
+const productionStaticSiteDomain =
+  (app.node.tryGetContext('productionStaticSiteDomain') as string | undefined) ??
+  process.env.PRODUCTION_STATIC_SITE_DOMAIN;
+
+const stagingHostedZoneId =
+  (app.node.tryGetContext('stagingHostedZoneId') as string | undefined) ??
+  process.env.STAGING_HOSTED_ZONE_ID;
+
+const productionHostedZoneId =
+  (app.node.tryGetContext('productionHostedZoneId') as string | undefined) ??
+  process.env.PRODUCTION_HOSTED_ZONE_ID;
+
+const stagingHostedZoneName =
+  (app.node.tryGetContext('stagingHostedZoneName') as string | undefined) ??
+  process.env.STAGING_HOSTED_ZONE_NAME;
+
+const productionHostedZoneName =
+  (app.node.tryGetContext('productionHostedZoneName') as string | undefined) ??
+  process.env.PRODUCTION_HOSTED_ZONE_NAME;
+
+new StaticSiteStack(app, 'StaticSiteStack-Staging', {
+  envName: 'staging',
+  domainName: stagingStaticSiteDomain,
+  certificateArn: stagingStaticSiteCertArn,
+  hostedZoneId: stagingHostedZoneId,
+  hostedZoneName: stagingHostedZoneName,
+  spaMode: true,
+  enableVersioning: true,
+  noncurrentVersionsToKeep: 5,
+  enableAccessLogging: false,
+  priceClass: cloudfront.PriceClass.PRICE_CLASS_100,
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: 'us-east-1', // CloudFront stacks must be in us-east-1
+  },
+  description: 'Staging S3 static site + CloudFront + Route 53 (SPA mode, US/EU edge)',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+new StaticSiteStack(app, 'StaticSiteStack-Production', {
+  envName: 'production',
+  domainName: productionStaticSiteDomain,
+  certificateArn: productionStaticSiteCertArn,
+  hostedZoneId: productionHostedZoneId,
+  hostedZoneName: productionHostedZoneName,
+  spaMode: true,
+  enableVersioning: true,
+  noncurrentVersionsToKeep: 10,
+  enableAccessLogging: true,
+  priceClass: cloudfront.PriceClass.PRICE_CLASS_ALL,
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: 'us-east-1', // CloudFront stacks must be in us-east-1
+  },
+  description: 'Production S3 static site + CloudFront + Route 53 (SPA mode, global edge, access logging)',
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });

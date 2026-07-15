@@ -1,0 +1,269 @@
+# Deploy a static site (React, Next.js static export, Vue, etc.) to S3 + CloudFront.
+#
+# Prerequisites:
+#   1. Deploy StaticSiteStack via CDK (aws/cdk/lib/static-site-stack.ts).
+#   2. Add the following GitHub Secrets / Variables to your repository:
+#
+#      Secrets:
+#        AWS_ROLE_ARN          — ARN of the IAM role to assume (OIDC; from GitHubOidcStack)
+#      Variables:
+#        AWS_REGION            — e.g. us-east-1
+#        S3_BUCKET_NAME        — value of StaticSiteStack output "SiteBucketName"
+#        CLOUDFRONT_DIST_ID    — value of StaticSiteStack output "DistributionId"
+#
+# Usage (call from your app repo):
+#
+#   jobs:
+#     deploy-staging:
+#       uses: Kojo-Brown/boilerplate-devops/.github/workflows/deploy-static-site.yml@main
+#       with:
+#         environment: staging
+#         build-command: pnpm build
+#         build-output-dir: dist
+#         s3-bucket: ${{ vars.STAGING_S3_BUCKET_NAME }}
+#         cloudfront-dist-id: ${{ vars.STAGING_CLOUDFRONT_DIST_ID }}
+#         aws-region: us-east-1
+#       secrets:
+#         aws-role-arn: ${{ secrets.STAGING_AWS_ROLE_ARN }}
+
+name: Deploy Static Site
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Deployment environment (staging | production)"
+        type: string
+        required: true
+      build-command:
+        description: "Command to build the static site (e.g. 'pnpm build')"
+        type: string
+        required: false
+        default: "pnpm build"
+      build-output-dir:
+        description: "Directory containing build output to sync to S3 (e.g. 'dist' or 'out')"
+        type: string
+        required: false
+        default: "dist"
+      node-version:
+        description: "Node.js version to use for building"
+        type: string
+        required: false
+        default: "22"
+      s3-bucket:
+        description: "Target S3 bucket name (StaticSiteStack SiteBucketName output)"
+        type: string
+        required: true
+      cloudfront-dist-id:
+        description: "CloudFront distribution ID to invalidate after deploy"
+        type: string
+        required: true
+      aws-region:
+        description: "AWS region where the S3 bucket lives (must be us-east-1 for CloudFront)"
+        type: string
+        required: false
+        default: "us-east-1"
+      invalidation-paths:
+        description: "Space-separated CloudFront paths to invalidate (default: '/*')"
+        type: string
+        required: false
+        default: "/*"
+      cache-control-immutable:
+        description: "Glob patterns (comma-separated) for assets with immutable cache headers"
+        type: string
+        required: false
+        default: "*.js,*.css,*.woff2,*.woff,*.ttf,*.svg,*.png,*.jpg,*.webp,*.avif"
+      cache-control-html:
+        description: "Cache-Control value for HTML files (revalidated on every request)"
+        type: string
+        required: false
+        default: "no-cache, no-store, must-revalidate"
+      working-directory:
+        description: "Repository subdirectory that contains the project (monorepo support)"
+        type: string
+        required: false
+        default: "."
+    secrets:
+      aws-role-arn:
+        description: "ARN of the IAM role to assume via OIDC"
+        required: true
+    outputs:
+      site-url:
+        description: "Public URL of the deployed site"
+        value: ${{ jobs.deploy.outputs.site-url }}
+      distribution-domain:
+        description: "CloudFront domain name (*.cloudfront.net)"
+        value: ${{ jobs.deploy.outputs.distribution-domain }}
+
+jobs:
+  deploy:
+    name: Deploy → ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write  # required for OIDC token
+      contents: read
+
+    outputs:
+      site-url: ${{ steps.site-info.outputs.site-url }}
+      distribution-domain: ${{ steps.site-info.outputs.distribution-domain }}
+
+    steps:
+      # ── Checkout ─────────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Node.js + package manager ─────────────────────────────────────────────
+      - name: Set up Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: "pnpm"
+          cache-dependency-path: ${{ inputs.working-directory }}/pnpm-lock.yaml
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      # ── Install dependencies ──────────────────────────────────────────────────
+      - name: Install dependencies
+        working-directory: ${{ inputs.working-directory }}
+        run: pnpm install --frozen-lockfile
+
+      # ── Build ─────────────────────────────────────────────────────────────────
+      - name: Build static site
+        working-directory: ${{ inputs.working-directory }}
+        run: ${{ inputs.build-command }}
+        env:
+          NODE_ENV: production
+
+      # ── Validate build output ─────────────────────────────────────────────────
+      - name: Validate build output
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          BUILD_DIR="${{ inputs.build-output-dir }}"
+          if [ ! -d "$BUILD_DIR" ]; then
+            echo "::error::Build output directory '$BUILD_DIR' does not exist."
+            echo "::error::Check the 'build-output-dir' input matches your build tool output (dist, out, build, public)."
+            exit 1
+          fi
+          FILE_COUNT=$(find "$BUILD_DIR" -type f | wc -l)
+          echo "Build output: $FILE_COUNT files in $BUILD_DIR"
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "::error::Build output directory is empty."
+            exit 1
+          fi
+          ls -lah "$BUILD_DIR" | head -20
+
+      # ── AWS credentials via OIDC ──────────────────────────────────────────────
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.aws-role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+          role-session-name: static-site-deploy-${{ inputs.environment }}-${{ github.run_id }}
+
+      # ── Sync HTML files (no-cache) ────────────────────────────────────────────
+      # Upload HTML first with no-cache so CDN edge nodes revalidate index.html
+      # and entry points immediately. Hashed assets are uploaded after.
+      - name: Sync HTML files (no-cache)
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          aws s3 sync \
+            "${{ inputs.build-output-dir }}" \
+            "s3://${{ inputs.s3-bucket }}" \
+            --exclude "*" \
+            --include "*.html" \
+            --cache-control "${{ inputs.cache-control-html }}" \
+            --content-type "text/html; charset=utf-8" \
+            --delete \
+            --no-progress
+
+      # ── Sync immutable hashed assets (long-lived cache) ───────────────────────
+      - name: Sync immutable assets (cache: 1 year)
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          IFS=',' read -ra PATTERNS <<< "${{ inputs.cache-control-immutable }}"
+          INCLUDE_FLAGS=""
+          for pattern in "${PATTERNS[@]}"; do
+            pattern=$(echo "$pattern" | xargs)  # trim whitespace
+            INCLUDE_FLAGS="$INCLUDE_FLAGS --include \"$pattern\""
+          done
+          eval aws s3 sync \
+            "\"${{ inputs.build-output-dir }}\"" \
+            "\"s3://${{ inputs.s3-bucket }}\"" \
+            --exclude "*" \
+            $INCLUDE_FLAGS \
+            --cache-control "public, max-age=31536000, immutable" \
+            --no-progress
+
+      # ── Sync remaining static assets ──────────────────────────────────────────
+      - name: Sync remaining files (cache: 1 hour)
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          aws s3 sync \
+            "${{ inputs.build-output-dir }}" \
+            "s3://${{ inputs.s3-bucket }}" \
+            --exclude "*.html" \
+            --cache-control "public, max-age=3600" \
+            --no-progress
+
+      # ── CloudFront cache invalidation ─────────────────────────────────────────
+      - name: Invalidate CloudFront cache
+        id: invalidate
+        run: |
+          PATHS="${{ inputs.invalidation-paths }}"
+          INVALIDATION_ID=$(aws cloudfront create-invalidation \
+            --distribution-id "${{ inputs.cloudfront-dist-id }}" \
+            --paths $PATHS \
+            --query 'Invalidation.Id' \
+            --output text)
+          echo "invalidation-id=$INVALIDATION_ID" >> "$GITHUB_OUTPUT"
+          echo "Created invalidation: $INVALIDATION_ID"
+
+      # ── Wait for invalidation to complete ─────────────────────────────────────
+      - name: Wait for CloudFront invalidation
+        run: |
+          echo "Waiting for invalidation ${{ steps.invalidate.outputs.invalidation-id }} to complete..."
+          aws cloudfront wait invalidation-completed \
+            --distribution-id "${{ inputs.cloudfront-dist-id }}" \
+            --id "${{ steps.invalidate.outputs.invalidation-id }}"
+          echo "Invalidation complete."
+
+      # ── Retrieve site info ────────────────────────────────────────────────────
+      - name: Get site URL
+        id: site-info
+        run: |
+          DOMAIN=$(aws cloudfront get-distribution \
+            --id "${{ inputs.cloudfront-dist-id }}" \
+            --query 'Distribution.DomainName' \
+            --output text)
+          echo "distribution-domain=$DOMAIN" >> "$GITHUB_OUTPUT"
+          echo "site-url=https://$DOMAIN" >> "$GITHUB_OUTPUT"
+          echo "Site URL: https://$DOMAIN"
+
+      # ── Smoke test ────────────────────────────────────────────────────────────
+      - name: Smoke test — check HTTP 200
+        run: |
+          DOMAIN="${{ steps.site-info.outputs.distribution-domain }}"
+          STATUS=$(curl -o /dev/null -s -w "%{http_code}" "https://$DOMAIN/")
+          if [ "$STATUS" != "200" ]; then
+            echo "::warning::Smoke test returned HTTP $STATUS (expected 200) for https://$DOMAIN/"
+          else
+            echo "Smoke test passed: HTTP $STATUS"
+          fi
+
+      # ── Summary ───────────────────────────────────────────────────────────────
+      - name: Deployment summary
+        run: |
+          echo "## Static Site Deployed ✓" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Environment | \`${{ inputs.environment }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| S3 Bucket | \`${{ inputs.s3-bucket }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| CloudFront Distribution | \`${{ inputs.cloudfront-dist-id }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Invalidation | \`${{ steps.invalidate.outputs.invalidation-id }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Site URL | ${{ steps.site-info.outputs.site-url }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Commit | \`${{ github.sha }}\` |" >> "$GITHUB_STEP_SUMMARY"
