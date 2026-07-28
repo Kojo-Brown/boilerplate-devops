@@ -89,6 +89,14 @@ export interface ParameterStoreStackProps extends cdk.StackProps {
  *          WithDecryption: true,
  *        }));
  *
+ * Caveat — SecureString parameters:
+ *   CloudFormation does not support *creating* SecureString parameters. The
+ *   SecureString branch below synthesizes valid CDK output, but a real
+ *   `cdk deploy` of those parameters will be rejected by CloudFormation.
+ *   For secrets, prefer the SecretsManagerStack; for existing SecureString
+ *   parameters, import them with
+ *   `ssm.StringParameter.fromSecureStringParameterAttributes`.
+ *
  * Security:
  *   - SecureString parameters encrypted with a CMK (annual auto-rotation)
  *   - String/StringList parameters readable only by principals explicitly granted access
@@ -158,20 +166,24 @@ export class ParameterStoreStack extends cdk.Stack {
 
       if (paramType === 'SecureString') {
         // CDK's high-level constructs do not support SecureString creation.
-        // We drop to L1 (CfnParameter) and attach a custom resource for the
-        // removal policy, then wrap in StringParameter.fromSecureStringParameterAttributes
-        // for IAM grant methods.
+        // We drop to L1 (CfnParameter), then wrap in
+        // StringParameter.fromSecureStringParameterAttributes for IAM grant methods.
         const cfnParam = new ssm.CfnParameter(this, `Param-${logicalId}`, {
           name: paramName,
           description: def.description,
           type: 'SecureString',
           value: def.value ?? 'REPLACE_ME',
           tier: paramTier,
-          // CDK's CfnParameter does not accept a KMS key ID directly — the
-          // key ARN is passed as the KeyId field (accepted by SSM API).
-          keyId: this.encryptionKey?.keyArn,
         });
         cfnParam.applyRemovalPolicy(removalPolicy);
+
+        // KeyId is absent from CfnParameterProps because CloudFormation does not
+        // officially support creating SecureString parameters (see the caveat on
+        // this class). A raw property override is the only way to associate the
+        // CMK; the synthesized template carries it verbatim.
+        if (this.encryptionKey) {
+          cfnParam.addPropertyOverride('KeyId', this.encryptionKey.keyArn);
+        }
 
         param = ssm.StringParameter.fromSecureStringParameterAttributes(
           this,

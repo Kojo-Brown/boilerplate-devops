@@ -4,6 +4,7 @@ import {
   SecurityHubStack,
   SecurityHubStackProps,
 } from '../lib/security-hub-stack';
+import { flattenedProps } from './support/cfn';
 
 const BASE_PROPS: SecurityHubStackProps = {
   envName: 'test',
@@ -17,6 +18,23 @@ const makeStack = (overrides: Partial<SecurityHubStackProps> = {}) => {
     ...overrides,
   });
   return { stack, template: Template.fromStack(stack) };
+};
+
+/** Standards ARNs embed stack.partition/stack.region, so they synth as Fn::Join. */
+const standardsArns = (template: Template): string[] =>
+  flattenedProps(template, 'AWS::SecurityHub::Standard', 'StandardsArn');
+
+/**
+ * EventBridge rule patterns synthesize as plain objects (not JSON strings), so
+ * they are read straight off the template rather than JSON.parse'd.
+ */
+const eventPatternFor = (template: Template, source: string): Record<string, unknown> => {
+  const rules = Object.values(template.findResources('AWS::Events::Rule')).map(
+    (r) => (r.Properties as { EventPattern: Record<string, unknown> }).EventPattern,
+  );
+  const match = rules.find((p) => (p.source as string[] | undefined)?.includes(source));
+  expect(match).toBeDefined();
+  return match!;
 };
 
 describe('SecurityHubStack', () => {
@@ -96,14 +114,26 @@ describe('SecurityHubStack', () => {
       });
     });
 
-    it('enables CloudTrail and S3 data sources by default', () => {
+    it('enables the S3 data source by default', () => {
       const { template } = makeStack();
       template.hasResourceProperties('AWS::GuardDuty::Detector', {
         DataSources: Match.objectLike({
-          CloudTrail: { Enable: true },
           S3Logs: { Enable: true },
         }),
       });
+    });
+
+    // CloudTrail management events are foundational to GuardDuty — always on and
+    // not expressible under DataSources. Asserting its absence keeps the template
+    // deployable if someone reintroduces the property.
+    it('does not emit a CloudTrail data source', () => {
+      const { template } = makeStack();
+      const detectors = template.findResources('AWS::GuardDuty::Detector');
+      const dataSources = Object.values(detectors).map(
+        (d) => (d.Properties as { DataSources: Record<string, unknown> }).DataSources,
+      );
+      expect(dataSources).toHaveLength(1);
+      expect(dataSources[0]).not.toHaveProperty('CloudTrail');
     });
 
     it('omits the detector when enableGuardDuty is false', () => {
@@ -155,39 +185,31 @@ describe('SecurityHubStack', () => {
 
     it('enables the FSBP standard when enableFsbpStandard is true (default)', () => {
       const { template } = makeStack();
-      template.hasResourceProperties('AWS::SecurityHub::Standard', {
-        StandardsArn: Match.stringLikeRegexp(
-          'standards/aws-foundational-security-best-practices/v/1\\.0\\.0',
-        ),
-      });
+      expect(standardsArns(template)).toContainEqual(
+        expect.stringContaining('standards/aws-foundational-security-best-practices/v/1.0.0'),
+      );
     });
 
     it('enables the CIS Benchmark standard when enableCisStandard is true (default)', () => {
       const { template } = makeStack();
-      template.hasResourceProperties('AWS::SecurityHub::Standard', {
-        StandardsArn: Match.stringLikeRegexp(
-          'cis-aws-foundations-benchmark/v/1\\.4\\.0',
-        ),
-      });
+      expect(standardsArns(template)).toContainEqual(
+        expect.stringContaining('ruleset/cis-aws-foundations-benchmark/v/1.4.0'),
+      );
     });
 
     it('does not enable PCI DSS by default', () => {
       const { template } = makeStack();
-      const standards = template.findResources('AWS::SecurityHub::Standard');
-      const hasPci = Object.values(standards).some((r) =>
-        String((r as { Properties: { StandardsArn: string } }).Properties.StandardsArn).includes(
-          'pci-dss',
-        ),
+      expect(standardsArns(template)).not.toContainEqual(
+        expect.stringContaining('pci-dss'),
       );
-      expect(hasPci).toBe(false);
     });
 
     it('enables PCI DSS when enablePciStandard is true', () => {
       const { template } = makeStack({ enablePciStandard: true });
       template.resourceCountIs('AWS::SecurityHub::Standard', 3);
-      template.hasResourceProperties('AWS::SecurityHub::Standard', {
-        StandardsArn: Match.stringLikeRegexp('pci-dss/v/3\\.2\\.1'),
-      });
+      expect(standardsArns(template)).toContainEqual(
+        expect.stringContaining('standards/pci-dss/v/3.2.1'),
+      );
     });
 
     it('enables no standards when all flags are false', () => {
@@ -238,50 +260,16 @@ describe('SecurityHubStack', () => {
       });
     });
 
-    it('GuardDuty rule defaults to numeric severity >= 7 (HIGH)', () => {
-      const { template } = makeStack();
-      const rules = template.findResources('AWS::Events::Rule');
-      const gdRule = Object.values(rules).find((r) => {
-        const p = (r as { Properties: { EventPattern: string } }).Properties.EventPattern;
-        const pattern = JSON.parse(p) as { source?: string[] };
-        return pattern.source?.includes('aws.guardduty');
-      }) as { Properties: { EventPattern: string } } | undefined;
-
-      expect(gdRule).toBeDefined();
-      const pattern = JSON.parse(gdRule!.Properties.EventPattern) as {
+    it.each([
+      ['defaults to numeric severity >= 7 (HIGH)', undefined, 7],
+      ['uses severity >= 9 when findingAlertSeverity is CRITICAL', 'CRITICAL' as const, 9],
+      ['uses severity >= 4 when findingAlertSeverity is MEDIUM', 'MEDIUM' as const, 4],
+    ])('GuardDuty rule %s', (_name, severity, expected) => {
+      const { template } = makeStack(severity ? { findingAlertSeverity: severity } : {});
+      const pattern = eventPatternFor(template, 'aws.guardduty') as {
         detail: { severity: { numeric: [string, number] }[] };
       };
-      expect(pattern.detail.severity[0].numeric).toEqual(['>=', 7]);
-    });
-
-    it('GuardDuty rule uses severity >= 9 when findingAlertSeverity is CRITICAL', () => {
-      const { template } = makeStack({ findingAlertSeverity: 'CRITICAL' });
-      const rules = template.findResources('AWS::Events::Rule');
-      const gdRule = Object.values(rules).find((r) => {
-        const p = (r as { Properties: { EventPattern: string } }).Properties.EventPattern;
-        const pattern = JSON.parse(p) as { source?: string[] };
-        return pattern.source?.includes('aws.guardduty');
-      }) as { Properties: { EventPattern: string } } | undefined;
-
-      const pattern = JSON.parse(gdRule!.Properties.EventPattern) as {
-        detail: { severity: { numeric: [string, number] }[] };
-      };
-      expect(pattern.detail.severity[0].numeric).toEqual(['>=', 9]);
-    });
-
-    it('GuardDuty rule uses severity >= 4 when findingAlertSeverity is MEDIUM', () => {
-      const { template } = makeStack({ findingAlertSeverity: 'MEDIUM' });
-      const rules = template.findResources('AWS::Events::Rule');
-      const gdRule = Object.values(rules).find((r) => {
-        const p = (r as { Properties: { EventPattern: string } }).Properties.EventPattern;
-        const pattern = JSON.parse(p) as { source?: string[] };
-        return pattern.source?.includes('aws.guardduty');
-      }) as { Properties: { EventPattern: string } } | undefined;
-
-      const pattern = JSON.parse(gdRule!.Properties.EventPattern) as {
-        detail: { severity: { numeric: [string, number] }[] };
-      };
-      expect(pattern.detail.severity[0].numeric).toEqual(['>=', 4]);
+      expect(pattern.detail.severity[0].numeric).toEqual(['>=', expected]);
     });
 
     it('Security Hub rule matches aws.securityhub source', () => {
@@ -294,51 +282,26 @@ describe('SecurityHubStack', () => {
       });
     });
 
-    it('Security Hub rule filters on HIGH and CRITICAL labels by default', () => {
-      const { template } = makeStack();
-      const rules = template.findResources('AWS::Events::Rule');
-      const shRule = Object.values(rules).find((r) => {
-        const p = (r as { Properties: { EventPattern: string } }).Properties.EventPattern;
-        const pattern = JSON.parse(p) as { source?: string[] };
-        return pattern.source?.includes('aws.securityhub');
-      }) as { Properties: { EventPattern: string } } | undefined;
-
-      expect(shRule).toBeDefined();
-      const pattern = JSON.parse(shRule!.Properties.EventPattern) as {
+    it.each([
+      ['filters on HIGH and CRITICAL labels by default', undefined, ['HIGH', 'CRITICAL']],
+      [
+        'includes MEDIUM when findingAlertSeverity is MEDIUM',
+        'MEDIUM' as const,
+        ['MEDIUM', 'HIGH', 'CRITICAL'],
+      ],
+      [
+        'only includes CRITICAL when findingAlertSeverity is CRITICAL',
+        'CRITICAL' as const,
+        ['CRITICAL'],
+      ],
+    ])('Security Hub rule %s', (_name, severity, expected) => {
+      const { template } = makeStack(severity ? { findingAlertSeverity: severity } : {});
+      const pattern = eventPatternFor(template, 'aws.securityhub') as {
         detail: { findings: { Severity: { Label: string[] } } };
       };
-      expect(pattern.detail.findings.Severity.Label).toEqual(['HIGH', 'CRITICAL']);
+      expect(pattern.detail.findings.Severity.Label).toEqual(expected);
     });
 
-    it('Security Hub rule includes MEDIUM when findingAlertSeverity is MEDIUM', () => {
-      const { template } = makeStack({ findingAlertSeverity: 'MEDIUM' });
-      const rules = template.findResources('AWS::Events::Rule');
-      const shRule = Object.values(rules).find((r) => {
-        const p = (r as { Properties: { EventPattern: string } }).Properties.EventPattern;
-        const pattern = JSON.parse(p) as { source?: string[] };
-        return pattern.source?.includes('aws.securityhub');
-      }) as { Properties: { EventPattern: string } } | undefined;
-
-      const pattern = JSON.parse(shRule!.Properties.EventPattern) as {
-        detail: { findings: { Severity: { Label: string[] } } };
-      };
-      expect(pattern.detail.findings.Severity.Label).toEqual(['MEDIUM', 'HIGH', 'CRITICAL']);
-    });
-
-    it('Security Hub rule only includes CRITICAL when findingAlertSeverity is CRITICAL', () => {
-      const { template } = makeStack({ findingAlertSeverity: 'CRITICAL' });
-      const rules = template.findResources('AWS::Events::Rule');
-      const shRule = Object.values(rules).find((r) => {
-        const p = (r as { Properties: { EventPattern: string } }).Properties.EventPattern;
-        const pattern = JSON.parse(p) as { source?: string[] };
-        return pattern.source?.includes('aws.securityhub');
-      }) as { Properties: { EventPattern: string } } | undefined;
-
-      const pattern = JSON.parse(shRule!.Properties.EventPattern) as {
-        detail: { findings: { Severity: { Label: string[] } } };
-      };
-      expect(pattern.detail.findings.Severity.Label).toEqual(['CRITICAL']);
-    });
 
     it('both rules target the security findings SNS topic', () => {
       const { stack } = makeStack();

@@ -4,6 +4,7 @@ import {
   RollbackAutomationStack,
   RollbackAutomationStackProps,
 } from '../lib/rollback-automation-stack';
+import { managedPolicyArns, resourceProps } from './support/cfn';
 
 const ALARM_ARN_1 =
   'arn:aws:cloudwatch:us-east-1:123456789012:alarm:production-alb-5xx-elb';
@@ -33,6 +34,20 @@ const makeStack = (overrides: Partial<RollbackAutomationStackProps> = {}) => {
   });
   return { template: Template.fromStack(stack), stack };
 };
+
+/**
+ * Every action granted across all inline policies in the stack.
+ *
+ * CDK renders a statement with a single action as a bare string and one with
+ * several as an array, so both shapes are normalized here.
+ */
+const policyActions = (template: Template): string[] =>
+  resourceProps(template, 'AWS::IAM::Policy').flatMap((policy) => {
+    const { Statement } = policy.PolicyDocument as { Statement: { Action: string | string[] }[] };
+    return Statement.flatMap((stmt) =>
+      Array.isArray(stmt.Action) ? stmt.Action : [stmt.Action],
+    );
+  });
 
 describe('RollbackAutomationStack', () => {
   describe('validation', () => {
@@ -154,7 +169,7 @@ describe('RollbackAutomationStack', () => {
       const { template } = makeStack({ envName: 'staging' });
       template.hasResourceProperties('AWS::IAM::Role', {
         RoleName: 'staging-rollback-automation-lambda-role',
-        AssumedBy: Match.objectLike({
+        AssumeRolePolicyDocument: Match.objectLike({
           Statement: Match.arrayWith([
             Match.objectLike({
               Principal: { Service: 'lambda.amazonaws.com' },
@@ -166,11 +181,10 @@ describe('RollbackAutomationStack', () => {
 
     it('attaches AWSLambdaBasicExecutionRole managed policy', () => {
       const { template } = makeStack();
-      template.hasResourceProperties('AWS::IAM::Role', {
-        ManagedPolicyArns: Match.arrayWith([
-          Match.stringLikeRegexp('AWSLambdaBasicExecutionRole'),
-        ]),
-      });
+      const [role] = resourceProps(template, 'AWS::IAM::Role');
+      expect(managedPolicyArns(role)).toContainEqual(
+        expect.stringContaining('AWSLambdaBasicExecutionRole'),
+      );
     });
 
     it('grants ecs:DescribeServices permission', () => {
@@ -221,15 +235,7 @@ describe('RollbackAutomationStack', () => {
 
     it('grants SNS publish permission to the notification topic', () => {
       const { template } = makeStack();
-      template.hasResourceProperties('AWS::IAM::Policy', {
-        PolicyDocument: Match.objectLike({
-          Statement: Match.arrayWith([
-            Match.objectLike({
-              Action: Match.arrayWith(['sns:Publish']),
-            }),
-          ]),
-        }),
-      });
+      expect(policyActions(template)).toContain('sns:Publish');
     });
   });
 
@@ -267,42 +273,36 @@ describe('RollbackAutomationStack', () => {
     it('filters on ALARM state value', () => {
       const { template } = makeStack();
       template.hasResourceProperties('AWS::Events::Rule', {
-        EventPattern: Match.serializedJson(
-          Match.objectLike({
-            detail: Match.objectLike({
-              state: { value: ['ALARM'] },
-            }),
+        EventPattern: Match.objectLike({
+          detail: Match.objectLike({
+            state: { value: ['ALARM'] },
           }),
-        ),
+        }),
       });
     });
 
     it('filters on the specific alarm name extracted from the ARN', () => {
       const { template } = makeStack({ triggerAlarmArns: [ALARM_ARN_1] });
       template.hasResourceProperties('AWS::Events::Rule', {
-        EventPattern: Match.serializedJson(
-          Match.objectLike({
-            detail: Match.objectLike({
-              alarmName: ['production-alb-5xx-elb'],
-            }),
+        EventPattern: Match.objectLike({
+          detail: Match.objectLike({
+            alarmName: ['production-alb-5xx-elb'],
           }),
-        ),
+        }),
       });
     });
 
     it('includes all alarm names when multiple ARNs are provided', () => {
       const { template } = makeStack({ triggerAlarmArns: [ALARM_ARN_1, ALARM_ARN_2] });
       template.hasResourceProperties('AWS::Events::Rule', {
-        EventPattern: Match.serializedJson(
-          Match.objectLike({
-            detail: Match.objectLike({
-              alarmName: Match.arrayWith([
-                'production-alb-5xx-elb',
-                'production-ecs-cpu-high',
-              ]),
-            }),
+        EventPattern: Match.objectLike({
+          detail: Match.objectLike({
+            alarmName: Match.arrayWith([
+              'production-alb-5xx-elb',
+              'production-ecs-cpu-high',
+            ]),
           }),
-        ),
+        }),
       });
     });
 

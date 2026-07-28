@@ -5,6 +5,7 @@ import {
   SecretsManagerStack,
   SecretsManagerStackProps,
 } from '../lib/secrets-manager-stack';
+import { outputByExportName } from './support/cfn';
 
 const makeStack = (props: SecretsManagerStackProps = {}) => {
   const app = new cdk.App();
@@ -134,9 +135,7 @@ describe('SecretsManagerStack', () => {
         secrets: [{ key: 'stripe-api-key', description: 'Stripe key' }],
         enableKmsEncryption: false,
       });
-      template.hasOutput('SecretArn-stripe-api-key', {
-        Export: { Name: 'staging-secret-stripe-api-key-arn' },
-      });
+      expect(outputByExportName(template, 'staging-secret-stripe-api-key-arn')).toBeDefined();
     });
 
     it('exports the secret name for each key', () => {
@@ -145,9 +144,7 @@ describe('SecretsManagerStack', () => {
         secrets: [{ key: 'stripe-api-key', description: 'Stripe key' }],
         enableKmsEncryption: false,
       });
-      template.hasOutput('SecretName-stripe-api-key', {
-        Export: { Name: 'staging-secret-stripe-api-key-name' },
-      });
+      expect(outputByExportName(template, 'staging-secret-stripe-api-key-name')).toBeDefined();
     });
   });
 
@@ -214,8 +211,9 @@ describe('SecretsManagerStack', () => {
       });
       const keys = template.findResources('AWS::KMS::Key');
       const keyLogicalId = Object.keys(keys)[0];
+      // The secret references the CMK by ARN (Fn::GetAtt), not by Ref.
       template.hasResourceProperties('AWS::SecretsManager::Secret', {
-        KmsKeyId: { Ref: keyLogicalId },
+        KmsKeyId: { 'Fn::GetAtt': [keyLogicalId, 'Arn'] },
       });
     });
   });

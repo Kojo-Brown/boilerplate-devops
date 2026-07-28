@@ -205,7 +205,7 @@ export class StaticSiteStack extends cdk.Stack {
         cachePolicy: cloudfront.CachePolicy.CACHING_OPTIMIZED,
         responseHeadersPolicy:
           cloudfront.ResponseHeadersPolicy
-            .CORS_WITH_PREFLIGHT_AND_SECURITY_HEADERS,
+            .CORS_ALLOW_ALL_ORIGINS_WITH_PREFLIGHT_AND_SECURITY_HEADERS,
         allowedMethods: cloudfront.AllowedMethods.ALLOW_GET_HEAD_OPTIONS,
         cachedMethods: cloudfront.CachedMethods.CACHE_GET_HEAD_OPTIONS,
       },

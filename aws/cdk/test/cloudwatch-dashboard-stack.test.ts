@@ -19,6 +19,34 @@ const makeStack = (overrides: Partial<CloudWatchDashboardStackProps> = {}) => {
   return { stack, template: Template.fromStack(stack) };
 };
 
+/**
+ * A dashboard body is synthesized as an Fn::Join because it embeds CloudFormation
+ * tokens (the region, at minimum), so Match.serializedJson — which only accepts a
+ * plain string — can never match it. Flatten the join, substituting each token
+ * with a placeholder, and parse the result back into the widget object.
+ */
+interface DashboardWidget {
+  readonly properties?: { readonly metrics?: unknown[][] };
+}
+
+const dashboardBody = (template: Template): { widgets: DashboardWidget[] } => {
+  const dashboards = template.findResources('AWS::CloudWatch::Dashboard');
+  const bodies = Object.values(dashboards).map(
+    (d) => (d.Properties as { DashboardBody: unknown }).DashboardBody,
+  );
+  expect(bodies).toHaveLength(1);
+  const body = bodies[0] as string | { 'Fn::Join': [string, unknown[]] };
+  if (typeof body === 'string') return JSON.parse(body);
+  const [delimiter, parts] = body['Fn::Join'];
+  return JSON.parse(
+    parts.map((part) => (typeof part === 'string' ? part : '<token>')).join(delimiter),
+  );
+};
+
+/** Every `[namespace, metricName, ...dimensions]` tuple across all widgets. */
+const widgetMetrics = (template: Template): unknown[][] =>
+  dashboardBody(template).widgets.flatMap((w) => w.properties?.metrics ?? []);
+
 describe('CloudWatchDashboardStack', () => {
   describe('Dashboard resource', () => {
     it('creates exactly one CloudWatch Dashboard', () => {
@@ -40,124 +68,18 @@ describe('CloudWatchDashboardStack', () => {
       });
     });
 
-    it('embeds ECS CPUUtilization in the dashboard body', () => {
+    it.each([
+      ['ECS CPUUtilization', 'AWS/ECS', 'CPUUtilization'],
+      ['ECS MemoryUtilization', 'AWS/ECS', 'MemoryUtilization'],
+      ['ALB HTTPCode_ELB_5XX_Count', 'AWS/ApplicationELB', 'HTTPCode_ELB_5XX_Count'],
+      ['ALB HTTPCode_Target_5XX_Count', 'AWS/ApplicationELB', 'HTTPCode_Target_5XX_Count'],
+      ['RDS DatabaseConnections', 'AWS/RDS', 'DatabaseConnections'],
+      ['RDS CPUUtilization', 'AWS/RDS', 'CPUUtilization'],
+    ])('embeds %s in the dashboard body', (_label, namespace, metricName) => {
       const { template } = makeStack();
-      template.hasResourceProperties('AWS::CloudWatch::Dashboard', {
-        DashboardBody: Match.serializedJson(
-          Match.objectLike({
-            widgets: Match.arrayWith([
-              Match.objectLike({
-                properties: Match.objectLike({
-                  metrics: Match.arrayWith([
-                    Match.arrayWith(['AWS/ECS', 'CPUUtilization']),
-                  ]),
-                }),
-              }),
-            ]),
-          }),
-        ),
-      });
-    });
-
-    it('embeds ECS MemoryUtilization in the dashboard body', () => {
-      const { template } = makeStack();
-      template.hasResourceProperties('AWS::CloudWatch::Dashboard', {
-        DashboardBody: Match.serializedJson(
-          Match.objectLike({
-            widgets: Match.arrayWith([
-              Match.objectLike({
-                properties: Match.objectLike({
-                  metrics: Match.arrayWith([
-                    Match.arrayWith(['AWS/ECS', 'MemoryUtilization']),
-                  ]),
-                }),
-              }),
-            ]),
-          }),
-        ),
-      });
-    });
-
-    it('embeds ALB HTTPCode_ELB_5XX_Count in the dashboard body', () => {
-      const { template } = makeStack();
-      template.hasResourceProperties('AWS::CloudWatch::Dashboard', {
-        DashboardBody: Match.serializedJson(
-          Match.objectLike({
-            widgets: Match.arrayWith([
-              Match.objectLike({
-                properties: Match.objectLike({
-                  metrics: Match.arrayWith([
-                    Match.arrayWith([
-                      'AWS/ApplicationELB',
-                      'HTTPCode_ELB_5XX_Count',
-                    ]),
-                  ]),
-                }),
-              }),
-            ]),
-          }),
-        ),
-      });
-    });
-
-    it('embeds ALB HTTPCode_Target_5XX_Count in the dashboard body', () => {
-      const { template } = makeStack();
-      template.hasResourceProperties('AWS::CloudWatch::Dashboard', {
-        DashboardBody: Match.serializedJson(
-          Match.objectLike({
-            widgets: Match.arrayWith([
-              Match.objectLike({
-                properties: Match.objectLike({
-                  metrics: Match.arrayWith([
-                    Match.arrayWith([
-                      'AWS/ApplicationELB',
-                      'HTTPCode_Target_5XX_Count',
-                    ]),
-                  ]),
-                }),
-              }),
-            ]),
-          }),
-        ),
-      });
-    });
-
-    it('embeds RDS DatabaseConnections in the dashboard body', () => {
-      const { template } = makeStack();
-      template.hasResourceProperties('AWS::CloudWatch::Dashboard', {
-        DashboardBody: Match.serializedJson(
-          Match.objectLike({
-            widgets: Match.arrayWith([
-              Match.objectLike({
-                properties: Match.objectLike({
-                  metrics: Match.arrayWith([
-                    Match.arrayWith(['AWS/RDS', 'DatabaseConnections']),
-                  ]),
-                }),
-              }),
-            ]),
-          }),
-        ),
-      });
-    });
-
-    it('embeds RDS CPUUtilization in the dashboard body', () => {
-      const { template } = makeStack();
-      template.hasResourceProperties('AWS::CloudWatch::Dashboard', {
-        DashboardBody: Match.serializedJson(
-          Match.objectLike({
-            widgets: Match.arrayWith([
-              Match.objectLike({
-                properties: Match.objectLike({
-                  metrics: Match.arrayWith([
-                    Match.arrayWith(['AWS/RDS', 'CPUUtilization']),
-                  ]),
-                }),
-              }),
-            ]),
-          }),
-        ),
-      });
+      expect(widgetMetrics(template)).toContainEqual(
+        expect.arrayContaining([namespace, metricName]),
+      );
     });
   });
 

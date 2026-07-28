@@ -98,8 +98,8 @@ export class BlueGreenDeployStack extends cdk.Stack {
 
     const deploymentConfigMap: Record<BlueGreenDeploymentConfigType, codedeploy.IEcsDeploymentConfig> = {
       AllAtOnce: codedeploy.EcsDeploymentConfig.ALL_AT_ONCE,
-      Canary10Percent5Minutes: codedeploy.EcsDeploymentConfig.CANARY_10_PERCENT_5_MINUTES,
-      Linear10Percent1Minute: codedeploy.EcsDeploymentConfig.LINEAR_10_PERCENT_EVERY_1_MINUTES,
+      Canary10Percent5Minutes: codedeploy.EcsDeploymentConfig.CANARY_10PERCENT_5MINUTES,
+      Linear10Percent1Minute: codedeploy.EcsDeploymentConfig.LINEAR_10PERCENT_EVERY_1MINUTES,
     };
     const deploymentConfig =
       deploymentConfigMap[props.deploymentConfigType ?? 'Linear10Percent1Minute'];

@@ -1,6 +1,18 @@
 import * as cdk from 'aws-cdk-lib';
 import { Template, Match } from 'aws-cdk-lib/assertions';
 import { VpcStack } from '../lib/vpc-stack';
+import { flattenIntrinsic, resourceProps } from './support/cfn';
+
+/**
+ * Gateway endpoint service names, flattened.
+ *
+ * They are built as `com.amazonaws.<region>.<service>` with the region as a
+ * token, so each synthesizes to an Fn::Join rather than a plain string.
+ */
+const gatewayEndpointServiceNames = (template: Template): string[] =>
+  resourceProps(template, 'AWS::EC2::VPCEndpoint')
+    .filter((e) => e.VpcEndpointType === 'Gateway')
+    .map((e) => flattenIntrinsic(e.ServiceName));
 
 describe('VpcStack', () => {
   const makeTemplate = (props?: ConstructorParameters<typeof VpcStack>[2]) => {
@@ -117,18 +129,16 @@ describe('VpcStack', () => {
   describe('VPC Endpoints', () => {
     it('creates an S3 Gateway endpoint', () => {
       const { template } = makeTemplate();
-      template.hasResourceProperties('AWS::EC2::VPCEndpoint', {
-        ServiceName: Match.stringLikeRegexp('s3'),
-        VpcEndpointType: 'Gateway',
-      });
+      expect(gatewayEndpointServiceNames(template)).toContainEqual(
+        expect.stringContaining('.s3'),
+      );
     });
 
     it('creates a DynamoDB Gateway endpoint', () => {
       const { template } = makeTemplate();
-      template.hasResourceProperties('AWS::EC2::VPCEndpoint', {
-        ServiceName: Match.stringLikeRegexp('dynamodb'),
-        VpcEndpointType: 'Gateway',
-      });
+      expect(gatewayEndpointServiceNames(template)).toContainEqual(
+        expect.stringContaining('.dynamodb'),
+      );
     });
   });
 

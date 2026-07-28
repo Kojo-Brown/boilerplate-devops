@@ -99,14 +99,14 @@ describe('RdsStack', () => {
     it('defaults to a 30-day rotation period', () => {
       const { template } = makeStacks();
       template.hasResourceProperties('AWS::SecretsManager::RotationSchedule', {
-        RotationRules: Match.objectLike({ AutomaticallyAfterDays: 30 }),
+        RotationRules: Match.objectLike({ ScheduleExpression: 'rate(30 days)' }),
       });
     });
 
     it('respects a custom rotation period', () => {
       const { template } = makeStacks({ secretRotationDays: 14 });
       template.hasResourceProperties('AWS::SecretsManager::RotationSchedule', {
-        RotationRules: Match.objectLike({ AutomaticallyAfterDays: 14 }),
+        RotationRules: Match.objectLike({ ScheduleExpression: 'rate(14 days)' }),
       });
     });
 

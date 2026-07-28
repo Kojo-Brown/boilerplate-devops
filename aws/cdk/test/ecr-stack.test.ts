@@ -1,6 +1,7 @@
 import * as cdk from 'aws-cdk-lib';
 import { Template, Match } from 'aws-cdk-lib/assertions';
 import { EcrStack, EcrStackProps } from '../lib/ecr-stack';
+import { resourceProps } from './support/cfn';
 
 const makeStack = (props: EcrStackProps = {}) => {
   const app = new cdk.App();
@@ -48,9 +49,11 @@ describe('EcrStack', () => {
 
     it('uses AES-256 encryption by default', () => {
       const { template } = makeStack();
-      template.hasResourceProperties('AWS::ECR::Repository', {
-        EncryptionConfiguration: { EncryptionType: 'AES256' },
-      });
+      // AES256 is ECR's server-side default, and CDK deliberately omits
+      // EncryptionConfiguration for it — the block is only emitted when a KMS
+      // key is involved. Asserting its absence is what pins "not KMS-encrypted".
+      const [repository] = resourceProps(template, 'AWS::ECR::Repository');
+      expect(repository.EncryptionConfiguration).toBeUndefined();
     });
 
     it('enforces immutable image tags', () => {
@@ -164,9 +167,9 @@ describe('EcrStack', () => {
       });
       const repos = template.findResources('AWS::ECR::Repository');
       const repoLogicalId = Object.keys(repos)[0];
-      const policyText = JSON.parse(
-        repos[repoLogicalId].Properties.RepositoryPolicyText,
-      ) as { Statement: Array<{ Sid: string; Principal: { AWS: string | string[] } }> };
+      const policyText = repos[repoLogicalId].Properties.RepositoryPolicyText as {
+        Statement: Array<{ Sid: string; Principal: { AWS: string | string[] } }>;
+      };
       const crossAccountStatement = policyText.Statement.find(
         (s) => s.Sid === 'CrossAccountPull',
       );
@@ -179,9 +182,7 @@ describe('EcrStack', () => {
       });
       const repos = template.findResources('AWS::ECR::Repository');
       const repoLogicalId = Object.keys(repos)[0];
-      const policyText = JSON.parse(
-        repos[repoLogicalId].Properties.RepositoryPolicyText,
-      ) as {
+      const policyText = repos[repoLogicalId].Properties.RepositoryPolicyText as {
         Statement: Array<{ Sid: string; Action: string | string[] }>;
       };
       const crossAccountStatement = policyText.Statement.find(

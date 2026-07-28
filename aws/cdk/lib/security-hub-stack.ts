@@ -13,8 +13,6 @@ export interface SecurityHubStackProps extends cdk.StackProps {
   readonly envName?: string;
   /** Enable GuardDuty threat detection (default: true) */
   readonly enableGuardDuty?: boolean;
-  /** Enable GuardDuty CloudTrail management events data source (default: true) */
-  readonly enableGuardDutyCloudTrail?: boolean;
   /** Enable GuardDuty S3 data events data source (default: true) */
   readonly enableGuardDutyS3Logs?: boolean;
   /** Enable GuardDuty Kubernetes audit log data source (default: false) */
@@ -96,20 +94,19 @@ export class SecurityHubStack extends cdk.Stack {
 
     // ── GuardDuty Detector ───────────────────────────────────────────────────
     if (enableGuardDuty) {
+      // CloudTrail management events are a foundational GuardDuty data source:
+      // always enabled, not configurable, and no longer accepted under
+      // AWS::GuardDuty::Detector DataSources. Only S3 data events, EKS audit
+      // logs, and Malware Protection remain opt-in here.
       const dataSources: guardduty.CfnDetector.CFNDataSourceConfigurationsProperty = {
-        cloudTrail: { enable: props.enableGuardDutyCloudTrail ?? true },
         s3Logs: { enable: props.enableGuardDutyS3Logs ?? true },
+        ...(props.enableGuardDutyKubernetesLogs
+          ? { kubernetes: { auditLogs: { enable: true } } }
+          : {}),
+        ...(props.enableGuardDutyMalwareProtection
+          ? { malwareProtection: { scanEc2InstanceWithFindings: { ebsVolumes: true } } }
+          : {}),
       };
-
-      if (props.enableGuardDutyKubernetesLogs) {
-        dataSources.kubernetes = { auditLogs: { enable: true } };
-      }
-
-      if (props.enableGuardDutyMalwareProtection) {
-        dataSources.malwareProtection = {
-          scanEc2InstanceWithFindings: { ebsVolumes: true },
-        };
-      }
 
       this.guardDutyDetector = new guardduty.CfnDetector(this, 'GuardDutyDetector', {
         enable: true,
@@ -213,7 +210,7 @@ export class SecurityHubStack extends cdk.Stack {
 
     if (this.guardDutyDetector) {
       new cdk.CfnOutput(this, 'GuardDutyDetectorId', {
-        value: this.guardDutyDetector.attrDetectorId,
+        value: this.guardDutyDetector.attrId,
         description: 'GuardDuty detector ID',
         exportName: `${envName}-guardduty-detector-id`,
       });
