@@ -72,10 +72,8 @@ describe('StaticSiteStack', () => {
       const { template } = makeStack({ enableVersioning: false });
       const buckets = template.findResources('AWS::S3::Bucket');
       const siteBucket = Object.values(buckets).find(
-        (b: { Properties: { BucketName?: string } }) =>
-          (b as { Properties: { BucketName?: string } }).Properties.BucketName ===
-          'test-static-site-origin',
-      ) as { Properties: { VersioningConfiguration?: unknown } } | undefined;
+        (b) => b.Properties?.BucketName === 'test-static-site-origin',
+      );
       expect(siteBucket?.Properties?.VersioningConfiguration).toBeUndefined();
     });
 

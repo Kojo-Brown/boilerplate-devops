@@ -88,12 +88,23 @@ export class DbMigrationStack extends cdk.Stack {
       allowAllOutbound: true,
     });
 
-    // Open port 5432 on the RDS security group so migration tasks can connect
-    props.dbSecurityGroup.addIngressRule(
-      this.migrationSecurityGroup,
-      ec2.Port.tcp(5432),
-      `PostgreSQL access for ${envName} migration tasks`,
-    );
+    // Open port 5432 on the RDS security group so migration tasks can connect.
+    //
+    // This is deliberately an L1 CfnSecurityGroupIngress rather than
+    // props.dbSecurityGroup.addIngressRule(). addIngressRule() attaches the rule
+    // to the *database* security group, which places the resource in the RDS
+    // stack and makes that stack depend on this one for the source group id.
+    // Since this stack already depends on the RDS stack for the credentials
+    // secret, that produces a cyclic stack reference and synthesis fails.
+    // Declaring the ingress here keeps the dependency one-directional.
+    new ec2.CfnSecurityGroupIngress(this, 'DbIngressFromMigrationTasks', {
+      groupId: props.dbSecurityGroup.securityGroupId,
+      ipProtocol: 'tcp',
+      fromPort: 5432,
+      toPort: 5432,
+      sourceSecurityGroupId: this.migrationSecurityGroup.securityGroupId,
+      description: `PostgreSQL access for ${envName} migration tasks`,
+    });
 
     // ── Dedicated ECS Cluster for migration tasks ───────────────────────────────
     this.migrationCluster = new ecs.Cluster(this, 'MigrationCluster', {

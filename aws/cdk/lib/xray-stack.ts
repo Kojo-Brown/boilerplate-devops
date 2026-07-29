@@ -140,9 +140,11 @@ export class XRayStack extends cdk.Stack {
     // ── X-Ray Sampling Rule ───────────────────────────────────────────────────
     // Priority 1000 catches all requests for this service; adjust as needed.
     // Health-check paths are typically excluded (see reservoirSize + rate docs).
+    const samplingRuleName = `${envName}-${props.serviceName}-rule`;
+
     this.samplingRule = new xray.CfnSamplingRule(this, 'SamplingRule', {
       samplingRule: {
-        ruleName: `${envName}-${props.serviceName}-rule`,
+        ruleName: samplingRuleName,
         priority: 1000,
         reservoirSize,
         fixedRate: samplingRate,
@@ -186,7 +188,9 @@ export class XRayStack extends cdk.Stack {
     });
 
     new cdk.CfnOutput(this, 'XRaySamplingRuleName', {
-      value: this.samplingRule.attrRuleName,
+      // AWS::XRay::SamplingRule exposes only RuleARN via Fn::GetAtt, so the
+      // name is emitted from the value we set rather than read back.
+      value: samplingRuleName,
       description: 'X-Ray sampling rule name',
       exportName: `${envName}-xray-sampling-rule-name`,
     });

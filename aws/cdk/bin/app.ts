@@ -780,7 +780,6 @@ const productionSecurityEmails = process.env.PRODUCTION_SECURITY_EMAIL
 new SecurityHubStack(app, 'SecurityHubStack-Staging', {
   envName: 'staging',
   enableGuardDuty: true,
-  enableGuardDutyCloudTrail: true,
   enableGuardDutyS3Logs: true,
   enableFsbpStandard: true,
   enableCisStandard: true,
@@ -798,7 +797,6 @@ new SecurityHubStack(app, 'SecurityHubStack-Staging', {
 new SecurityHubStack(app, 'SecurityHubStack-Production', {
   envName: 'production',
   enableGuardDuty: true,
-  enableGuardDutyCloudTrail: true,
   enableGuardDutyS3Logs: true,
   enableFsbpStandard: true,
   enableCisStandard: true,

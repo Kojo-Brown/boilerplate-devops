@@ -181,7 +181,7 @@ jobs:
             --no-progress
 
       # ── Sync immutable hashed assets (long-lived cache) ───────────────────────
-      - name: Sync immutable assets (cache: 1 year)
+      - name: "Sync immutable assets (cache: 1 year)"
         working-directory: ${{ inputs.working-directory }}
         run: |
           IFS=',' read -ra PATTERNS <<< "${{ inputs.cache-control-immutable }}"
@@ -199,7 +199,7 @@ jobs:
             --no-progress
 
       # ── Sync remaining static assets ──────────────────────────────────────────
-      - name: Sync remaining files (cache: 1 hour)
+      - name: "Sync remaining files (cache: 1 hour)"
         working-directory: ${{ inputs.working-directory }}
         run: |
           aws s3 sync \

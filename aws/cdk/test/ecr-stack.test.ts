@@ -46,11 +46,14 @@ describe('EcrStack', () => {
       });
     });
 
+    // AES256 is the ECR service default, so CDK deliberately renders no
+    // EncryptionConfiguration for it — the property only appears for KMS.
+    // Asserting its absence is what actually pins "encrypted with AES-256".
     it('uses AES-256 encryption by default', () => {
       const { template } = makeStack();
-      template.hasResourceProperties('AWS::ECR::Repository', {
-        EncryptionConfiguration: { EncryptionType: 'AES256' },
-      });
+      const repos = template.findResources('AWS::ECR::Repository');
+      const repo = Object.values(repos)[0];
+      expect(repo.Properties.EncryptionConfiguration).toBeUndefined();
     });
 
     it('enforces immutable image tags', () => {
@@ -164,9 +167,10 @@ describe('EcrStack', () => {
       });
       const repos = template.findResources('AWS::ECR::Repository');
       const repoLogicalId = Object.keys(repos)[0];
-      const policyText = JSON.parse(
-        repos[repoLogicalId].Properties.RepositoryPolicyText,
-      ) as { Statement: Array<{ Sid: string; Principal: { AWS: string | string[] } }> };
+      // CDK renders RepositoryPolicyText as a JSON object, not a string.
+      const policyText = repos[repoLogicalId].Properties.RepositoryPolicyText as {
+        Statement: Array<{ Sid: string; Principal: { AWS: string | string[] } }>;
+      };
       const crossAccountStatement = policyText.Statement.find(
         (s) => s.Sid === 'CrossAccountPull',
       );
@@ -179,9 +183,7 @@ describe('EcrStack', () => {
       });
       const repos = template.findResources('AWS::ECR::Repository');
       const repoLogicalId = Object.keys(repos)[0];
-      const policyText = JSON.parse(
-        repos[repoLogicalId].Properties.RepositoryPolicyText,
-      ) as {
+      const policyText = repos[repoLogicalId].Properties.RepositoryPolicyText as {
         Statement: Array<{ Sid: string; Action: string | string[] }>;
       };
       const crossAccountStatement = policyText.Statement.find(

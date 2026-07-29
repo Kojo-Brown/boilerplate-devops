@@ -181,8 +181,11 @@ describe('ParameterStoreStack', () => {
     });
   });
 
+  // CloudFormation cannot create SecureString parameters — AWS::SSM::Parameter
+  // accepts Type String or StringList only. The stack references them instead
+  // and emits the bootstrap command as an output.
   describe('SecureString Parameters', () => {
-    it('creates a SecureString parameter', () => {
+    it('does not emit an AWS::SSM::Parameter resource for a SecureString', () => {
       const { template } = makeStack({
         envName: 'production',
         parameters: [
@@ -190,18 +193,30 @@ describe('ParameterStoreStack', () => {
             key: 'db-password',
             description: 'Database password',
             type: 'SecureString',
-            value: 'REPLACE_ME',
           },
         ],
       });
-      template.hasResourceProperties('AWS::SSM::Parameter', {
-        Name: '/app/production/db-password',
-        Type: 'SecureString',
-      });
+      template.resourceCountIs('AWS::SSM::Parameter', 0);
     });
 
-    it('associates the CMK with SecureString parameters', () => {
+    it('never puts SecureString values in the synthesised template', () => {
       const { template } = makeStack({
+        envName: 'production',
+        parameters: [
+          {
+            key: 'db-password',
+            description: 'Database password',
+            type: 'SecureString',
+            value: 'not-a-real-secret-abc123',
+          },
+        ],
+      });
+      expect(JSON.stringify(template.toJSON())).not.toContain('not-a-real-secret-abc123');
+    });
+
+    it('emits a bootstrap command naming the CMK when encryption is enabled', () => {
+      const { template } = makeStack({
+        envName: 'production',
         enableKmsEncryption: true,
         parameters: [
           {
@@ -213,13 +228,19 @@ describe('ParameterStoreStack', () => {
       });
       const keys = template.findResources('AWS::KMS::Key');
       const keyLogicalId = Object.keys(keys)[0];
-      template.hasResourceProperties('AWS::SSM::Parameter', {
-        KeyId: Match.objectLike({ 'Fn::GetAtt': [keyLogicalId, 'Arn'] }),
+      template.hasOutput('ParamBootstrapsigningkey', {
+        Value: Match.objectLike({
+          'Fn::Join': Match.arrayWith([
+            Match.arrayWith([Match.objectLike({ 'Fn::GetAtt': [keyLogicalId, 'Arn'] })]),
+          ]),
+        }),
+        Export: { Name: 'production-param-signing-key-bootstrap' },
       });
     });
 
-    it('does not associate a KMS key when encryption is disabled', () => {
+    it('omits the --key-id argument when encryption is disabled', () => {
       const { template } = makeStack({
+        envName: 'production',
         enableKmsEncryption: false,
         parameters: [
           {
@@ -229,9 +250,11 @@ describe('ParameterStoreStack', () => {
           },
         ],
       });
-      const params = template.findResources('AWS::SSM::Parameter');
-      const paramLogicalId = Object.keys(params)[0];
-      expect(params[paramLogicalId].Properties.KeyId).toBeUndefined();
+      template.hasOutput('ParamBootstrapsigningkey', {
+        Value:
+          'aws ssm put-parameter --name /app/production/signing-key --type SecureString' +
+          " --tier Standard --value '<secret>' --overwrite",
+      });
     });
   });
 
@@ -284,7 +307,9 @@ describe('ParameterStoreStack', () => {
           { key: 'log-level', description: 'Log level', value: 'info' },
         ],
       });
-      template.hasOutput('ParamName-log-level', {
+      // CloudFormation output logical IDs are alphanumeric only, so CDK strips
+      // the hyphens from the `ParamName-${logicalId}` construct id.
+      template.hasOutput('ParamNameloglevel', {
         Value: '/app/test/log-level',
         Export: { Name: 'test-param-log-level-name' },
       });
@@ -298,8 +323,8 @@ describe('ParameterStoreStack', () => {
           { key: 'timeout', description: 'Timeout' },
         ],
       });
-      template.hasOutput('ParamName-log-level', {});
-      template.hasOutput('ParamName-timeout', {});
+      template.hasOutput('ParamNameloglevel', {});
+      template.hasOutput('ParamNametimeout', {});
     });
   });
 

@@ -10,6 +10,28 @@ const BASE_PROPS: SecurityHubStackProps = {
   env: { account: '123456789012', region: 'us-east-1' },
 };
 
+/**
+ * Standards ARNs interpolate the partition and region, so CloudFormation
+ * renders StandardsArn as an Fn::Join rather than a plain string and
+ * Match.stringLikeRegexp can never match it. Flattening the join back into its
+ * literal segments lets the tests assert on the part that actually identifies
+ * the standard. Unresolved tokens (Ref/GetAtt) contribute no literal text.
+ */
+const flattenArn = (value: unknown): string => {
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) return value.map(flattenArn).join('');
+  if (value && typeof value === 'object') {
+    const join = (value as { 'Fn::Join'?: [string, unknown[]] })['Fn::Join'];
+    return join ? join[1].map(flattenArn).join(join[0]) : '';
+  }
+  return '';
+};
+
+const standardsArns = (template: Template): string[] =>
+  Object.values(template.findResources('AWS::SecurityHub::Standard')).map((r) =>
+    flattenArn(r.Properties.StandardsArn),
+  );
+
 const makeStack = (overrides: Partial<SecurityHubStackProps> = {}) => {
   const app = new cdk.App();
   const stack = new SecurityHubStack(app, 'TestSecurityHubStack', {
@@ -96,14 +118,22 @@ describe('SecurityHubStack', () => {
       });
     });
 
-    it('enables CloudTrail and S3 data sources by default', () => {
+    it('enables the S3 data source by default', () => {
       const { template } = makeStack();
       template.hasResourceProperties('AWS::GuardDuty::Detector', {
         DataSources: Match.objectLike({
-          CloudTrail: { Enable: true },
           S3Logs: { Enable: true },
         }),
       });
+    });
+
+    // CloudTrail management events are always analysed by GuardDuty and are not
+    // a configurable member of DataSources on AWS::GuardDuty::Detector.
+    it('does not emit a CloudTrail data source toggle', () => {
+      const { template } = makeStack();
+      const detectors = template.findResources('AWS::GuardDuty::Detector');
+      const detector = Object.values(detectors)[0];
+      expect(detector.Properties.DataSources.CloudTrail).toBeUndefined();
     });
 
     it('omits the detector when enableGuardDuty is false', () => {
@@ -155,39 +185,33 @@ describe('SecurityHubStack', () => {
 
     it('enables the FSBP standard when enableFsbpStandard is true (default)', () => {
       const { template } = makeStack();
-      template.hasResourceProperties('AWS::SecurityHub::Standard', {
-        StandardsArn: Match.stringLikeRegexp(
-          'standards/aws-foundational-security-best-practices/v/1\\.0\\.0',
+      expect(standardsArns(template)).toContainEqual(
+        expect.stringContaining(
+          'standards/aws-foundational-security-best-practices/v/1.0.0',
         ),
-      });
+      );
     });
 
     it('enables the CIS Benchmark standard when enableCisStandard is true (default)', () => {
       const { template } = makeStack();
-      template.hasResourceProperties('AWS::SecurityHub::Standard', {
-        StandardsArn: Match.stringLikeRegexp(
-          'cis-aws-foundations-benchmark/v/1\\.4\\.0',
-        ),
-      });
+      expect(standardsArns(template)).toContainEqual(
+        expect.stringContaining('cis-aws-foundations-benchmark/v/1.4.0'),
+      );
     });
 
     it('does not enable PCI DSS by default', () => {
       const { template } = makeStack();
-      const standards = template.findResources('AWS::SecurityHub::Standard');
-      const hasPci = Object.values(standards).some((r) =>
-        String((r as { Properties: { StandardsArn: string } }).Properties.StandardsArn).includes(
-          'pci-dss',
-        ),
+      expect(standardsArns(template)).not.toContainEqual(
+        expect.stringContaining('pci-dss'),
       );
-      expect(hasPci).toBe(false);
     });
 
     it('enables PCI DSS when enablePciStandard is true', () => {
       const { template } = makeStack({ enablePciStandard: true });
       template.resourceCountIs('AWS::SecurityHub::Standard', 3);
-      template.hasResourceProperties('AWS::SecurityHub::Standard', {
-        StandardsArn: Match.stringLikeRegexp('pci-dss/v/3\\.2\\.1'),
-      });
+      expect(standardsArns(template)).toContainEqual(
+        expect.stringContaining('pci-dss/v/3.2.1'),
+      );
     });
 
     it('enables no standards when all flags are false', () => {
