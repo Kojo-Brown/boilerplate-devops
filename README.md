@@ -51,5 +51,20 @@ jobs:
 ## OIDC Setup (no long-lived AWS keys)
 See `aws/cloudformation/github-oidc-role.yml` for the IAM role template.
 
+## Guardrails
+
+Everything here is meant to be copied into someone else's account, so CI blocks
+the two mistakes that survive a copy:
+
+| Gate | What it blocks | Where |
+|------|----------------|-------|
+| `npm run scan:identifiers` | Hardcoded AWS account IDs (including those embedded in ARNs and ECR image URIs), AWS access keys, PEM private keys, and provider tokens | `aws/cdk/tools/scan-hardcoded-identifiers.ts` |
+| TruffleHog | Secrets with no distinctive shape, detected by entropy and verification | `workflow-templates/secret-scanning.yml` |
+
+Placeholders must use one of the AWS documentation account IDs
+(`123456789012`, `111122223333`, …) — the scan permits those and nothing else.
+For a genuine exception, add `scan-allow: <rule-id> <reason>` to the line; a
+suppression without a reason is rejected.
+
 ## Spec Progress
 See [SPEC.md](./SPEC.md).
