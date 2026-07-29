@@ -6,7 +6,7 @@
 - [x] Confirm every CDK stack passes `cdk synth` cleanly
 - [x] Confirm every workflow in `workflow-templates/` passes `actionlint`
 - [x] Add a CI workflow that runs `cdk synth`, `actionlint`, and Checkov on every PR
-- [ ] Verify no template contains a hardcoded account id, ARN, or credential
+- [x] Verify no template contains a hardcoded account id, ARN, or credential
 
 ## Phase 1 — GitHub Actions Workflows
 - [x] Reusable workflow: `ci.yml` (lint → typecheck → test → build)
