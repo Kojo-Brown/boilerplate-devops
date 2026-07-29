@@ -3,9 +3,9 @@
 > GitHub Actions + AWS CI/CD templates. Copy-paste ready. Spec-driven.
 
 ## Phase 0 — Green Baseline (blocks all feature work)
-- [ ] Confirm every CDK stack passes `cdk synth` cleanly
-- [ ] Confirm every workflow in `workflow-templates/` passes `actionlint`
-- [ ] Add a CI workflow that runs `cdk synth`, `actionlint`, and Checkov on every PR
+- [x] Confirm every CDK stack passes `cdk synth` cleanly
+- [x] Confirm every workflow in `workflow-templates/` passes `actionlint`
+- [x] Add a CI workflow that runs `cdk synth`, `actionlint`, and Checkov on every PR
 - [ ] Verify no template contains a hardcoded account id, ARN, or credential
 
 ## Phase 1 — GitHub Actions Workflows
