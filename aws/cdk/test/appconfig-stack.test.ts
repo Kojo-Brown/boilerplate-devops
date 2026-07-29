@@ -1,6 +1,7 @@
 import * as cdk from 'aws-cdk-lib';
 import { Template, Match } from 'aws-cdk-lib/assertions';
 import { AppConfigStack, AppConfigStackProps } from '../lib/appconfig-stack';
+import { flattenIntrinsic, resourceProps, TOKEN } from './support/cfn';
 
 const makeStack = (props: AppConfigStackProps = {}) => {
   const app = new cdk.App();
@@ -149,13 +150,15 @@ describe('AppConfigStack', () => {
 
     it('creates environments without monitors when no alarms are supplied', () => {
       const { template } = makeStack();
-      const envsWithMonitors = template.findResources('AWS::AppConfig::Environment', {
-        Properties: Match.objectLike({
-          Monitors: Match.anyValue(),
-        }),
-      });
-      // Monitors property may be absent or empty when no alarms are given
-      expect(Object.keys(envsWithMonitors)).toHaveLength(0);
+      // The Monitors property is always emitted; with no alarms it is an empty
+      // list, so assert emptiness rather than absence.
+      const monitors = resourceProps(template, 'AWS::AppConfig::Environment').map(
+        (env) => (env.Monitors as unknown[]) ?? [],
+      );
+      expect(monitors).toHaveLength(2);
+      for (const envMonitors of monitors) {
+        expect(envMonitors).toHaveLength(0);
+      }
     });
   });
 
@@ -279,23 +282,20 @@ describe('AppConfigStack', () => {
 
     it('scopes StartConfigurationSession to this application', () => {
       const { template } = makeStack();
-      template.hasResourceProperties('AWS::IAM::ManagedPolicy', {
-        PolicyDocument: Match.objectLike({
-          Statement: Match.arrayWith([
-            Match.objectLike({
-              Sid: 'StartConfigurationSession',
-              Resource: Match.objectLike({
-                'Fn::Join': Match.arrayWith([
-                  Match.anyValue(),
-                  Match.arrayWith([
-                    Match.objectLike({ 'Fn::GetAtt': Match.anyValue() }),
-                  ]),
-                ]),
-              }),
-            }),
-          ]),
-        }),
-      });
+      const [policy] = resourceProps(template, 'AWS::IAM::ManagedPolicy');
+      const { Statement } = policy.PolicyDocument as {
+        Statement: { Sid: string; Resource: unknown }[];
+      };
+      const statement = Statement.find((s) => s.Sid === 'StartConfigurationSession');
+      expect(statement).toBeDefined();
+
+      // The resource ARN interpolates the application id, so it synthesizes to an
+      // Fn::Join. Flattening it proves the grant is scoped to this application
+      // rather than a bare wildcard.
+      const resource = flattenIntrinsic(statement!.Resource);
+      expect(resource).toContain(':appconfig:');
+      expect(resource).toContain(`application/${TOKEN}`);
+      expect(resource).not.toBe('*');
     });
   });
 

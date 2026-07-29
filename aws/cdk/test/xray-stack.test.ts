@@ -193,7 +193,7 @@ describe('XRayStack', () => {
           RuleName: 'staging-api-health-check-exclude',
           FixedRate: 0,
           ReservoirSize: 0,
-          UrlPath: '/health',
+          URLPath: '/health',
           Priority: 100,
         }),
       });
@@ -203,8 +203,9 @@ describe('XRayStack', () => {
       const { xrayTemplate } = makeStacks();
       const resources = xrayTemplate.findResources('AWS::XRay::SamplingRule');
       const priorities = Object.values(resources).map(
-        (r: { Properties: { SamplingRule: { Priority: number } } }) =>
-          r.Properties.SamplingRule.Priority,
+        (r) =>
+          (r.Properties as { SamplingRule: { Priority: number } }).SamplingRule
+            .Priority,
       );
       expect(Math.min(...priorities)).toBe(100);
       expect(Math.max(...priorities)).toBe(1000);

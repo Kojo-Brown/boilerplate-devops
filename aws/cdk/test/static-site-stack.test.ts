@@ -72,8 +72,8 @@ describe('StaticSiteStack', () => {
       const { template } = makeStack({ enableVersioning: false });
       const buckets = template.findResources('AWS::S3::Bucket');
       const siteBucket = Object.values(buckets).find(
-        (b: { Properties: { BucketName?: string } }) =>
-          (b as { Properties: { BucketName?: string } }).Properties.BucketName ===
+        (b) =>
+          (b.Properties as { BucketName?: string }).BucketName ===
           'test-static-site-origin',
       ) as { Properties: { VersioningConfiguration?: unknown } } | undefined;
       expect(siteBucket?.Properties?.VersioningConfiguration).toBeUndefined();
@@ -312,11 +312,15 @@ describe('StaticSiteStack', () => {
         certificateArn:
           'arn:aws:acm:us-east-1:123456789012:certificate/aaaabbbb-cccc-dddd-eeee-111122223333',
       });
+      // CDK resolves CloudFront's canonical hosted zone (Z2FDTNDATAQYW2) through
+      // a region mapping rather than inlining it, so assert the alias points at
+      // the distribution and that the zone comes from that mapping.
       template.hasResourceProperties('AWS::Route53::RecordSet', {
         Type: 'A',
         Name: 'app.example.com.',
         AliasTarget: Match.objectLike({
-          HostedZoneId: 'Z2FDTNDATAQYW2', // CloudFront canonical hosted zone ID
+          DNSName: { 'Fn::GetAtt': [Match.stringLikeRegexp('^Distribution'), 'DomainName'] },
+          HostedZoneId: { 'Fn::FindInMap': Match.anyValue() },
         }),
       });
     });

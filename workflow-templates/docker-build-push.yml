@@ -46,7 +46,7 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           IMAGE_URI="$REGISTRY/$IMAGE:$SHA"
-          docker build -f ${{ inputs.dockerfile }} -t "$IMAGE_URI" -t "$REGISTRY/$IMAGE:latest" .
+          docker build -f "${{ inputs.dockerfile }}" -t "$IMAGE_URI" -t "$REGISTRY/$IMAGE:latest" .
           docker push "$IMAGE_URI"
           docker push "$REGISTRY/$IMAGE:latest"
-          echo "image-uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+          echo "image-uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"

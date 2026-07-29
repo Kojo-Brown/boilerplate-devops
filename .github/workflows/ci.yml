@@ -1,0 +1,135 @@
+name: CI
+
+# Phase 0 green baseline for this repository: every PR must prove that the CDK
+# app compiles, its unit tests pass, it synthesises, the shipped workflow
+# templates are valid GitHub Actions, and no new Checkov finding is introduced.
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "22"
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  cdk:
+    name: CDK typecheck, test, synth
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: aws/cdk
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: aws/cdk/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      # Synth runs before the suite deliberately. It is the build step and takes
+      # seconds, while the suite takes minutes; ordering it first means a test
+      # failure never hides whether the app still synthesises.
+      - name: Synthesize all stacks
+        run: npx cdk synth --quiet
+
+      # The Checkov job scans the synthesised CloudFormation rather than the
+      # TypeScript, so the templates have to cross the job boundary.
+      - name: Upload synthesised templates
+        uses: actions/upload-artifact@v4
+        with:
+          name: cdk-out
+          path: aws/cdk/cdk.out
+          retention-days: 7
+
+      - name: Unit tests
+        run: npm test -- --ci
+
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.7
+        run: |
+          curl -fsSL \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
+            -o actionlint.tar.gz
+          tar -xzf actionlint.tar.gz actionlint
+          sudo install -m 0755 actionlint /usr/local/bin/actionlint
+
+      # Both the workflows this repo runs and the templates it ships to
+      # consumers must lint — a broken template is the product being broken.
+      #
+      # actionlint shells out to shellcheck for every `run:` block when
+      # shellcheck is on PATH, which it is on ubuntu-latest. Install shellcheck
+      # before running this locally or local runs will silently skip those
+      # checks and disagree with CI.
+      - name: Lint workflows and shipped templates
+        run: actionlint -no-color -oneline .github/workflows/*.yml workflow-templates/*.yml
+
+  checkov:
+    name: Checkov
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: cdk
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Checkov
+        run: pip install --disable-pip-version-check "checkov==3.3.8"
+
+      - name: Download synthesised templates
+        uses: actions/download-artifact@v4
+        with:
+          name: cdk-out
+          path: cdk.out
+
+      # .checkov.baseline records the findings that already existed when this
+      # gate was introduced. Anything not in the baseline fails the build, so
+      # new infrastructure cannot regress while the backlog is burned down.
+      - name: Scan synthesised CloudFormation
+        run: |
+          checkov \
+            --directory cdk.out \
+            --framework cloudformation \
+            --baseline .checkov.baseline \
+            --quiet \
+            --compact
+
+      - name: Scan GitHub Actions workflows
+        run: |
+          checkov \
+            --directory .github/workflows \
+            --framework github_actions \
+            --quiet \
+            --compact

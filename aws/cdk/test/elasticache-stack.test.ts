@@ -43,7 +43,19 @@ describe('ElastiCacheStack', () => {
         Properties: Match.objectLike({ GroupName: Match.stringLikeRegexp('redis') }),
       });
       const sg = Object.values(sgs)[0] as { Properties: Record<string, unknown> };
-      expect(sg.Properties['SecurityGroupEgress']).toBeUndefined();
+      // With allowAllOutbound: false, CDK emits its placeholder "disallow all
+      // traffic" rule rather than omitting egress entirely. Assert that no rule
+      // opens outbound to the world.
+      const egress = (sg.Properties['SecurityGroupEgress'] ?? []) as {
+        CidrIp?: string;
+        Description?: string;
+      }[];
+      expect(egress).toEqual([
+        expect.objectContaining({
+          CidrIp: '255.255.255.255/32',
+          Description: 'Disallow all traffic',
+        }),
+      ]);
     });
 
     it('adds a port-6379 ingress rule for each allowed security group', () => {

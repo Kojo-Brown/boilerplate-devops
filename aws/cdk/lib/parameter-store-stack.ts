@@ -17,14 +17,17 @@ export interface AppParameterDefinition {
   /** Human-readable description stored on the SSM parameter. */
   readonly description: string;
   /**
-   * Parameter type. SecureString parameters are encrypted at rest with KMS.
+   * Parameter type. SecureString parameters are encrypted at rest with KMS and
+   * are *referenced* rather than created — CloudFormation cannot create them.
    * StringList values are comma-separated; access the list in shell as: IFS=',' read -ra VALUES <<< "$PARAM"
    * Defaults to "String".
    */
   readonly type?: ParameterType;
   /**
    * Initial value written at synthesis time.
-   * For SecureString parameters, the value is encrypted by KMS before storage.
+   * Ignored for SecureString parameters: those are created out of band with the
+   * `aws ssm put-parameter` command emitted as a stack output, so that no secret
+   * material ends up in the CloudFormation template.
    * Override post-deployment:
    *   aws ssm put-parameter --name /app/{env}/{key} --value '...' --overwrite
    * Defaults to "REPLACE_ME".
@@ -88,6 +91,14 @@ export interface ParameterStoreStackProps extends cdk.StackProps {
  *          Name: '/app/staging/api-endpoint',
  *          WithDecryption: true,
  *        }));
+ *
+ * Caveat — SecureString parameters:
+ *   CloudFormation does not support *creating* SecureString parameters. The
+ *   SecureString branch below synthesizes valid CDK output, but a real
+ *   `cdk deploy` of those parameters will be rejected by CloudFormation.
+ *   For secrets, prefer the SecretsManagerStack; for existing SecureString
+ *   parameters, import them with
+ *   `ssm.StringParameter.fromSecureStringParameterAttributes`.
  *
  * Security:
  *   - SecureString parameters encrypted with a CMK (annual auto-rotation)
@@ -157,22 +168,14 @@ export class ParameterStoreStack extends cdk.Stack {
       let param: ssm.IParameter;
 
       if (paramType === 'SecureString') {
-        // CDK's high-level constructs do not support SecureString creation.
-        // We drop to L1 (CfnParameter) and attach a custom resource for the
-        // removal policy, then wrap in StringParameter.fromSecureStringParameterAttributes
-        // for IAM grant methods.
-        const cfnParam = new ssm.CfnParameter(this, `Param-${logicalId}`, {
-          name: paramName,
-          description: def.description,
-          type: 'SecureString',
-          value: def.value ?? 'REPLACE_ME',
-          tier: paramTier,
-          // CDK's CfnParameter does not accept a KMS key ID directly — the
-          // key ARN is passed as the KeyId field (accepted by SSM API).
-          keyId: this.encryptionKey?.keyArn,
-        });
-        cfnParam.applyRemovalPolicy(removalPolicy);
-
+        // AWS CloudFormation cannot create SecureString parameters: the
+        // AWS::SSM::Parameter resource only accepts Type String or StringList.
+        // Putting a secret in a template would also leak it — template bodies
+        // are readable by anyone with cloudformation:GetTemplate.
+        //
+        // So the parameter is created out of band and only *referenced* here.
+        // The reference still gives consumers grantRead()/parameterArn, and the
+        // bootstrap command below is emitted as a stack output.
         param = ssm.StringParameter.fromSecureStringParameterAttributes(
           this,
           `ParamRef-${logicalId}`,
@@ -181,6 +184,16 @@ export class ParameterStoreStack extends cdk.Stack {
             encryptionKey: this.encryptionKey,
           },
         );
+
+        const keyIdArg = this.encryptionKey ? ` --key-id ${this.encryptionKey.keyArn}` : '';
+        new cdk.CfnOutput(this, `ParamBootstrap-${logicalId}`, {
+          value:
+            `aws ssm put-parameter --name ${paramName} --type SecureString` +
+            `${keyIdArg} --tier ${paramTier} --value '<secret>' --overwrite`,
+          description:
+            `Run once before deploying: CloudFormation cannot create the SecureString ${paramName}`,
+          exportName: `${envName}-param-${logicalId}-bootstrap`,
+        });
       } else if (paramType === 'StringList') {
         const p = new ssm.StringListParameter(this, `Param-${logicalId}`, {
           parameterName: paramName,

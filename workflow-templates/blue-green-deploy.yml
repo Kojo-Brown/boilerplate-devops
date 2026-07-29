@@ -93,7 +93,7 @@ jobs:
             --query taskDefinition \
             --output json > task-definition.json
           echo "Task definition downloaded"
-          cat task-definition.json | python3 -c "
+          python3 -c "
           import sys, json
           d = json.load(sys.stdin)
           # Remove fields that cannot be present when registering a new revision
@@ -102,7 +102,7 @@ jobs:
                       'registeredBy', 'deregisteredAt']:
               d.pop(key, None)
           print(json.dumps(d, indent=2))
-          " > task-definition-clean.json
+          " < task-definition.json > task-definition-clean.json
           mv task-definition-clean.json task-definition.json
 
       # Render a new task definition revision with the updated container image.

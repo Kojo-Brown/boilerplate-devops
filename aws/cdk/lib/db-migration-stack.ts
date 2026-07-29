@@ -88,12 +88,23 @@ export class DbMigrationStack extends cdk.Stack {
       allowAllOutbound: true,
     });
 
-    // Open port 5432 on the RDS security group so migration tasks can connect
-    props.dbSecurityGroup.addIngressRule(
-      this.migrationSecurityGroup,
-      ec2.Port.tcp(5432),
-      `PostgreSQL access for ${envName} migration tasks`,
-    );
+    // Open port 5432 on the RDS security group so migration tasks can connect.
+    //
+    // This is deliberately an L1 CfnSecurityGroupIngress owned by *this* stack
+    // rather than props.dbSecurityGroup.addIngressRule(). addIngressRule() places
+    // the rule in the RDS stack (the security group's owner) pointing at this
+    // stack's SG, which makes the RDS stack depend on the migration stack. Since
+    // the migration stack already consumes the RDS master secret, that produces a
+    // cross-stack dependency cycle and `cdk synth` fails outright. Owning the rule
+    // here keeps the dependency edge one-way: migration → RDS.
+    new ec2.CfnSecurityGroupIngress(this, 'DbIngressFromMigrationTasks', {
+      groupId: props.dbSecurityGroup.securityGroupId,
+      ipProtocol: 'tcp',
+      fromPort: 5432,
+      toPort: 5432,
+      sourceSecurityGroupId: this.migrationSecurityGroup.securityGroupId,
+      description: `PostgreSQL access for ${envName} migration tasks`,
+    });
 
     // ── Dedicated ECS Cluster for migration tasks ───────────────────────────────
     this.migrationCluster = new ecs.Cluster(this, 'MigrationCluster', {
