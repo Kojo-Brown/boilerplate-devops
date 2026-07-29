@@ -83,6 +83,11 @@ jobs:
 
       # Both the workflows this repo runs and the templates it ships to
       # consumers must lint — a broken template is the product being broken.
+      #
+      # actionlint shells out to shellcheck for every `run:` block when
+      # shellcheck is on PATH, which it is on ubuntu-latest. Install shellcheck
+      # before running this locally or local runs will silently skip those
+      # checks and disagree with CI.
       - name: Lint workflows and shipped templates
         run: actionlint -no-color -oneline .github/workflows/*.yml workflow-templates/*.yml
 

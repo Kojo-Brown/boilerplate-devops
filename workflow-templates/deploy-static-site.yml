@@ -154,7 +154,7 @@ jobs:
             echo "::error::Build output directory is empty."
             exit 1
           fi
-          ls -lah "$BUILD_DIR" | head -20
+          find "$BUILD_DIR" -maxdepth 1 -printf '%10s  %p\n' | head -20
 
       # ── AWS credentials via OIDC ──────────────────────────────────────────────
       - name: Configure AWS credentials (OIDC)
@@ -184,17 +184,20 @@ jobs:
       - name: "Sync immutable assets (cache: 1 year)"
         working-directory: ${{ inputs.working-directory }}
         run: |
+          # Build the --include flags as an array rather than a string: an array
+          # survives patterns containing spaces or globs without eval, which
+          # would otherwise re-parse the bucket name and paths as shell code.
           IFS=',' read -ra PATTERNS <<< "${{ inputs.cache-control-immutable }}"
-          INCLUDE_FLAGS=""
+          INCLUDE_ARGS=()
           for pattern in "${PATTERNS[@]}"; do
             pattern=$(echo "$pattern" | xargs)  # trim whitespace
-            INCLUDE_FLAGS="$INCLUDE_FLAGS --include \"$pattern\""
+            INCLUDE_ARGS+=(--include "$pattern")
           done
-          eval aws s3 sync \
-            "\"${{ inputs.build-output-dir }}\"" \
-            "\"s3://${{ inputs.s3-bucket }}\"" \
+          aws s3 sync \
+            "${{ inputs.build-output-dir }}" \
+            "s3://${{ inputs.s3-bucket }}" \
             --exclude "*" \
-            $INCLUDE_FLAGS \
+            "${INCLUDE_ARGS[@]}" \
             --cache-control "public, max-age=31536000, immutable" \
             --no-progress
 
@@ -257,13 +260,15 @@ jobs:
       # ── Summary ───────────────────────────────────────────────────────────────
       - name: Deployment summary
         run: |
-          echo "## Static Site Deployed ✓" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Environment | \`${{ inputs.environment }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| S3 Bucket | \`${{ inputs.s3-bucket }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| CloudFront Distribution | \`${{ inputs.cloudfront-dist-id }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Invalidation | \`${{ steps.invalidate.outputs.invalidation-id }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Site URL | ${{ steps.site-info.outputs.site-url }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Commit | \`${{ github.sha }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Static Site Deployed ✓"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Environment | \`${{ inputs.environment }}\` |"
+            echo "| S3 Bucket | \`${{ inputs.s3-bucket }}\` |"
+            echo "| CloudFront Distribution | \`${{ inputs.cloudfront-dist-id }}\` |"
+            echo "| Invalidation | \`${{ steps.invalidate.outputs.invalidation-id }}\` |"
+            echo "| Site URL | ${{ steps.site-info.outputs.site-url }} |"
+            echo "| Commit | \`${{ github.sha }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
