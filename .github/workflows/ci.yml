@@ -45,6 +45,12 @@ jobs:
       - name: Typecheck
         run: npx tsc --noEmit
 
+      # Everything here is copy-paste material, so a literal account ID or
+      # credential in a template becomes one in the consumer's repository.
+      # Scans the whole repository, not just aws/cdk.
+      - name: Scan for hardcoded account IDs, ARNs, and credentials
+        run: npm run scan:identifiers
+
       # Synth runs before the suite deliberately. It is the build step and takes
       # seconds, while the suite takes minutes; ordering it first means a test
       # failure never hides whether the app still synthesises.
