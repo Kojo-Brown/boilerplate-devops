@@ -5,6 +5,7 @@ import {
   ParameterStoreStack,
   ParameterStoreStackProps,
 } from '../lib/parameter-store-stack';
+import { outputByExportName } from './support/cfn';
 
 const makeStack = (props: ParameterStoreStackProps = {}) => {
   const app = new cdk.App();
@@ -307,11 +308,8 @@ describe('ParameterStoreStack', () => {
           { key: 'log-level', description: 'Log level', value: 'info' },
         ],
       });
-      // CloudFormation output logical IDs are alphanumeric only, so CDK strips
-      // the hyphens from the `ParamName-${logicalId}` construct id.
-      template.hasOutput('ParamNameloglevel', {
+      expect(outputByExportName(template, 'test-param-log-level-name')).toMatchObject({
         Value: '/app/test/log-level',
-        Export: { Name: 'test-param-log-level-name' },
       });
     });
 
@@ -323,8 +321,8 @@ describe('ParameterStoreStack', () => {
           { key: 'timeout', description: 'Timeout' },
         ],
       });
-      template.hasOutput('ParamNameloglevel', {});
-      template.hasOutput('ParamNametimeout', {});
+      expect(outputByExportName(template, 'test-param-log-level-name')).toBeDefined();
+      expect(outputByExportName(template, 'test-param-timeout-name')).toBeDefined();
     });
   });
 

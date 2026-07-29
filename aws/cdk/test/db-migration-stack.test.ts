@@ -4,6 +4,7 @@ import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import { VpcStack } from '../lib/vpc-stack';
 import { RdsStack } from '../lib/rds-stack';
 import { DbMigrationStack, DbMigrationStackProps } from '../lib/db-migration-stack';
+import { managedPolicyArns, resourceProps } from './support/cfn';
 
 const DB_SECRET_ARN =
   'arn:aws:secretsmanager:us-east-1:123456789012:secret:/production/rds/master-credentials-AbCdEf';
@@ -39,6 +40,13 @@ const makeStacks = (overrides: Partial<DbMigrationStackProps> = {}) => {
     template: Template.fromStack(migrationStack),
     migrationStack,
   };
+};
+
+/** Look up a role's synthesized properties by its explicit RoleName. */
+const roleNamed = (template: Template, roleName: string): Record<string, unknown> => {
+  const role = resourceProps(template, 'AWS::IAM::Role').find((r) => r.RoleName === roleName);
+  expect(role).toBeDefined();
+  return role!;
 };
 
 describe('DbMigrationStack', () => {
@@ -172,7 +180,7 @@ describe('DbMigrationStack', () => {
       const { template } = makeStacks({ envName: 'staging' });
       template.hasResourceProperties('AWS::IAM::Role', {
         RoleName: 'staging-migration-execution-role',
-        AssumedBy: Match.objectLike({
+        AssumeRolePolicyDocument: Match.objectLike({
           Statement: Match.arrayWith([
             Match.objectLike({
               Principal: { Service: 'ecs-tasks.amazonaws.com' },
@@ -183,12 +191,11 @@ describe('DbMigrationStack', () => {
     });
 
     it('attaches AmazonECSTaskExecutionRolePolicy to execution role', () => {
-      const { template } = makeStacks();
-      template.hasResourceProperties('AWS::IAM::Role', {
-        ManagedPolicyArns: Match.arrayWith([
-          Match.stringLikeRegexp('AmazonECSTaskExecutionRolePolicy'),
-        ]),
-      });
+      const { template } = makeStacks({ envName: 'staging' });
+      const role = roleNamed(template, 'staging-migration-execution-role');
+      expect(managedPolicyArns(role)).toContainEqual(
+        expect.stringContaining('AmazonECSTaskExecutionRolePolicy'),
+      );
     });
 
     it('grants execution role access to the DB secret', () => {
@@ -209,7 +216,7 @@ describe('DbMigrationStack', () => {
       const { template } = makeStacks({ envName: 'staging' });
       template.hasResourceProperties('AWS::IAM::Role', {
         RoleName: 'staging-migration-hook-lambda-role',
-        AssumedBy: Match.objectLike({
+        AssumeRolePolicyDocument: Match.objectLike({
           Statement: Match.arrayWith([
             Match.objectLike({
               Principal: { Service: 'lambda.amazonaws.com' },
@@ -220,12 +227,11 @@ describe('DbMigrationStack', () => {
     });
 
     it('attaches AWSLambdaVPCAccessExecutionRole to Lambda role', () => {
-      const { template } = makeStacks();
-      template.hasResourceProperties('AWS::IAM::Role', {
-        ManagedPolicyArns: Match.arrayWith([
-          Match.stringLikeRegexp('AWSLambdaVPCAccessExecutionRole'),
-        ]),
-      });
+      const { template } = makeStacks({ envName: 'staging' });
+      const role = roleNamed(template, 'staging-migration-hook-lambda-role');
+      expect(managedPolicyArns(role)).toContainEqual(
+        expect.stringContaining('AWSLambdaVPCAccessExecutionRole'),
+      );
     });
 
     it('grants Lambda role ecs:RunTask permission scoped to migration task def', () => {

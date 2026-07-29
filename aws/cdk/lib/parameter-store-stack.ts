@@ -92,6 +92,14 @@ export interface ParameterStoreStackProps extends cdk.StackProps {
  *          WithDecryption: true,
  *        }));
  *
+ * Caveat — SecureString parameters:
+ *   CloudFormation does not support *creating* SecureString parameters. The
+ *   SecureString branch below synthesizes valid CDK output, but a real
+ *   `cdk deploy` of those parameters will be rejected by CloudFormation.
+ *   For secrets, prefer the SecretsManagerStack; for existing SecureString
+ *   parameters, import them with
+ *   `ssm.StringParameter.fromSecureStringParameterAttributes`.
+ *
  * Security:
  *   - SecureString parameters encrypted with a CMK (annual auto-rotation)
  *   - String/StringList parameters readable only by principals explicitly granted access

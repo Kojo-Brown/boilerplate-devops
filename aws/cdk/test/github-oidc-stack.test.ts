@@ -2,6 +2,7 @@ import * as cdk from 'aws-cdk-lib';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import { Match, Template } from 'aws-cdk-lib/assertions';
 import { GitHubOidcStack, GitHubOidcStackProps } from '../lib/github-oidc-stack';
+import { flattenIntrinsic } from './support/cfn';
 
 const makeStack = (props: GitHubOidcStackProps = {}) => {
   const app = new cdk.App();
@@ -11,6 +12,32 @@ const makeStack = (props: GitHubOidcStackProps = {}) => {
   });
   return { template: Template.fromStack(stack), stack };
 };
+
+interface TrustStatement {
+  readonly Effect: string;
+  readonly Action: string;
+  readonly Condition: Record<string, Record<string, string | string[]>>;
+}
+
+interface GitHubActionsRole {
+  readonly RoleName: string;
+  readonly MaxSessionDuration?: number;
+  readonly ManagedPolicyArns?: unknown[];
+  readonly AssumeRolePolicyDocument: { Statement: TrustStatement[] };
+}
+
+/**
+ * Only the roles this stack creates for GitHub Actions.
+ *
+ * `iam.OpenIdConnectProvider` is backed by a custom resource, so the synthesized
+ * template also contains a Lambda execution role for its provider. That role is
+ * unnamed and trusts lambda.amazonaws.com, so filtering on the role-name prefix
+ * keeps these assertions about the roles the stack actually exposes.
+ */
+const githubActionsRoles = (template: Template): GitHubActionsRole[] =>
+  Object.values(template.findResources('AWS::IAM::Role'))
+    .map((r) => r.Properties as unknown as GitHubActionsRole)
+    .filter((p) => typeof p.RoleName === 'string' && p.RoleName.startsWith('github-actions-'));
 
 describe('GitHubOidcStack', () => {
   describe('OIDC Provider', () => {
@@ -64,17 +91,14 @@ describe('GitHubOidcStack', () => {
   });
 
   describe('Default roles', () => {
-    it('creates three default IAM roles', () => {
+    it('creates three default GitHub Actions roles', () => {
       const { template } = makeStack();
-      template.resourceCountIs('AWS::IAM::Role', 3);
+      expect(githubActionsRoles(template)).toHaveLength(3);
     });
 
     it('creates roles with names scoped to the envName', () => {
       const { template } = makeStack({ envName: 'staging' });
-      const roles = template.findResources('AWS::IAM::Role');
-      const roleNames = Object.values(roles).map(
-        (r) => (r as { Properties: { RoleName: string } }).Properties.RoleName,
-      );
+      const roleNames = githubActionsRoles(template).map((r) => r.RoleName);
       expect(roleNames.some((n) => n.includes('staging'))).toBe(true);
     });
 
@@ -87,16 +111,8 @@ describe('GitHubOidcStack', () => {
 
     it('uses OIDC federated principal for all roles', () => {
       const { template } = makeStack();
-      const roles = template.findResources('AWS::IAM::Role');
-      for (const role of Object.values(roles)) {
-        const trustDoc = (role as {
-          Properties: {
-            AssumeRolePolicyDocument: {
-              Statement: Array<{ Effect: string; Action: string }>;
-            };
-          };
-        }).Properties.AssumeRolePolicyDocument;
-        const stmt = trustDoc.Statement[0];
+      for (const role of githubActionsRoles(template)) {
+        const stmt = role.AssumeRolePolicyDocument.Statement[0];
         expect(stmt.Action).toBe('sts:AssumeRoleWithWebIdentity');
         expect(stmt.Effect).toBe('Allow');
       }
@@ -104,18 +120,8 @@ describe('GitHubOidcStack', () => {
 
     it('enforces audience claim on all roles', () => {
       const { template } = makeStack();
-      const roles = template.findResources('AWS::IAM::Role');
-      for (const role of Object.values(roles)) {
-        const trustDoc = (role as {
-          Properties: {
-            AssumeRolePolicyDocument: {
-              Statement: Array<{
-                Condition: Record<string, Record<string, string>>;
-              }>;
-            };
-          };
-        }).Properties.AssumeRolePolicyDocument;
-        const cond = trustDoc.Statement[0].Condition;
+      for (const role of githubActionsRoles(template)) {
+        const cond = role.AssumeRolePolicyDocument.Statement[0].Condition;
         expect(
           cond['StringEquals']['https://token.actions.githubusercontent.com:aud'],
         ).toBe('sts.amazonaws.com');
@@ -124,18 +130,8 @@ describe('GitHubOidcStack', () => {
 
     it('sets sub condition with StringLike (not Equals) for wildcard support', () => {
       const { template } = makeStack();
-      const roles = template.findResources('AWS::IAM::Role');
-      for (const role of Object.values(roles)) {
-        const trustDoc = (role as {
-          Properties: {
-            AssumeRolePolicyDocument: {
-              Statement: Array<{
-                Condition: Record<string, Record<string, string>>;
-              }>;
-            };
-          };
-        }).Properties.AssumeRolePolicyDocument;
-        const cond = trustDoc.Statement[0].Condition;
+      for (const role of githubActionsRoles(template)) {
+        const cond = role.AssumeRolePolicyDocument.Statement[0].Condition;
         expect(cond).toHaveProperty('StringLike');
         const subKey = 'https://token.actions.githubusercontent.com:sub';
         const subValue = cond['StringLike'][subKey] as string | string[];
@@ -163,17 +159,14 @@ describe('GitHubOidcStack', () => {
 
     it('ReadOnly role has the ReadOnlyAccess managed policy', () => {
       const { template } = makeStack();
-      template.hasResourceProperties('AWS::IAM::Role', {
-        RoleName: Match.stringLikeRegexp('-readonly$'),
-        ManagedPolicyArns: Match.arrayWith([
-          Match.objectLike({
-            'Fn::Join': Match.arrayWith([
-              Match.anyValue(),
-              Match.arrayWith(['arn:', Match.anyValue(), ':iam::aws:policy/ReadOnlyAccess']),
-            ]),
-          }),
-        ]),
-      });
+      const readOnly = githubActionsRoles(template).find((r) =>
+        r.RoleName.endsWith('-readonly'),
+      );
+      expect(readOnly).toBeDefined();
+      const managedPolicies = (readOnly!.ManagedPolicyArns ?? []).map(flattenIntrinsic);
+      expect(managedPolicies).toContainEqual(
+        expect.stringContaining(':iam::aws:policy/ReadOnlyAccess'),
+      );
     });
   });
 
@@ -194,22 +187,13 @@ describe('GitHubOidcStack', () => {
 
     it('creates exactly one role when one custom role is supplied', () => {
       const { template } = makeStack({ roles: customRoles });
-      template.resourceCountIs('AWS::IAM::Role', 1);
+      expect(githubActionsRoles(template)).toHaveLength(1);
     });
 
     it('scopes sub to the supplied owner/repo', () => {
       const { template } = makeStack({ roles: customRoles });
-      const roles = template.findResources('AWS::IAM::Role');
-      const role = Object.values(roles)[0] as {
-        Properties: {
-          AssumeRolePolicyDocument: {
-            Statement: Array<{
-              Condition: Record<string, Record<string, string>>;
-            }>;
-          };
-        };
-      };
-      const cond = role.Properties.AssumeRolePolicyDocument.Statement[0].Condition;
+      const cond = githubActionsRoles(template)[0].AssumeRolePolicyDocument.Statement[0]
+        .Condition;
       const subKey = 'https://token.actions.githubusercontent.com:sub';
       const subValue = cond['StringLike'][subKey] as string | string[];
       const values = Array.isArray(subValue) ? subValue : [subValue];

@@ -187,6 +187,8 @@ export class XRayStack extends cdk.Stack {
       exportName: `${envName}-xray-group-name`,
     });
 
+    // AWS::XRay::SamplingRule exposes only RuleARN as a CloudFormation attribute,
+    // so the rule name is echoed from the value we set rather than read back.
     new cdk.CfnOutput(this, 'XRaySamplingRuleName', {
       // AWS::XRay::SamplingRule exposes only RuleARN via Fn::GetAtt, so the
       // name is emitted from the value we set rather than read back.

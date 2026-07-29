@@ -46,7 +46,10 @@ describe('LogInsightsStack — app log queries', () => {
     const { template } = makeStack();
     template.hasResourceProperties('AWS::Logs::QueryDefinition', {
       Name: 'test/app/recent-errors',
-      QueryString: Match.stringLikeRegexp('(?i)\\(error\\|fatal\\|critical\\)'),
+      // The query embeds the Logs Insights regex /(?i)(error|fatal|critical)/.
+      // Every metacharacter must be escaped to stay a valid *JavaScript* regex —
+      // an unescaped '(?i)' is an invalid group and throws at match time.
+      QueryString: Match.stringLikeRegexp('\\(\\?i\\)\\(error\\|fatal\\|critical\\)'),
     });
   });
 

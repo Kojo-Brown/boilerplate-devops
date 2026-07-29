@@ -1,6 +1,7 @@
 import * as cdk from 'aws-cdk-lib';
 import { Template, Match } from 'aws-cdk-lib/assertions';
 import { EcrStack, EcrStackProps } from '../lib/ecr-stack';
+import { resourceProps } from './support/cfn';
 
 const makeStack = (props: EcrStackProps = {}) => {
   const app = new cdk.App();
@@ -51,9 +52,11 @@ describe('EcrStack', () => {
     // Asserting its absence is what actually pins "encrypted with AES-256".
     it('uses AES-256 encryption by default', () => {
       const { template } = makeStack();
-      const repos = template.findResources('AWS::ECR::Repository');
-      const repo = Object.values(repos)[0];
-      expect(repo.Properties.EncryptionConfiguration).toBeUndefined();
+      // AES256 is ECR's server-side default, and CDK deliberately omits
+      // EncryptionConfiguration for it — the block is only emitted when a KMS
+      // key is involved. Asserting its absence is what pins "not KMS-encrypted".
+      const [repository] = resourceProps(template, 'AWS::ECR::Repository');
+      expect(repository.EncryptionConfiguration).toBeUndefined();
     });
 
     it('enforces immutable image tags', () => {

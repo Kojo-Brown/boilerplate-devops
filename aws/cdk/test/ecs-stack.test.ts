@@ -2,6 +2,7 @@ import * as cdk from 'aws-cdk-lib';
 import { Template, Match } from 'aws-cdk-lib/assertions';
 import { VpcStack } from '../lib/vpc-stack';
 import { EcsStack, EcsStackProps } from '../lib/ecs-stack';
+import { managedPolicyArns, resourceProps } from './support/cfn';
 
 const CERT_ARN =
   'arn:aws:acm:us-east-1:123456789012:certificate/aaaabbbb-cccc-dddd-eeee-ffffffffffff';
@@ -109,10 +110,14 @@ describe('EcsStack', () => {
             }),
           ]),
         }),
-        ManagedPolicyArns: Match.arrayWith([
-          Match.stringLikeRegexp('AmazonECSTaskExecutionRolePolicy'),
-        ]),
       });
+      const executionRole = resourceProps(template, 'AWS::IAM::Role').find(
+        (r) => r.RoleName === 'prod-ecs-execution-role',
+      );
+      expect(executionRole).toBeDefined();
+      expect(managedPolicyArns(executionRole!)).toContainEqual(
+        expect.stringContaining('AmazonECSTaskExecutionRolePolicy'),
+      );
     });
 
     it('creates a task runtime role', () => {
