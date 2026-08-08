@@ -1,0 +1,238 @@
+name: Canary Deploy to ECS via weighted target groups
+
+# Reusable workflow: runs a canary deployment driven by CanaryDeployStack.
+#
+# How it works:
+#   1. Renders a new task-definition revision with the image being deployed and
+#      registers it.
+#   2. Starts the canary state machine with that revision's ARN.
+#   3. Polls the execution until it finishes, then reports what the analysis
+#      decided at each traffic step.
+#
+# The workflow does not shift traffic or judge metrics itself — the state
+# machine does both. That split is deliberate: a deployment must survive a
+# cancelled Actions run, and it does, because everything that matters is
+# happening in Step Functions. Cancelling this job stops the polling, not the
+# deployment; use `aws stepfunctions stop-execution` if you need to abort one,
+# which triggers the state machine's own rollback path.
+#
+# Prerequisites (set as GitHub Secrets / Variables):
+#   AWS_ROLE_ARN             — IAM role trusted by GitHub OIDC (see github-oidc-stack)
+#   Outputs from CanaryDeployStack:
+#     CANARY_STATE_MACHINE_ARN ← StateMachineArn
+#     TASK_DEFINITION          ← TaskDefinitionFamily  (${envName}-canary-task)
+#
+# The deploy role needs, at minimum:
+#   ecs:DescribeTaskDefinition, ecs:RegisterTaskDefinition
+#   iam:PassRole for the task and execution roles
+#   states:StartExecution, states:DescribeExecution, states:GetExecutionHistory
+
+on:
+  workflow_call:
+    inputs:
+      image-uri:
+        description: Full ECR image URI including tag (e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/app:sha-abc123)
+        required: true
+        type: string
+      task-definition:
+        description: Task definition family name (CanaryDeployStack output TaskDefinitionFamily)
+        required: true
+        type: string
+      state-machine-arn:
+        description: Canary deployment state machine ARN (CanaryDeployStack output StateMachineArn)
+        required: true
+        type: string
+      container-name:
+        description: Container name inside the task definition (default AppContainer)
+        required: false
+        type: string
+        default: AppContainer
+      aws-region:
+        description: AWS region (default us-east-1)
+        required: false
+        type: string
+        default: us-east-1
+      wait-for-completion:
+        description: Poll until the canary deployment finishes and fail the job if it rolls back (default true)
+        required: false
+        type: boolean
+        default: true
+      poll-interval-seconds:
+        description: Seconds between execution status polls (default 30)
+        required: false
+        type: number
+        default: 30
+      timeout-minutes:
+        description: Give up polling after this many minutes (default 90). The state machine has its own timeout and keeps running regardless.
+        required: false
+        type: number
+        default: 90
+    secrets:
+      AWS_ROLE_ARN:
+        description: IAM role ARN with ECS register + Step Functions execute permissions
+        required: true
+    outputs:
+      execution-arn:
+        description: ARN of the canary deployment execution that was started
+        value: ${{ jobs.canary-deploy.outputs.execution-arn }}
+      status:
+        description: Final execution status (SUCCEEDED, FAILED, TIMED_OUT, ABORTED, or RUNNING if not waited on)
+        value: ${{ jobs.canary-deploy.outputs.status }}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  canary-deploy:
+    name: Canary Deploy
+    runs-on: ubuntu-latest
+    outputs:
+      execution-arn: ${{ steps.start.outputs.execution-arn }}
+      status: ${{ steps.wait.outputs.status || 'RUNNING' }}
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      # Pull the current revision and strip the fields RegisterTaskDefinition
+      # rejects, so the next step can register a copy with a new image.
+      - name: Download current task definition
+        env:
+          TASK_DEFINITION: ${{ inputs.task-definition }}
+        run: |
+          set -euo pipefail
+          aws ecs describe-task-definition \
+            --task-definition "$TASK_DEFINITION" \
+            --query taskDefinition \
+            --output json > task-definition-raw.json
+          python3 - <<'PY'
+          import json
+
+          with open('task-definition-raw.json') as handle:
+              definition = json.load(handle)
+
+          for key in ('taskDefinitionArn', 'revision', 'status', 'requiresAttributes',
+                      'placementConstraints', 'compatibilities', 'registeredAt',
+                      'registeredBy', 'deregisteredAt'):
+              definition.pop(key, None)
+
+          with open('task-definition.json', 'w') as handle:
+              json.dump(definition, handle, indent=2)
+          PY
+
+      - name: Render new task definition
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ inputs.container-name }}
+          image: ${{ inputs.image-uri }}
+
+      # Registered here rather than by the state machine: the state machine's
+      # controller Lambda holds UpdateService on two named services and nothing
+      # more, and giving it RegisterTaskDefinition would widen that to the
+      # ability to define arbitrary tasks.
+      - name: Register task definition revision
+        id: register
+        env:
+          RENDERED: ${{ steps.render.outputs.task-definition }}
+        run: |
+          set -euo pipefail
+          TASK_DEF_ARN="$(aws ecs register-task-definition \
+            --cli-input-json "file://$RENDERED" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)"
+          echo "Registered $TASK_DEF_ARN"
+          echo "task-definition-arn=$TASK_DEF_ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Start canary deployment
+        id: start
+        env:
+          STATE_MACHINE_ARN: ${{ inputs.state-machine-arn }}
+          TASK_DEF_ARN: ${{ steps.register.outputs.task-definition-arn }}
+          IMAGE_URI: ${{ inputs.image-uri }}
+        run: |
+          set -euo pipefail
+          # Execution names must be unique per state machine for 90 days and are
+          # limited to 80 characters, so the run id and attempt are used rather
+          # than a commit SHA that a re-run would repeat.
+          EXECUTION_NAME="gha-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          INPUT="$(jq -nc \
+            --arg taskDefinitionArn "$TASK_DEF_ARN" \
+            --arg imageUri "$IMAGE_URI" \
+            --arg commit "$GITHUB_SHA" \
+            '{taskDefinitionArn: $taskDefinitionArn, imageUri: $imageUri, commit: $commit}')"
+
+          EXECUTION_ARN="$(aws stepfunctions start-execution \
+            --state-machine-arn "$STATE_MACHINE_ARN" \
+            --name "$EXECUTION_NAME" \
+            --input "$INPUT" \
+            --query executionArn \
+            --output text)"
+
+          echo "Started $EXECUTION_ARN"
+          echo "execution-arn=$EXECUTION_ARN" >> "$GITHUB_OUTPUT"
+          echo "Canary deployment started: \`$EXECUTION_ARN\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Wait for the canary deployment to finish
+        id: wait
+        if: ${{ inputs.wait-for-completion }}
+        env:
+          EXECUTION_ARN: ${{ steps.start.outputs.execution-arn }}
+          POLL_INTERVAL: ${{ inputs.poll-interval-seconds }}
+          TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
+        run: |
+          set -euo pipefail
+          DEADLINE=$(( $(date +%s) + TIMEOUT_MINUTES * 60 ))
+          STATUS=RUNNING
+
+          while [ "$STATUS" = "RUNNING" ]; do
+            if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+              echo "::error::Timed out after ${TIMEOUT_MINUTES}m waiting for $EXECUTION_ARN."
+              echo "The deployment is still running in Step Functions; this job stopped watching it."
+              echo "status=TIMED_OUT_WAITING" >> "$GITHUB_OUTPUT"
+              exit 1
+            fi
+            sleep "$POLL_INTERVAL"
+            STATUS="$(aws stepfunctions describe-execution \
+              --execution-arn "$EXECUTION_ARN" \
+              --query status \
+              --output text)"
+            echo "status: $STATUS"
+          done
+
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+
+          # Surface what the analysis decided at each step. The analyzer's
+          # output is the payload of every AnalyzeAt*Percent task, so the
+          # execution history explains a rollback without opening the console.
+          echo "### Canary analysis" >> "$GITHUB_STEP_SUMMARY"
+          # shellcheck disable=SC2016
+          # The single quotes are required: `\(...)` and `$__loc__`-style
+          # sigils inside the filter are jq's own interpolation syntax, and
+          # letting the shell expand them first would corrupt the program.
+          aws stepfunctions get-execution-history \
+            --execution-arn "$EXECUTION_ARN" \
+            --max-items 1000 \
+            --query 'events[?type==`TaskSucceeded`].taskSucceededEventDetails.output' \
+            --output text \
+            | tr '\t' '\n' \
+            | jq -rc 'select(.verdict != null)
+                | "- **\(.metrics.canaryWeight)%** → `\(.verdict)` — "
+                  + "\(.metrics.canaryRequests) reqs, "
+                  + "\(.metrics.canaryErrorRatePercent)% errors "
+                  + "(stable \(.metrics.stableErrorRatePercent)%), "
+                  + "\(.metrics.latencyStatistic) \(.metrics.canaryLatencyMs)ms "
+                  + "(stable \(.metrics.stableLatencyMs)ms)"
+                  + (if (.reasons | length) > 0 then " — \(.reasons | join("; "))" else "" end)' \
+            >> "$GITHUB_STEP_SUMMARY" || echo "- no analysis output recorded" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$STATUS" != "SUCCEEDED" ]; then
+            echo "::error::Canary deployment finished with status $STATUS — traffic was restored to the stable target group."
+            exit 1
+          fi
+
+          echo "Canary deployment promoted."

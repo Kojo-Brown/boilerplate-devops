@@ -14,6 +14,7 @@ import { CloudWatchDashboardStack } from '../lib/cloudwatch-dashboard-stack';
 import { CloudWatchAlarmsStack } from '../lib/cloudwatch-alarms-stack';
 import { LogInsightsStack } from '../lib/log-insights-stack';
 import { BlueGreenDeployStack } from '../lib/blue-green-deploy-stack';
+import { CanaryDeployStack } from '../lib/canary-deploy-stack';
 import { AppConfigStack } from '../lib/appconfig-stack';
 import { DbMigrationStack } from '../lib/db-migration-stack';
 import { RollbackAutomationStack } from '../lib/rollback-automation-stack';
@@ -515,6 +516,85 @@ new BlueGreenDeployStack(app, 'BlueGreenDeployStack-Production', {
     region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
   },
   description: 'Production blue/green ECS service via CodeDeploy (canary traffic shift)',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+// ── Canary deployment on weighted ALB target groups ──────────────────────────
+// An alternative to the blue/green stacks above, not a companion to them. Both
+// own an ALB, an ECS cluster, and the deployment path for the same application,
+// so a real deployment picks one. They are both defined here because this is a
+// boilerplate: deploy the stacks for the strategy you want and delete the other.
+//
+//   Blue/green — CodeDeploy shifts on a schedule and reacts to alarms.
+//   Canary     — this stack shifts the listener weights itself and compares the
+//                canary target group against the stable one at every step.
+//
+// After CDK deploy, copy the stack outputs into GitHub Secrets / Variables:
+//   CANARY_STATE_MACHINE_ARN ← CanaryDeployStack-*.StateMachineArn
+//   ECS_CLUSTER              ← CanaryDeployStack-*.ClusterName
+//   TASK_DEFINITION          ← CanaryDeployStack-*.TaskDefinitionFamily
+//
+// Do not run `cdk deploy` on these stacks while a canary execution is in
+// flight — the listener weights are runtime state the state machine owns, and
+// a deploy resets them to 100/0 underneath it.
+
+new CanaryDeployStack(app, 'CanaryDeployStack-Staging', {
+  vpc: vpcStackStaging.vpc,
+  envName: 'staging',
+  certificateArn: stagingCertArn,
+  containerImage: process.env.CONTAINER_IMAGE,
+  containerPort: 3000,
+  cpu: 512,
+  memoryLimitMiB: 1024,
+  stableDesiredCount: 1,
+  canaryDesiredCount: 1,
+  // Two short steps: staging exists to prove the pipeline works, not to
+  // accumulate statistical confidence.
+  trafficSteps: [25, 50],
+  bakeTimeSeconds: 120,
+  analysis: {
+    maxErrorRatePercent: 2,
+    maxLatencyMs: 1500,
+    // Staging rarely sees production-shaped traffic, so a window with too few
+    // requests promotes rather than blocking every deployment.
+    minimumRequestCount: 20,
+    inconclusiveVerdict: 'pass',
+  },
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Staging canary ECS deployment on weighted ALB target groups with automatic analysis',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+new CanaryDeployStack(app, 'CanaryDeployStack-Production', {
+  vpc: vpcStackProduction.vpc,
+  envName: 'production',
+  certificateArn: productionCertArn,
+  containerImage: process.env.CONTAINER_IMAGE,
+  containerPort: 3000,
+  cpu: 1024,
+  memoryLimitMiB: 2048,
+  stableDesiredCount: 2,
+  canaryDesiredCount: 1,
+  trafficSteps: [10, 25, 50],
+  bakeTimeSeconds: 300,
+  analysis: {
+    maxErrorRatePercent: 1,
+    maxLatencyMs: 1000,
+    errorRateToleranceMultiplier: 2,
+    latencyToleranceMultiplier: 1.5,
+    minimumRequestCount: 100,
+    // Production refuses to promote a canary it could not measure.
+    inconclusiveVerdict: 'fail',
+    latencyStatistic: 'p95',
+  },
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Production canary ECS deployment on weighted ALB target groups with automatic analysis',
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
 
