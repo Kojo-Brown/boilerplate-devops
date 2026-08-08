@@ -47,13 +47,41 @@
 - [x] S3 static site + CloudFront + Route53
 
 ## Phase 7 — Progressive Delivery
-- [ ] Canary deployment with weighted ALB target groups and automatic analysis
+- [x] Canary deployment with weighted ALB target groups and automatic analysis — `CanaryDeployStack` shifts the listener weights itself from a Step Functions state machine and judges each bake window by comparing the canary target group against the stable one, so a regression is caught relative to what the deployment is replacing rather than against a fixed alarm threshold; a window with too little traffic to judge rolls back in production instead of promoting unmeasured (PR #27)
 - [ ] Automated rollback driven by SLO burn rate, not just alarm state
 - [ ] Trunk-based development guardrails: merge queue, required checks, short-lived branches
 - [ ] Preview environment per PR with seeded data and teardown on close
 - [ ] Database expand/contract migration playbook with a zero-downtime worked example
 - [ ] Feature-flag lifecycle: creation, rollout, and a stale-flag cleanup job
 - [ ] Deployment metrics: DORA four keys collected and dashboarded
+
+Item 1 complete as of PR #27 (2026-08-08). All four checks green: the CDK job
+(typecheck, identifier scan, synth of 39 stacks, 819 tests), actionlint,
+Checkov, and GitGuardian.
+
+`CanaryDeployStack` is an *alternative* to `EcsStack` and `BlueGreenDeployStack`,
+not a companion — all three own an ALB and an ECS service for the same
+application, so a real deployment picks one and deletes the others. `bin/app.ts`
+defines all of them because this is a boilerplate.
+
+Checkov gained zero new findings and `.checkov.baseline` was not touched, which
+required real fixes rather than suppressions: a customer-managed KMS key over all
+four log groups and both Lambdas' environment variables, `TLS13-1-2` on the
+listener, `drop_invalid_header_fields`, reserved Lambda concurrency, and Step
+Functions tracing plus logging. The two genuine non-applicable checks
+(`CKV_AWS_116` DLQ, `CKV_AWS_117` VPC) are exempted as `Metadata.checkov.skip` on
+the resources themselves, so the reasoning copies out with them.
+
+Known gaps carried forward: **nothing here has been deployed to AWS** — the
+verification is synth, unit tests, and static analysis, so the state machine's
+behaviour against a live ALB and real ECS rollouts is unproven. Listener weights
+are runtime state the state machine owns, so `cdk deploy` during an in-flight
+execution resets them to 100/0 and that execution will then analyze a canary
+receiving no traffic; do not deploy while one is running. The analyzer reads
+ALB-level signals only (5xx, latency, unhealthy hosts) — application-level canary
+metrics would need a custom namespace. The older deploy workflows still sit in
+`workflow-templates/` rather than `.github/workflows/`; only the new
+`canary-deploy.yml` follows the stated convention.
 
 ## Phase 8 — Kubernetes Track
 - [ ] EKS cluster via CDK with managed node groups and IRSA
