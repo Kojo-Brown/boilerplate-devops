@@ -48,7 +48,7 @@
 
 ## Phase 7 — Progressive Delivery
 - [x] Canary deployment with weighted ALB target groups and automatic analysis — `CanaryDeployStack` shifts the listener weights itself from a Step Functions state machine and judges each bake window by comparing the canary target group against the stable one, so a regression is caught relative to what the deployment is replacing rather than against a fixed alarm threshold; a window with too little traffic to judge rolls back in production instead of promoting unmeasured (PR #27)
-- [ ] Automated rollback driven by SLO burn rate, not just alarm state
+- [x] Automated rollback driven by SLO burn rate, not just alarm state — `SloBurnRateRollbackStack` measures the error ratio against the budget the objective implies, so 1% errors against three nines reads as a 10x burn rather than "over 1%", and each policy fires only when a long *and* a short window agree: the long one refuses to react to a spike, the short one refuses to react to an incident that has already ended. The handler attributes before it acts — it re-reads the metrics, aborts if the burn has recovered, and rolls back only services whose deployment started recently, because burning budget is a symptom a rollback treats only if a deployment caused it (PR #28)
 - [ ] Trunk-based development guardrails: merge queue, required checks, short-lived branches
 - [ ] Preview environment per PR with seeded data and teardown on close
 - [ ] Database expand/contract migration playbook with a zero-downtime worked example
@@ -82,6 +82,39 @@ ALB-level signals only (5xx, latency, unhealthy hosts) — application-level can
 metrics would need a custom namespace. The older deploy workflows still sit in
 `workflow-templates/` rather than `.github/workflows/`; only the new
 `canary-deploy.yml` follows the stated convention.
+
+Item 2 complete as of PR #28 (2026-08-09). All four checks green: the CDK job
+(typecheck, identifier scan, synth of 41 stacks, 899 tests), actionlint, Checkov,
+and GitGuardian. 80 of those tests are new; 35 of them compile and run the inline
+Lambda handler against recording SDK stubs, which is the only thing in the build
+that parses it at all — `tsc` sees a template literal and `cdk synth` embeds it
+verbatim, so an inverted comparison would otherwise first surface as a rollback
+that silently did not happen. Writing them caught two real defects before push:
+the recovery check disagreed with the alarm at exactly the threshold, and
+CodeDeploy targets were calling `DescribeServices` unnecessarily.
+
+`SloBurnRateRollbackStack` composes with `RollbackAutomationStack` rather than
+replacing it — alarm state for hard failures, burn rate for the slow regressions
+a fixed threshold either misses or over-reacts to. Unlike the three deployment
+strategies it does not own an ALB or a service, so it stacks on whichever one an
+environment picks.
+
+Checkov gained zero new findings and `.checkov.baseline` was not touched: a
+customer-managed KMS key over the log group and the Lambda environment, SNS
+encryption, reserved concurrency of 2 so a metric storm cannot stack rollbacks,
+and IAM scoped to the exact ECS service and CodeDeploy deployment-group ARNs. The
+two non-applicable checks are `Metadata.checkov.skip` on the function itself.
+
+Known gaps carried forward: **nothing here has been deployed to AWS** — synth,
+unit tests, and static analysis are the whole of the verification, so the alarms
+against a live ALB and the rollback against a real ECS rollout are unproven. The
+metric-math expressions synthesize and read correctly but have never been
+evaluated by CloudWatch; `IF`/`FILL` behaviour on a zero-traffic window is
+reasoned about, not observed, which is why the denominator is guarded
+independently of the traffic floor. The SLO is measured on ALB 5xx and request
+count only — an objective on latency, or on an application-level definition of
+"good", would need a second metric source. `minimumRequestsPerWindow` is the
+setting most likely to be wrong for a given environment's traffic.
 
 ## Phase 8 — Kubernetes Track
 - [ ] EKS cluster via CDK with managed node groups and IRSA
