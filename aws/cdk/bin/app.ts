@@ -18,6 +18,7 @@ import { CanaryDeployStack } from '../lib/canary-deploy-stack';
 import { AppConfigStack } from '../lib/appconfig-stack';
 import { DbMigrationStack } from '../lib/db-migration-stack';
 import { RollbackAutomationStack } from '../lib/rollback-automation-stack';
+import { SloBurnRateRollbackStack } from '../lib/slo-burn-rate-rollback-stack';
 import { CostAnomalyStack } from '../lib/cost-anomaly-stack';
 import { SecurityHubStack } from '../lib/security-hub-stack';
 import { WafStack } from '../lib/waf-stack';
@@ -772,6 +773,84 @@ new RollbackAutomationStack(app, 'RollbackAutomationStack-Production', {
     region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
   },
   description: 'Production rollback automation — EventBridge alarm → Lambda → ECS/CodeDeploy rollback',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+// ── SLO Burn-Rate Rollback ────────────────────────────────────────────────────
+// The companion to RollbackAutomationStack above, not a replacement for it.
+// That stack answers "is a threshold crossed right now"; this one answers "is
+// this deployment costing more reliability than the objective can afford".
+//
+// How it works:
+//   ALB metrics → burn rate (errors / requests / error budget)
+//     → long-window alarm AND short-window alarm → composite alarm
+//       → EventBridge → Lambda
+//           ├─ re-reads the burn and the remaining budget
+//           ├─ rolls back only services that deployed recently
+//           └─ SNS notification with the numbers behind the decision
+//
+// Staging runs a looser objective (99.5%) than production (99.9%) deliberately:
+// a boilerplate that pages on staging noise gets its alarms muted, and a muted
+// alarm is worse than no alarm.
+//
+// After deployment:
+//   - Confirm the SNS email subscription sent to each notificationEmail address.
+//   - Feed SloBurnRateRollbackStack-Production.CompositeAlarmNames into the
+//     CodeDeploy deployment group's alarm configuration so a burn-rate breach
+//     also aborts an in-flight blue/green shift.
+//   - Watch the `production-slo-burn-rate` dashboard for a week before letting
+//     the fast policy roll back unattended; the traffic floor is the setting
+//     most likely to need tuning to your request volume.
+
+new SloBurnRateRollbackStack(app, 'SloBurnRateRollbackStack-Staging', {
+  envName: 'staging',
+  loadBalancerFullName: ecsStackStaging.alb.loadBalancerFullName,
+  targetGroupFullName: ecsStackStaging.targetGroup.targetGroupFullName,
+  slo: { target: 0.995, windowDays: 30, minimumRequestsPerWindow: 30 },
+  rollbackTargets: [
+    {
+      clusterName: ecsStackStaging.cluster.clusterName,
+      serviceName: ecsStackStaging.service.serviceName,
+    },
+  ],
+  notificationEmails: process.env.STAGING_ROLLBACK_NOTIFY_EMAIL
+    ? [process.env.STAGING_ROLLBACK_NOTIFY_EMAIL]
+    : [],
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Staging SLO burn-rate rollback — multi-window burn alarms → Lambda → ECS rollback',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+new SloBurnRateRollbackStack(app, 'SloBurnRateRollbackStack-Production', {
+  envName: 'production',
+  loadBalancerFullName: ecsStackProduction.alb.loadBalancerFullName,
+  targetGroupFullName: ecsStackProduction.targetGroup.targetGroupFullName,
+  slo: { target: 0.999, windowDays: 30, minimumRequestsPerWindow: 60 },
+  rollbackTargets: [
+    {
+      clusterName: ecsStackProduction.cluster.clusterName,
+      serviceName: ecsStackProduction.service.serviceName,
+    },
+    // Blue/green ECS service (BlueGreenDeployStack) — CodeDeploy mode
+    {
+      clusterName: `production-bg-cluster`,
+      serviceName: `production-bg-service`,
+      codeDeployApplication: `production-ecs-app`,
+      codeDeployDeploymentGroup: `production-ecs-dg`,
+    },
+  ],
+  notificationEmails: process.env.PRODUCTION_ROLLBACK_NOTIFY_EMAIL
+    ? [process.env.PRODUCTION_ROLLBACK_NOTIFY_EMAIL]
+    : [],
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description:
+    'Production SLO burn-rate rollback — multi-window burn alarms → Lambda → ECS/CodeDeploy rollback',
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
 
