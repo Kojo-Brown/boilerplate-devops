@@ -102,6 +102,27 @@ Tune the steps and thresholds per environment in `aws/cdk/bin/app.ts`
 these stacks while an execution is in flight: the listener weights are runtime
 state the state machine owns, and a deploy resets them underneath it.
 
+**Rollback after the deployment is done.** All three strategies above decide
+during a deployment. `SloBurnRateRollbackStack` decides afterwards, on how fast
+the service is consuming its error budget:
+
+```
+burn rate = (failed requests / total requests) / (1 − SLO target)
+```
+
+A burn rate of 1x spends the whole 30-day budget in 30 days; 14.4x spends 2% of
+it in an hour. Each policy alarms only when a long window *and* a short window
+are both over the threshold — the long one refuses to react to a spike, the
+short one refuses to react to an incident that has already ended. A breach rolls
+back only services that deployed recently, because a rollback treats the symptom
+only if a deployment caused it.
+
+This composes with `RollbackAutomationStack` rather than replacing it: alarm
+state for hard failures, burn rate for the slow regressions a fixed threshold
+either misses or over-reacts to. See
+[docs/slo-burn-rate-rollback.md](./docs/slo-burn-rate-rollback.md) for the
+arithmetic, the defaults, and what the handler checks before it acts.
+
 ## OIDC Setup (no long-lived AWS keys)
 See `aws/cloudformation/github-oidc-role.yml` for the IAM role template.
 
