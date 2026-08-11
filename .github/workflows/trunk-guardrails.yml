@@ -1,0 +1,205 @@
+name: Trunk guardrails
+
+# The "short-lived branches" half of trunk-based development, as a check.
+#
+# Merge queue and required checks are ruleset settings — see
+# `.github/rulesets/trunk-based-main.json`. Branch lifetime is not: GitHub has
+# no setting for "branches must be short", so it has to be measured, and the
+# only place it can be measured is a job that runs on the pull request.
+#
+# Two measurements, because "short-lived" means short in both senses:
+#
+#   • age    — how long the oldest commit unique to this branch has existed.
+#              A branch that has been open for a week has been diverging from
+#              trunk for a week, whatever its size.
+#   • size   — how many lines the branch changes against the merge base.
+#              A one-hour branch that rewrites 4,000 lines is a big-bang merge
+#              that happens to have been written quickly.
+#
+# Both are advisory by construction: they are thresholds on a social practice,
+# not correctness properties, so `enforcement: warn` is a supported mode and the
+# summary is written either way.
+#
+# Reusable — call it from another repository with:
+#
+#   jobs:
+#     guardrails:
+#       uses: Kojo-Brown/boilerplate-devops/.github/workflows/trunk-guardrails.yml@main
+#       with:
+#         max-branch-age-hours: "24"
+on:
+  pull_request:
+  # Required checks must report on merge_group or the queue entry waits out
+  # check_response_timeout_minutes and is evicted. Enforced by
+  # `npm run audit:trunk`.
+  merge_group:
+  workflow_call:
+    inputs:
+      max-branch-age-hours:
+        description: Age of the oldest commit unique to the branch, in hours.
+        type: string
+        default: "48"
+      max-changed-lines:
+        description: Added plus deleted lines against the merge base.
+        type: string
+        default: "400"
+      size-exclude-paths:
+        description: >-
+          Space-separated globs excluded from the line count. Lockfiles are
+          generated, are not read in review, and would otherwise dominate it.
+        type: string
+        default: "**/package-lock.json **/pnpm-lock.yaml **/yarn.lock **/uv.lock **/Cargo.lock **/go.sum"
+      enforcement:
+        description: '"error" fails the check, "warn" annotates and passes.'
+        type: string
+        default: "error"
+
+permissions:
+  contents: read
+
+# github.ref is distinct per merge-queue entry
+# (refs/heads/gh-readonly-queue/main/pr-N-<sha>), so cancel-in-progress cancels
+# a superseded push to the same pull request and never a sibling queue entry.
+concurrency:
+  group: trunk-guardrails-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The name is the required-status-check context in the ruleset. Renaming the
+  # job renames the check; `npm run audit:trunk` fails when they drift apart.
+  short-lived-branch:
+    name: Short-lived branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The `inputs` context is empty for every event except workflow_call, so the
+    # declared `default:` above applies only to callers and the literal on the
+    # right of each `||` is what *this* repository runs with. They differ on
+    # purpose, and the difference is the calibration:
+    #
+    # The input defaults (48h / 400 lines / error) are the conventional
+    # trunk-based numbers for an application repository. This is not one. Its
+    # working agreement is one SPEC.md item per pull request, implemented with
+    # source, tests and docs, and the measured distribution over the twenty
+    # merged changes before this one is 438–3,280 lines excluding lockfiles,
+    # median ≈ 920. A 400-line cap here would fail every conforming pull
+    # request, which is not a guardrail, it is noise.
+    #
+    # So: 1,200 lines (≈ the 75th percentile, so it annotates the genuinely
+    # large ones), and `warn` — the same advice docs/trunk-based-development.md
+    # gives anyone turning this on for the first time. Tighten it once there is
+    # a distribution to tighten towards.
+    env:
+      MAX_BRANCH_AGE_HOURS: ${{ inputs.max-branch-age-hours || '48' }}
+      MAX_CHANGED_LINES: ${{ inputs.max-changed-lines || '1200' }}
+      SIZE_EXCLUDE_PATHS: ${{ inputs.size-exclude-paths || '**/package-lock.json **/pnpm-lock.yaml **/yarn.lock **/uv.lock **/Cargo.lock **/go.sum' }}
+      ENFORCEMENT: ${{ inputs.enforcement || 'warn' }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      # Every step is conditional rather than the job, because a job-level `if`
+      # that evaluates false reports the check as skipped, and a skipped
+      # required check blocks the merge instead of passing it. The job must
+      # always report; on merge_group it reports having done nothing.
+      - name: Checkout repository
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v4
+        with:
+          # The merge base is only computable with the full graph, and a
+          # branch old enough to fail this check is old enough to sit outside
+          # any shallow fetch depth worth guessing.
+          fetch-depth: 0
+
+      - name: Measure branch age and size
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+
+          merge_base=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+          oldest=$(git rev-list --reverse "$merge_base..$HEAD_SHA" | head -n 1)
+
+          if [ -z "$oldest" ]; then
+            echo "No commits unique to this branch; nothing to measure."
+            {
+              echo "### Short-lived branch"
+              echo
+              echo "No commits unique to this branch."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # Author date, not committer date: a rebase rewrites the committer
+          # date of every commit it touches, so committer date would reset the
+          # clock on exactly the branches that have been alive long enough to
+          # need rebasing.
+          authored_at=$(git show --no-patch --format=%at "$oldest")
+          age_hours=$(( ( $(date +%s) - authored_at ) / 3600 ))
+
+          read -ra exclude_globs <<< "$SIZE_EXCLUDE_PATHS"
+          exclude_pathspecs=()
+          for glob in ${exclude_globs[@]+"${exclude_globs[@]}"}; do
+            exclude_pathspecs+=(":(exclude,glob)$glob")
+          done
+
+          # Binary files report "-\t-" in --numstat and are skipped: they carry
+          # no lines to review, which is what the threshold is about.
+          changed_lines=$(
+            git diff --numstat "$merge_base" "$HEAD_SHA" \
+              -- . ${exclude_pathspecs[@]+"${exclude_pathspecs[@]}"} |
+              awk '$1 != "-" && $2 != "-" { total += $1 + $2 } END { print total + 0 }'
+          )
+
+          commits=$(git rev-list --count "$merge_base..$HEAD_SHA")
+
+          echo "oldest unique commit: $oldest"
+          echo "branch age:           ${age_hours}h (limit ${MAX_BRANCH_AGE_HOURS}h)"
+          echo "changed lines:        ${changed_lines} (limit ${MAX_CHANGED_LINES})"
+          echo "commits:              ${commits}"
+
+          failures=()
+          if [ "$age_hours" -gt "$MAX_BRANCH_AGE_HOURS" ]; then
+            failures+=("branch is ${age_hours}h old, limit is ${MAX_BRANCH_AGE_HOURS}h")
+          fi
+          if [ "$changed_lines" -gt "$MAX_CHANGED_LINES" ]; then
+            failures+=("branch changes ${changed_lines} lines, limit is ${MAX_CHANGED_LINES}")
+          fi
+
+          {
+            echo "### Short-lived branch"
+            echo
+            echo "| Measure | Value | Limit |"
+            echo "|---------|-------|-------|"
+            echo "| Age of oldest unique commit | ${age_hours}h | ${MAX_BRANCH_AGE_HOURS}h |"
+            echo "| Changed lines vs merge base | ${changed_lines} | ${MAX_CHANGED_LINES} |"
+            echo "| Commits | ${commits} | — |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ ${#failures[@]} -eq 0 ]; then
+            echo "Within both limits."
+            exit 0
+          fi
+
+          for failure in "${failures[@]}"; do
+            if [ "$ENFORCEMENT" = "warn" ]; then
+              echo "::warning title=Long-lived branch::${failure}"
+            else
+              echo "::error title=Long-lived branch::${failure}"
+            fi
+          done
+
+          {
+            echo
+            echo "Split the branch: land the part that is ready behind a feature flag,"
+            echo "and open a new branch for the rest. See docs/trunk-based-development.md."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$ENFORCEMENT" = "warn" ]; then
+            echo "enforcement=warn — annotated but not failed."
+            exit 0
+          fi
+
+          exit 1
+
+      - name: Merge queue entry
+        if: github.event_name == 'merge_group'
+        run: |
+          echo "Branch lifetime was measured on the pull request; a queue entry has none."

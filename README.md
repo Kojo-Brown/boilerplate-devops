@@ -15,6 +15,8 @@ Reusable CI/CD workflows and AWS infrastructure templates.
 | AWS CDK VPC + ECS stack | `aws/cdk/` |
 | CloudFormation templates | `aws/cloudformation/` |
 | Dependabot config | `.github/dependabot.yml` |
+| Trunk-based ruleset (required checks + merge queue) | `.github/rulesets/trunk-based-main.json` |
+| Short-lived branch check | `.github/workflows/trunk-guardrails.yml` |
 
 ## Usage
 
@@ -140,6 +142,26 @@ Placeholders must use one of the AWS documentation account IDs
 (`123456789012`, `111122223333`, …) — the scan permits those and nothing else.
 For a genuine exception, add `scan-allow: <rule-id> <reason>` to the line; a
 suppression without a reason is rejected.
+
+## Trunk-based development
+
+Required status checks and a merge queue are declared in
+`.github/rulesets/trunk-based-main.json` and applied with `gh api`; branch
+lifetime is measured on the pull request by
+`.github/workflows/trunk-guardrails.yml` (48h and 400 changed lines by default,
+both configurable, both callable from another repository).
+
+The three settings are edited independently and nothing in GitHub reconciles
+them, so `npm run audit:trunk` does: it fails the build when a required check
+has no producing job, when a producer cannot report inside the merge queue
+(missing `merge_group` trigger, a path filter, a job-level `if`, a matrix), or
+when a concurrency group lets one queue entry cancel another. Each of those
+mistakes is invisible until a pull request hangs at *"waiting for status to be
+reported"*.
+
+See [docs/trunk-based-development.md](./docs/trunk-based-development.md) for the
+apply commands, the reasoning behind each rule, and what to do when a branch
+fails the size or age limit.
 
 ## Spec Progress
 See [SPEC.md](./SPEC.md).
