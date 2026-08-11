@@ -71,11 +71,28 @@ jobs:
     name: Short-lived branch
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # The `inputs` context is empty for every event except workflow_call, so the
+    # declared `default:` above applies only to callers and the literal on the
+    # right of each `||` is what *this* repository runs with. They differ on
+    # purpose, and the difference is the calibration:
+    #
+    # The input defaults (48h / 400 lines / error) are the conventional
+    # trunk-based numbers for an application repository. This is not one. Its
+    # working agreement is one SPEC.md item per pull request, implemented with
+    # source, tests and docs, and the measured distribution over the twenty
+    # merged changes before this one is 438–3,280 lines excluding lockfiles,
+    # median ≈ 920. A 400-line cap here would fail every conforming pull
+    # request, which is not a guardrail, it is noise.
+    #
+    # So: 1,200 lines (≈ the 75th percentile, so it annotates the genuinely
+    # large ones), and `warn` — the same advice docs/trunk-based-development.md
+    # gives anyone turning this on for the first time. Tighten it once there is
+    # a distribution to tighten towards.
     env:
       MAX_BRANCH_AGE_HOURS: ${{ inputs.max-branch-age-hours || '48' }}
-      MAX_CHANGED_LINES: ${{ inputs.max-changed-lines || '400' }}
+      MAX_CHANGED_LINES: ${{ inputs.max-changed-lines || '1200' }}
       SIZE_EXCLUDE_PATHS: ${{ inputs.size-exclude-paths || '**/package-lock.json **/pnpm-lock.yaml **/yarn.lock **/uv.lock **/Cargo.lock **/go.sum' }}
-      ENFORCEMENT: ${{ inputs.enforcement || 'error' }}
+      ENFORCEMENT: ${{ inputs.enforcement || 'warn' }}
       BASE_SHA: ${{ github.event.pull_request.base.sha }}
       HEAD_SHA: ${{ github.event.pull_request.head.sha }}
     steps:

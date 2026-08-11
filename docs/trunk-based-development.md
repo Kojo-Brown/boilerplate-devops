@@ -143,6 +143,25 @@ Both thresholds are advisory in the sense that matters — they describe a
 practice, not a correctness property — so `enforcement: warn` annotates and
 passes. Use it to find the current distribution before turning it on hard.
 
+### What this repository runs
+
+The defaults above are the conventional numbers for an application repository.
+This repository is not one: its unit of work is one `SPEC.md` item — a CDK
+stack or a workflow template, with its tests and its documentation — and the
+twenty merged changes before this feature measure 438 to 3,280 lines excluding
+lockfiles, median ≈ 920. A 400-line cap would fail every conforming pull
+request, and a limit nobody can meet is not enforcement, it is noise that
+teaches people to ignore a red check.
+
+So this repository self-applies at **1,200 lines** (roughly the 75th percentile
+of that distribution, so it annotates the genuinely large ones) in **warn**
+mode, which is the advice above taken at face value. The age limit is unchanged
+at 48h — nothing in the working agreement argues for a long-lived branch.
+
+Those numbers are the literals on the right of each `||` in the workflow's `env`
+block; the `default:` values on the inputs are what callers get. The two differ
+deliberately and the block says so.
+
 ### Using it from another repository
 
 ```yaml
