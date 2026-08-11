@@ -5,6 +5,10 @@ name: CI
 # templates are valid GitHub Actions, and no new Checkov finding is introduced.
 on:
   pull_request:
+  # Every job below is a required status check, and a required check that does
+  # not report on merge_group leaves its queue entry waiting until
+  # check_response_timeout_minutes expires. Enforced by `npm run audit:trunk`.
+  merge_group:
   push:
     branches:
       - main
@@ -50,6 +54,14 @@ jobs:
       # Scans the whole repository, not just aws/cdk.
       - name: Scan for hardcoded account IDs, ARNs, and credentials
         run: npm run scan:identifiers
+
+      # The ruleset and the workflows that satisfy it are edited independently
+      # and nothing in GitHub reconciles them. A required check with no producer
+      # blocks every pull request; with a merge queue enabled it stalls the
+      # queue. Both are silent until the first merge attempt, so they are
+      # checked here instead.
+      - name: Audit trunk-based guardrails
+        run: npm run audit:trunk
 
       # Synth runs before the suite deliberately. It is the build step and takes
       # seconds, while the suite takes minutes; ordering it first means a test
