@@ -109,6 +109,13 @@ jobs:
       - name: Lint workflows and shipped templates
         run: actionlint -no-color -oneline .github/workflows/*.yml workflow-templates/*.yml
 
+      # Scripts a workflow shells out to are not reachable from actionlint —
+      # it only sees the `run:` block that invokes them, which is one quoted
+      # path. Without this they are the only shell in the repository nothing
+      # checks.
+      - name: Lint helper scripts
+        run: shellcheck .github/scripts/*.sh
+
   checkov:
     name: Checkov
     runs-on: ubuntu-latest
