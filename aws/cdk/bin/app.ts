@@ -23,6 +23,8 @@ import { CostAnomalyStack } from '../lib/cost-anomaly-stack';
 import { SecurityHubStack } from '../lib/security-hub-stack';
 import { WafStack } from '../lib/waf-stack';
 import { StaticSiteStack } from '../lib/static-site-stack';
+import { PreviewEnvironmentStack } from '../lib/preview-environment-stack';
+import { PreviewPrStack } from '../lib/preview-pr-stack';
 
 const app = new cdk.App();
 
@@ -1165,5 +1167,90 @@ new StaticSiteStack(app, 'StaticSiteStack-Production', {
     region: 'us-east-1', // CloudFront stacks must be in us-east-1
   },
   description: 'Production S3 static site + CloudFront + Route 53 (SPA mode, global edge, access logging)',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+// ── Preview environments (one per open pull request) ──────────────────────────
+// `PreviewEnvironmentStack` is the shared half — ALB, cluster, database, reaper —
+// and is deployed once. `PreviewPrStack` is the per-pull-request half and is
+// deployed and destroyed by `.github/workflows/preview-environment.yml`.
+//
+// The pull request number comes from context so CI can synthesise a real one:
+//   cdk deploy preview-pr-123 --context previewPrNumber=123 \
+//     --context previewImageUri=<account>.dkr.ecr.<region>.amazonaws.com/app:sha-abc123
+//
+// The default of 1 exists so `cdk synth` with no context still produces a
+// per-PR template for Checkov to scan. Previews share the staging VPC: a
+// preview is a staging-grade workload and a VPC of its own would add a NAT
+// gateway's standing cost to a system whose whole point is being cheap.
+//
+// See docs/preview-environments.md.
+const previewCertArn =
+  (app.node.tryGetContext('previewCertificateArn') as string | undefined) ??
+  process.env.PREVIEW_ACM_CERTIFICATE_ARN ??
+  'arn:aws:acm:REGION:ACCOUNT:certificate/REPLACE-ME-PREVIEW-WILDCARD';
+
+const previewDomain =
+  (app.node.tryGetContext('previewDomain') as string | undefined) ??
+  process.env.PREVIEW_DOMAIN ??
+  'preview.example.com';
+
+const previewRepository =
+  (app.node.tryGetContext('previewRepository') as string | undefined) ??
+  process.env.PREVIEW_REPOSITORY ??
+  'YOUR_ORG/YOUR_REPO';
+
+// Omit to run the reaper on age alone; see docs/preview-environments.md for the
+// difference that makes.
+const previewGitHubTokenSecretArn =
+  (app.node.tryGetContext('previewGitHubTokenSecretArn') as string | undefined) ??
+  process.env.PREVIEW_GITHUB_TOKEN_SECRET_ARN;
+
+const previewEnvironmentStack = new PreviewEnvironmentStack(app, 'PreviewEnvironmentStack', {
+  stackName: 'preview-shared',
+  vpc: vpcStackStaging.vpc,
+  certificateArn: previewCertArn,
+  previewDomain,
+  repository: previewRepository,
+  githubTokenSecretArn: previewGitHubTokenSecretArn,
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Shared preview infrastructure: ALB, ECS cluster, Postgres, and the reaper',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+const previewPrNumber = Number(
+  (app.node.tryGetContext('previewPrNumber') as string | number | undefined) ??
+    process.env.PREVIEW_PR_NUMBER ??
+    1,
+);
+
+const previewImageUri =
+  (app.node.tryGetContext('previewImageUri') as string | undefined) ??
+  process.env.PREVIEW_IMAGE_URI ??
+  'public.ecr.aws/nginx/nginx:stable-alpine';
+
+new PreviewPrStack(app, `PreviewPrStack-${previewPrNumber}`, {
+  prNumber: previewPrNumber,
+  repository: previewRepository,
+  imageUri: previewImageUri,
+  vpc: vpcStackStaging.vpc,
+  cluster: previewEnvironmentStack.cluster,
+  httpsListener: previewEnvironmentStack.httpsListener,
+  taskSecurityGroup: previewEnvironmentStack.taskSecurityGroup,
+  logGroup: previewEnvironmentStack.logGroup,
+  databaseHost: previewEnvironmentStack.database.instanceEndpoint.hostname,
+  databasePort: cdk.Token.asString(previewEnvironmentStack.database.instanceEndpoint.port),
+  databaseSecret: previewEnvironmentStack.databaseSecret,
+  previewDomain: previewEnvironmentStack.previewDomain,
+  envName: previewEnvironmentStack.envName,
+  containerPort: previewEnvironmentStack.containerPort,
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: `Preview environment for pull request #${previewPrNumber}`,
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });

@@ -1,0 +1,461 @@
+name: Preview environment
+
+# Reusable workflow: deploys a per-pull-request preview environment, seeds it,
+# and tears it down again.
+#
+# How it works:
+#   deploy  — create the pull request's database, deploy PreviewPrStack with the
+#             image under review, run the seed command as a one-off task, then
+#             scale the service up and wait for it to stabilise.
+#   destroy — drop the database, then delete the stack.
+#
+# The order in `deploy` is not cosmetic. The stack declares a service with zero
+# tasks precisely so the seed can run between "the task definition exists" and
+# "the application is serving": see the class documentation on PreviewPrStack.
+#
+# `destroy` never checks the repository out and never runs the CDK. It calls
+# DeleteStack directly, because by the time a pull request closes the branch it
+# was built from is usually gone, and a teardown that needs the branch to still
+# exist is a teardown that fails exactly when it is needed. The reaper Lambda in
+# PreviewEnvironmentStack uses the same call for the same reason, so both paths
+# converge on one mechanism rather than two that can disagree.
+#
+# This workflow is the fast path, not the guarantee. Every reason a `closed`
+# event can fail to reach a runner — a cancelled run, a disabled Actions
+# installation, a workflow file that is not on the branch — leaves an
+# environment running, and the reaper is what eventually collects it.
+#
+# Prerequisites:
+#   AWS_ROLE_ARN                — IAM role trusted by GitHub OIDC (github-oidc-stack)
+#   PreviewEnvironmentStack deployed, and its stack name passed as
+#   `shared-stack-name` (default `preview-shared`).
+#
+# The deploy role needs, at minimum:
+#   cloudformation:* on the preview stacks, plus whatever the CDK bootstrap
+#   execution role requires; ecs:RunTask / DescribeTasks / UpdateService /
+#   DescribeServices; iam:PassRole for the preview task roles.
+#
+# Actions are referenced by major tag, matching the rest of this repository.
+# Pinning every Action by digest is its own spec item and will be done as one
+# sweep so the pins stay consistent.
+
+on:
+  workflow_call:
+    inputs:
+      action:
+        description: '`deploy` or `destroy`'
+        required: true
+        type: string
+      pr-number:
+        description: Pull request number the environment belongs to
+        required: true
+        type: number
+      image-uri:
+        description: Full image URI built from the pull request head (required for `deploy`)
+        required: false
+        type: string
+        default: ''
+      is-fork:
+        description: >-
+          Whether the pull request comes from a fork. Fork previews are refused:
+          the deploy runs the fork's code with the base repository's AWS role and
+          seeds a database with it.
+        required: false
+        type: boolean
+        default: false
+      shared-stack-name:
+        description: Stack name of PreviewEnvironmentStack
+        required: false
+        type: string
+        default: preview-shared
+      env-name:
+        description: Environment name the shared stack was deployed with
+        required: false
+        type: string
+        default: preview
+      preview-domain:
+        description: >-
+          Domain previews are served under. Must match what the shared stack was
+          deployed with, or the listener rule will match a hostname the wildcard
+          certificate does not cover.
+        required: false
+        type: string
+        default: preview.example.com
+      repository:
+        description: >-
+          `owner/name` recorded on the preview stack's tags. Defaults to the
+          repository the caller runs in.
+        required: false
+        type: string
+        default: ''
+      aws-region:
+        description: AWS region
+        required: false
+        type: string
+        default: us-east-1
+      service-stable-timeout-minutes:
+        description: Give up waiting for the preview service to stabilise after this long
+        required: false
+        type: number
+        default: 15
+    secrets:
+      AWS_ROLE_ARN:
+        description: IAM role ARN with permission to deploy and delete preview stacks
+        required: true
+    outputs:
+      preview-url:
+        description: URL the preview is served at (empty for `destroy`)
+        value: ${{ jobs.deploy.outputs.preview-url }}
+
+permissions:
+  contents: read
+
+# Two pushes to the same pull request must not deploy the same stack at once:
+# the second CloudFormation update is rejected while the first is in progress.
+# Keyed on the pull request rather than the ref so `destroy` also queues behind
+# an in-flight `deploy` instead of racing it to the same stack.
+concurrency:
+  group: preview-${{ inputs.pr-number }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy preview
+    if: inputs.action == 'deploy'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      preview-url: ${{ steps.outputs.outputs.preview-url }}
+    defaults:
+      run:
+        working-directory: aws/cdk
+    steps:
+      - name: Refuse fork pull requests
+        if: inputs.is-fork
+        run: |
+          echo "::error::Preview environments are not deployed for forks." >&2
+          echo "The deploy assumes an AWS role in this account and runs the pull" >&2
+          echo "request's own code against it. For a fork that is a supply-chain" >&2
+          echo "hole, not a convenience." >&2
+          exit 1
+
+      - name: Reject a deploy with no image
+        env:
+          IMAGE_URI: ${{ inputs.image-uri }}
+        run: |
+          set -euo pipefail
+          if [ -z "$IMAGE_URI" ]; then
+            echo "::error::image-uri is required when action is 'deploy'." >&2
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: aws/cdk/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Resolve shared preview infrastructure
+        id: shared
+        env:
+          SHARED_STACK_NAME: ${{ inputs.shared-stack-name }}
+        run: |
+          set -euo pipefail
+          aws cloudformation describe-stacks \
+            --stack-name "$SHARED_STACK_NAME" \
+            --query 'Stacks[0].Outputs' \
+            --output json > shared-outputs.json
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+
+          with open('shared-outputs.json') as handle:
+              outputs = {o['OutputKey']: o['OutputValue'] for o in json.load(handle)}
+
+          for key, name in (
+              ('PreviewClusterName', 'cluster'),
+              ('PreviewDbAdminTaskFamily', 'db-admin-task'),
+              ('PreviewTaskSubnets', 'subnets'),
+              ('PreviewTaskSecurityGroup', 'security-group'),
+          ):
+              if key not in outputs:
+                  raise SystemExit(f'shared stack has no output {key}')
+              print(f'{name}={outputs[key]}')
+          PY
+
+      - name: Create the pull request's database
+        env:
+          CLUSTER: ${{ steps.shared.outputs.cluster }}
+          TASK_DEFINITION: ${{ steps.shared.outputs.db-admin-task }}
+          SUBNETS: ${{ steps.shared.outputs.subnets }}
+          SECURITY_GROUP: ${{ steps.shared.outputs.security-group }}
+          PR_NUMBER: ${{ inputs.pr-number }}
+        run: |
+          set -euo pipefail
+          overrides=$(python3 -c '
+          import json, os
+          print(json.dumps({"containerOverrides": [{
+              "name": "DatabaseAdmin",
+              "environment": [
+                  {"name": "PREVIEW_DB_ACTION", "value": "create"},
+                  {"name": "PREVIEW_DB_NAME", "value": "preview_pr_" + os.environ["PR_NUMBER"]},
+              ],
+          }]}))
+          ')
+          "$GITHUB_WORKSPACE/.github/scripts/run-preview-task.sh" \
+            "$CLUSTER" "$TASK_DEFINITION" "$SUBNETS" "$SECURITY_GROUP" "$overrides"
+
+      - name: Deploy the preview stack
+        env:
+          PR_NUMBER: ${{ inputs.pr-number }}
+          IMAGE_URI: ${{ inputs.image-uri }}
+          ENV_NAME: ${{ inputs.env-name }}
+          PREVIEW_DOMAIN: ${{ inputs.preview-domain }}
+          PREVIEW_REPOSITORY: ${{ inputs.repository || github.repository }}
+        run: |
+          set -euo pipefail
+          # --exclusively: without it the CDK also deploys this stack's
+          # dependencies, which are the shared preview stack and the VPC. Those
+          # are deployed on their own schedule, and re-deploying a VPC on every
+          # push to every pull request is both slow and a way to find out that
+          # somebody changed it.
+          npx cdk deploy "${ENV_NAME}-pr-${PR_NUMBER}" \
+            --exclusively \
+            --context "previewPrNumber=${PR_NUMBER}" \
+            --context "previewImageUri=${IMAGE_URI}" \
+            --context "previewDomain=${PREVIEW_DOMAIN}" \
+            --context "previewRepository=${PREVIEW_REPOSITORY}" \
+            --require-approval never \
+            --outputs-file preview-outputs.json
+
+      - name: Read the preview stack outputs
+        id: outputs
+        env:
+          PR_NUMBER: ${{ inputs.pr-number }}
+          ENV_NAME: ${{ inputs.env-name }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+
+          stack = f'{os.environ["ENV_NAME"]}-pr-{os.environ["PR_NUMBER"]}'
+          with open('preview-outputs.json') as handle:
+              outputs = json.load(handle)[stack]
+
+          print(f'preview-url={outputs["PreviewUrl"]}')
+          print(f'service={outputs["PreviewServiceName"]}')
+          print(f'task-definition={outputs["PreviewTaskDefinitionArn"]}')
+          # Read rather than configured here. The seed command is a property of
+          # the image, which the stack already declares; a second copy as a
+          # workflow input is a second place for it to be wrong.
+          print(f'seed-command={outputs["PreviewSeedCommand"]}')
+          PY
+
+      - name: Seed the preview with fixtures
+        env:
+          CLUSTER: ${{ steps.shared.outputs.cluster }}
+          TASK_DEFINITION: ${{ steps.outputs.outputs.task-definition }}
+          SUBNETS: ${{ steps.shared.outputs.subnets }}
+          SECURITY_GROUP: ${{ steps.shared.outputs.security-group }}
+          SEED_COMMAND: ${{ steps.outputs.outputs.seed-command }}
+        run: |
+          set -euo pipefail
+          # The seed runs from the task definition of the image under review, so
+          # the migrations and the fixtures are the ones in this pull request.
+          overrides=$(python3 -c '
+          import json, os
+          command = json.loads(os.environ["SEED_COMMAND"])
+          if not isinstance(command, list) or not all(isinstance(a, str) for a in command):
+              raise SystemExit("seed-command must be a JSON array of strings")
+          print(json.dumps({"containerOverrides": [{
+              "name": "AppContainer",
+              "command": command,
+          }]}))
+          ')
+          "$GITHUB_WORKSPACE/.github/scripts/run-preview-task.sh" \
+            "$CLUSTER" "$TASK_DEFINITION" "$SUBNETS" "$SECURITY_GROUP" "$overrides"
+
+      - name: Start the preview service
+        env:
+          CLUSTER: ${{ steps.shared.outputs.cluster }}
+          SERVICE: ${{ steps.outputs.outputs.service }}
+          TIMEOUT_MINUTES: ${{ inputs.service-stable-timeout-minutes }}
+        run: |
+          set -euo pipefail
+          aws ecs update-service \
+            --cluster "$CLUSTER" \
+            --service "$SERVICE" \
+            --desired-count 1 \
+            --force-new-deployment \
+            --no-cli-pager > /dev/null
+
+          # `aws ecs wait services-stable` polls for a fixed 40 minutes and
+          # cannot be shortened, so the bound the caller asked for is applied
+          # here instead of relying on the job timeout to cut it off.
+          if ! timeout "${TIMEOUT_MINUTES}m" aws ecs wait services-stable \
+              --cluster "$CLUSTER" --services "$SERVICE"; then
+            echo "::error::Preview service did not stabilise within ${TIMEOUT_MINUTES} minutes." >&2
+            aws ecs describe-services \
+              --cluster "$CLUSTER" --services "$SERVICE" \
+              --query 'services[0].events[:10].message' --output table >&2
+            exit 1
+          fi
+
+      - name: Summarise
+        env:
+          PREVIEW_URL: ${{ steps.outputs.outputs.preview-url }}
+          PR_NUMBER: ${{ inputs.pr-number }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Preview environment"
+            echo
+            echo "Pull request #${PR_NUMBER} is deployed at <${PREVIEW_URL}>."
+            echo
+            echo "Fixtures were re-seeded from this commit. The environment is deleted"
+            echo "when the pull request closes, and swept up by the reaper if that fails."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  destroy:
+    name: Destroy preview
+    if: inputs.action == 'destroy'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      # Only the two shell scripts are needed, not the branch under review —
+      # which by now may not exist.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Resolve shared preview infrastructure
+        id: shared
+        env:
+          SHARED_STACK_NAME: ${{ inputs.shared-stack-name }}
+        run: |
+          set -euo pipefail
+          aws cloudformation describe-stacks \
+            --stack-name "$SHARED_STACK_NAME" \
+            --query 'Stacks[0].Outputs' \
+            --output json > shared-outputs.json
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+
+          with open('shared-outputs.json') as handle:
+              outputs = {o['OutputKey']: o['OutputValue'] for o in json.load(handle)}
+
+          for key, name in (
+              ('PreviewClusterName', 'cluster'),
+              ('PreviewDbAdminTaskFamily', 'db-admin-task'),
+              ('PreviewTaskSubnets', 'subnets'),
+              ('PreviewTaskSecurityGroup', 'security-group'),
+          ):
+              if key not in outputs:
+                  raise SystemExit(f'shared stack has no output {key}')
+              print(f'{name}={outputs[key]}')
+          PY
+
+      - name: Check the stack is a preview
+        id: check
+        env:
+          PR_NUMBER: ${{ inputs.pr-number }}
+          ENV_NAME: ${{ inputs.env-name }}
+        run: |
+          set -euo pipefail
+          stack="${ENV_NAME}-pr-${PR_NUMBER}"
+          echo "stack=${stack}" >> "$GITHUB_OUTPUT"
+
+          # A pull request closed before it ever deployed has nothing to delete,
+          # which is a normal outcome and not a failure.
+          if ! aws cloudformation describe-stacks --stack-name "$stack" \
+              --query 'Stacks[0].Tags' --output json > tags.json 2>/dev/null; then
+            echo "No stack named ${stack}; nothing to tear down."
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # The same three-way agreement the reaper insists on: the marker tag,
+          # the pull request number, and the name. Deleting a stack is not a
+          # step to take on a name match alone.
+          STACK="$stack" python3 - <<'PY'
+          import json, os
+
+          stack = os.environ['STACK']
+          with open('tags.json') as handle:
+              tags = {t['Key']: t['Value'] for t in json.load(handle)}
+
+          if tags.get('PreviewEnvironment') != 'true':
+              raise SystemExit(f'refusing to delete {stack}: not tagged PreviewEnvironment=true')
+          if tags.get('PreviewPrNumber') != os.environ['PR_NUMBER']:
+              raise SystemExit(f'refusing to delete {stack}: PreviewPrNumber tag does not match')
+          PY
+          echo "exists=true" >> "$GITHUB_OUTPUT"
+
+      - name: Drop the pull request's database
+        if: steps.check.outputs.exists == 'true'
+        env:
+          CLUSTER: ${{ steps.shared.outputs.cluster }}
+          TASK_DEFINITION: ${{ steps.shared.outputs.db-admin-task }}
+          SUBNETS: ${{ steps.shared.outputs.subnets }}
+          SECURITY_GROUP: ${{ steps.shared.outputs.security-group }}
+          PR_NUMBER: ${{ inputs.pr-number }}
+        run: |
+          set -euo pipefail
+          # Before the stack delete, not after: the drop needs the cluster and
+          # the admin task definition, which live in the shared stack, and doing
+          # it first means a failed stack delete leaves nothing half-collected.
+          # DROP DATABASE ... WITH (FORCE) evicts the service's own connections.
+          overrides=$(python3 -c '
+          import json, os
+          print(json.dumps({"containerOverrides": [{
+              "name": "DatabaseAdmin",
+              "environment": [
+                  {"name": "PREVIEW_DB_ACTION", "value": "drop"},
+                  {"name": "PREVIEW_DB_NAME", "value": "preview_pr_" + os.environ["PR_NUMBER"]},
+              ],
+          }]}))
+          ')
+          "$GITHUB_WORKSPACE/.github/scripts/run-preview-task.sh" \
+            "$CLUSTER" "$TASK_DEFINITION" "$SUBNETS" "$SECURITY_GROUP" "$overrides"
+
+      - name: Delete the preview stack
+        if: steps.check.outputs.exists == 'true'
+        env:
+          STACK: ${{ steps.check.outputs.stack }}
+        run: |
+          set -euo pipefail
+          aws cloudformation delete-stack --stack-name "$STACK"
+          if ! aws cloudformation wait stack-delete-complete --stack-name "$STACK"; then
+            echo "::error::Deleting ${STACK} failed. The reaper will retry on its next sweep." >&2
+            aws cloudformation describe-stack-events --stack-name "$STACK" \
+              --query "StackEvents[?ResourceStatus=='DELETE_FAILED'].[LogicalResourceId,ResourceStatusReason]" \
+              --output table >&2
+            exit 1
+          fi
+          echo "Deleted ${STACK}."

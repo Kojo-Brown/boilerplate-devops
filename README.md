@@ -17,6 +17,7 @@ Reusable CI/CD workflows and AWS infrastructure templates.
 | Dependabot config | `.github/dependabot.yml` |
 | Trunk-based ruleset (required checks + merge queue) | `.github/rulesets/trunk-based-main.json` |
 | Short-lived branch check | `.github/workflows/trunk-guardrails.yml` |
+| Per-PR preview environment (deploy + teardown) | `.github/workflows/preview-environment.yml` |
 
 ## Usage
 
@@ -124,6 +125,32 @@ state for hard failures, burn rate for the slow regressions a fixed threshold
 either misses or over-reacts to. See
 [docs/slo-burn-rate-rollback.md](./docs/slo-burn-rate-rollback.md) for the
 arithmetic, the defaults, and what the handler checks before it acts.
+
+## Preview environments
+
+Every open pull request gets a running copy of the application at
+`pr-<number>.preview.example.com`, seeded from that pull request's own commit
+and deleted when it closes. `PreviewEnvironmentStack` holds everything shared —
+one ALB, one ECS cluster, one Postgres instance — and `PreviewPrStack` adds only
+a service, a target group, and a listener rule, so a preview appears in about a
+minute instead of the fifteen a per-PR VPC and database would take.
+
+The service is declared with zero tasks on purpose. A preview's database has no
+schema until the seed task has run, and the seed task cannot run until the task
+definition exists — which is the same CloudFormation operation that creates the
+service. So the workflow creates the database, deploys, seeds, and only then
+scales up.
+
+Teardown has two mechanisms because one is not enough. The `closed` event is the
+fast path; an hourly reaper Lambda is the guarantee, because a cancelled run, a
+degraded Actions installation, or a workflow file missing from the branch all
+leave an environment running and billing, silently. The reaper deletes stacks
+whose pull request has closed, and stacks that have outlived their limit
+whatever GitHub says — but it never confuses *cannot reach GitHub* with
+*closed*.
+
+See [docs/preview-environments.md](./docs/preview-environments.md) for the
+seeding contract, the fork policy, the ALB limits, and the cost model.
 
 ## OIDC Setup (no long-lived AWS keys)
 See `aws/cloudformation/github-oidc-role.yml` for the IAM role template.
