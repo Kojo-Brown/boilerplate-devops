@@ -9,6 +9,7 @@
     "typecheck": "tsc --noEmit",
     "scan:identifiers": "ts-node tools/scan-hardcoded-identifiers.ts",
     "audit:trunk": "ts-node tools/audit-trunk-guardrails.ts",
+    "audit:migrations": "ts-node tools/audit-migrations.ts",
     "cdk": "cdk"
   },
   "devDependencies": {

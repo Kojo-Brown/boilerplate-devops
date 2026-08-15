@@ -1,0 +1,28 @@
+-- migration: 002_expand_index_last_name
+-- phase: expand
+-- release: 1.4.0
+-- transaction: none
+-- rollback: DROP INDEX CONCURRENTLY users_last_name_idx.
+--
+-- The index 1.6.0 will need to sort by surname, built four releases before
+-- anything queries it. Indexes are the cheapest thing to ship early: an unused
+-- index costs write amplification and disk, and nothing else.
+--
+-- CONCURRENTLY is not optional on a table that is serving traffic. A plain
+-- CREATE INDEX holds a SHARE lock for the whole build, which blocks every
+-- INSERT, UPDATE and DELETE until it finishes — seconds on a small table, and
+-- on a table large enough to need an index, long enough to be an outage.
+--
+-- `-- transaction: none` is what makes it work. CREATE INDEX CONCURRENTLY takes
+-- two table scans and commits between them, so Postgres refuses to run it
+-- inside a transaction block. Most migration runners wrap each file in
+-- BEGIN/COMMIT unless told otherwise, so a runner that ignores this header will
+-- fail here with `CREATE INDEX CONCURRENTLY cannot run inside a transaction
+-- block` — the good failure, at deploy time, before any lock is taken.
+--
+-- A CONCURRENTLY build that fails partway leaves an INVALID index behind. It is
+-- not used by the planner and it is not repaired by a retry: drop it
+-- (`DROP INDEX CONCURRENTLY`) and run this again. Check for one with
+--   SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid;
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS users_last_name_idx ON users (last_name);
