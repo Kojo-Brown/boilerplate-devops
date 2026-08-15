@@ -63,6 +63,13 @@ jobs:
       - name: Audit trunk-based guardrails
         run: npm run audit:trunk
 
+      # An unsafe migration is invisible in review — it is ordinary SQL, and it
+      # fails only under load, only in production, and only during the deploy
+      # window when the old code is the only code running. Checking the shipped
+      # example on every PR also keeps it executed rather than illustrative.
+      - name: Audit migration expand/contract safety
+        run: npm run audit:migrations
+
       # Synth runs before the suite deliberately. It is the build step and takes
       # seconds, while the suite takes minutes; ordering it first means a test
       # failure never hides whether the app still synthesises.

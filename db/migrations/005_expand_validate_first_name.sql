@@ -1,0 +1,23 @@
+-- migration: 005_expand_validate_first_name
+-- phase: expand
+-- release: 1.5.1
+-- transaction: implicit
+-- rollback: none needed. Validating a constraint changes one catalogue flag and
+--           rejects nothing that was already accepted.
+--
+-- Prove the constraint holds for the rows that predate it.
+--
+-- VALIDATE CONSTRAINT does the scan that 004 refused to do, but it takes only
+-- SHARE UPDATE EXCLUSIVE: reads and writes continue throughout, and the only
+-- thing it blocks is another schema change on the same table. The scan can take
+-- minutes on a large table and that is fine, because nothing is waiting on it.
+--
+-- Ships after 004 rather than with it. In the same transaction the deferral
+-- buys nothing — the ACCESS EXCLUSIVE lock taken by the ADD is held until
+-- commit, so the scan happens under it anyway, which is the exact stall 004
+-- exists to avoid.
+--
+-- If this fails, 003 did not finish: some row still has a NULL `first_name`.
+-- Re-run the backfill and try again. It is safe to be here more than once.
+
+ALTER TABLE users VALIDATE CONSTRAINT users_first_name_not_null;

@@ -18,6 +18,7 @@ Reusable CI/CD workflows and AWS infrastructure templates.
 | Trunk-based ruleset (required checks + merge queue) | `.github/rulesets/trunk-based-main.json` |
 | Short-lived branch check | `.github/workflows/trunk-guardrails.yml` |
 | Per-PR preview environment (deploy + teardown) | `.github/workflows/preview-environment.yml` |
+| Expand/contract migration playbook + worked example | `db/migrations/` |
 
 ## Usage
 
@@ -152,6 +153,33 @@ whatever GitHub says — but it never confuses *cannot reach GitHub* with
 See [docs/preview-environments.md](./docs/preview-environments.md) for the
 seeding contract, the fork policy, the ALB limits, and the cost model.
 
+## Zero-downtime database migrations
+
+`DbMigrationStack` runs migrations from CodeDeploy's `BeforeAllowTraffic` hook,
+so a failed migration rolls the deployment back before a single request reaches
+the new tasks. The corollary is the part that catches teams out: at the moment a
+migration commits, the **only code running is the old code**. A migration that
+needs the new release to already be deployed does not fail at the end of the
+rollout — it fails at the start of it, against the version you were replacing.
+
+Expand/contract is what makes that survivable. `db/migrations/` is a worked
+example of the hard case — splitting `users.full_name` into `first_name` and
+`last_name` across five releases — with the trigger that keeps both shapes in
+step, a batched resumable backfill, the `NOT VALID` → `VALIDATE` →
+`SET NOT NULL` sequence that adds a constraint without a table scan, and the
+irreversible drop three releases behind the last reader.
+
+`npm run audit:migrations` enforces the mechanical half on every PR: renames and
+in-place type changes, `NOT NULL` columns with no default, indexes built without
+`CONCURRENTLY`, constraints added without `NOT VALID`, unbounded backfills, and
+any file that both adds and removes schema — which leaves no release you can
+roll back to. It reads inside `DO` blocks and function bodies, because a
+`DROP TABLE` is no less destructive for being wrapped in PL/pgSQL.
+
+See [docs/expand-contract-migrations.md](./docs/expand-contract-migrations.md)
+for the release timeline, the lock table, and what the audit cannot check for
+you.
+
 ## OIDC Setup (no long-lived AWS keys)
 See `aws/cloudformation/github-oidc-role.yml` for the IAM role template.
 
@@ -164,6 +192,7 @@ the two mistakes that survive a copy:
 |------|----------------|-------|
 | `npm run scan:identifiers` | Hardcoded AWS account IDs (including those embedded in ARNs and ECR image URIs), AWS access keys, PEM private keys, and provider tokens | `aws/cdk/tools/scan-hardcoded-identifiers.ts` |
 | TruffleHog | Secrets with no distinctive shape, detected by entropy and verification | `workflow-templates/secret-scanning.yml` |
+| `npm run audit:migrations` | Migrations that cannot survive a deployment window: renames, in-place type changes, scans and rewrites under `ACCESS EXCLUSIVE`, unbounded backfills, expand and contract in one file | `aws/cdk/tools/audit-migrations.ts` |
 
 Placeholders must use one of the AWS documentation account IDs
 (`123456789012`, `111122223333`, …) — the scan permits those and nothing else.
