@@ -1,8 +1,11 @@
+import * as fs from 'fs';
+import * as path from 'path';
 import * as cdk from 'aws-cdk-lib';
 import * as appconfig from 'aws-cdk-lib/aws-appconfig';
 import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import { Construct } from 'constructs';
+import { FEATURE_FLAG_MANIFEST_SCHEMA } from '../tools/audit-feature-flags';
 
 export interface AppConfigEnvironmentConfig {
   /** Environment name, e.g. 'production' or 'staging' */
@@ -49,15 +52,27 @@ export interface AppConfigStackProps extends cdk.StackProps {
    * rolls back to the previous configuration version automatically.
    */
   readonly rollbackAlarmArns?: string[];
+
+  /**
+   * Feature flag manifest used to bootstrap the first configuration version.
+   * Defaults to `aws/appconfig/feature-flags.example.json`.
+   *
+   * The default is the file the audit gate checks and the file the deploy
+   * workflow ships, deliberately: a stack that bootstrapped from an inline
+   * literal would put a set of flags into every new environment that nothing in
+   * the repository validates and no manifest in the repository matches.
+   */
+  readonly featureFlagsManifestPath?: string;
 }
 
-const INITIAL_FEATURE_FLAGS: Record<string, boolean | number> = {
-  newDashboard: false,
-  darkModeDefault: true,
-  maintenanceMode: false,
-  betaFeatures: false,
-  rateLimitRequestsPerMinute: 100,
-};
+/** `aws/appconfig/feature-flags.example.json`, resolved from this file. */
+export const DEFAULT_FEATURE_FLAGS_MANIFEST_PATH = path.join(
+  __dirname,
+  '..',
+  '..',
+  'appconfig',
+  'feature-flags.example.json',
+);
 
 /**
  * AWS AppConfig stack for feature flag deployment.
@@ -67,11 +82,18 @@ const INITIAL_FEATURE_FLAGS: Record<string, boolean | number> = {
  *     └─ DeploymentStrategy (linear 10 % / min, 10-min duration, 5-min bake)
  *     ├─ Environment: production  (+ CloudWatch rollback monitors)
  *     ├─ Environment: staging     (+ CloudWatch rollback monitors)
- *     └─ HostedConfiguration: feature-flags
+ *     └─ HostedConfiguration: feature-flags  (+ JSON Schema validator)
  *          └─ Deployment → all environments
  *
+ * The configuration is the flag manifest described in `docs/feature-flags.md`,
+ * bootstrapped from `aws/appconfig/feature-flags.example.json`. The manifest
+ * schema is attached to the profile as a validator, so AppConfig rejects a
+ * malformed version at CreateHostedConfigurationVersion rather than deploying
+ * it — the last line of defence behind `npm run audit:flags`, and the only one
+ * that still applies when somebody uploads a version by hand.
+ *
  * Deployment flow (via workflow-templates/deploy-feature-flags.yml):
- *   1. CI validates the feature-flags JSON file.
+ *   1. CI validates the feature-flags manifest.
  *   2. aws appconfig create-hosted-configuration-version  → new version N+1
  *   3. aws appconfig start-deployment  → gradual rollout begins
  *   4. AppConfig shifts traffic 10 % per minute over 10 minutes.
@@ -154,17 +176,27 @@ export class AppConfigStack extends cdk.Stack {
     }
 
     // ── Feature Flags Hosted Configuration ────────────────────────────────────
-    // Content type FREEFORM allows any valid JSON object. The workflow manages
-    // subsequent versions; CDK bootstraps the initial version and deploys it.
+    // FREEFORM rather than AppConfig's own FEATURE_FLAGS type. That type has a
+    // fixed schema with nowhere to record who owns a flag or when it is due to
+    // be removed, and the lifecycle machinery in `FeatureFlagLifecycleStack`
+    // reads exactly those fields off the deployed configuration. A validator
+    // gives back what the typed profile would have provided — server-side
+    // rejection of a malformed version — for a shape that carries the metadata.
+    //
+    // The workflow manages subsequent versions; CDK bootstraps the first one
+    // from the manifest in the repository and deploys it.
+    const manifestPath = props.featureFlagsManifestPath ?? DEFAULT_FEATURE_FLAGS_MANIFEST_PATH;
+    const manifest = fs.readFileSync(manifestPath, 'utf8');
+
     this.featureFlagsConfig = new appconfig.HostedConfiguration(this, 'FeatureFlags', {
       application: this.application,
       name: 'feature-flags',
-      description: 'Boolean and numeric feature flags polled by application containers',
-      content: appconfig.ConfigurationContent.fromInlineJson(
-        JSON.stringify(INITIAL_FEATURE_FLAGS, null, 2),
-        'application/json',
-      ),
+      description: 'Feature flag manifest polled by application containers',
+      content: appconfig.ConfigurationContent.fromInlineJson(manifest, 'application/json'),
       type: appconfig.ConfigurationType.FREEFORM,
+      validators: [
+        appconfig.JsonSchemaValidator.fromInline(JSON.stringify(FEATURE_FLAG_MANIFEST_SCHEMA)),
+      ],
       deploymentStrategy: this.deploymentStrategy,
       deployTo: Object.values(this.environments),
     });

@@ -10,11 +10,13 @@
     "scan:identifiers": "ts-node tools/scan-hardcoded-identifiers.ts",
     "audit:trunk": "ts-node tools/audit-trunk-guardrails.ts",
     "audit:migrations": "ts-node tools/audit-migrations.ts",
+    "audit:flags": "ts-node tools/audit-feature-flags.ts",
     "cdk": "cdk"
   },
   "devDependencies": {
     "@types/jest": "^29.5.12",
     "@types/node": "^22.0.0",
+    "ajv": "^8.20.0",
     "aws-cdk": "^2.200.0",
     "jest": "^29.7.0",
     "js-yaml": "^5.2.3",

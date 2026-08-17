@@ -16,6 +16,7 @@ import { LogInsightsStack } from '../lib/log-insights-stack';
 import { BlueGreenDeployStack } from '../lib/blue-green-deploy-stack';
 import { CanaryDeployStack } from '../lib/canary-deploy-stack';
 import { AppConfigStack } from '../lib/appconfig-stack';
+import { FeatureFlagLifecycleStack } from '../lib/feature-flag-lifecycle-stack';
 import { DbMigrationStack } from '../lib/db-migration-stack';
 import { RollbackAutomationStack } from '../lib/rollback-automation-stack';
 import { SloBurnRateRollbackStack } from '../lib/slo-burn-rate-rollback-stack';
@@ -628,7 +629,7 @@ new CanaryDeployStack(app, 'CanaryDeployStack-Production', {
 //   Attach AppConfigReadPolicyArn to the ECS task role, then call:
 //     StartConfigurationSession → GetLatestConfiguration (poll every 30–60 s)
 
-new AppConfigStack(app, 'AppConfigStack', {
+const appConfigStack = new AppConfigStack(app, 'AppConfigStack', {
   appName: 'boilerplate',
   deploymentGrowthFactor: 10,
   deploymentDurationMinutes: 10,
@@ -638,6 +639,37 @@ new AppConfigStack(app, 'AppConfigStack', {
     region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
   },
   description: 'AppConfig feature flags — gradual rollout with auto-rollback on alarm',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+// ── Feature Flag Lifecycle ────────────────────────────────────────────────────
+// The half of the lifecycle that runs after the merge. AppConfigStack ships
+// flags; this stack reads back what is actually deployed, once a day, and
+// reports the ones that are past their declared removal date, finished rolling
+// out, or were never turned on at all — as CloudWatch metrics, an SNS summary,
+// and a GitHub issue in the owning team's backlog.
+//
+// It never deletes a flag. Removing the configuration before the code that
+// reads it leaves running processes resolving the key to undefined, which is
+// falsy, which takes the branch the rollout was moving away from. See
+// docs/feature-flags.md.
+//
+// `githubTokenSecretArn` is optional: without it the sweep still measures and
+// notifies, it just cannot turn a measurement into somebody's work.
+new FeatureFlagLifecycleStack(app, 'FeatureFlagLifecycleStack', {
+  application: appConfigStack.application,
+  configurationProfileId: appConfigStack.featureFlagsConfig.configurationProfileId,
+  environments: Object.entries(appConfigStack.environments).map(([name, environment]) => ({
+    name,
+    environmentId: environment.environmentId,
+  })),
+  repository: 'YOUR_ORG/YOUR_REPO',
+  githubTokenSecretArn: process.env.FLAG_SWEEP_GITHUB_TOKEN_SECRET_ARN,
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Daily sweep for expired, finished, and abandoned feature flags',
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
 

@@ -70,6 +70,15 @@ jobs:
       - name: Audit migration expand/contract safety
         run: npm run audit:migrations
 
+      # A flag with no owner, no ticket, or no removal date is the state every
+      # abandoned flag is already in, and it is invisible in review because the
+      # declaration that is missing is the one nobody looks for. Deliberately
+      # runs without `--now`: expiry is enforced at deploy time and by the daily
+      # sweep, not by turning every build in the repository red on a date the
+      # pull request in front of you did not choose. See docs/feature-flags.md.
+      - name: Audit feature flag manifests
+        run: npm run audit:flags
+
       # Synth runs before the suite deliberately. It is the build step and takes
       # seconds, while the suite takes minutes; ordering it first means a test
       # failure never hides whether the app still synthesises.

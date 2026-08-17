@@ -1,7 +1,23 @@
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import Ajv from 'ajv';
 import * as cdk from 'aws-cdk-lib';
 import { Template, Match } from 'aws-cdk-lib/assertions';
-import { AppConfigStack, AppConfigStackProps } from '../lib/appconfig-stack';
+import {
+  AppConfigStack,
+  AppConfigStackProps,
+  DEFAULT_FEATURE_FLAGS_MANIFEST_PATH,
+} from '../lib/appconfig-stack';
+import { auditFeatureFlags, FEATURE_FLAG_MANIFEST_SCHEMA } from '../tools/audit-feature-flags';
 import { flattenIntrinsic, resourceProps, TOKEN } from './support/cfn';
+
+/** The manifest CDK puts into the first hosted configuration version. */
+const bootstrappedContent = (template: Template): unknown => {
+  const versions = template.findResources('AWS::AppConfig::HostedConfigurationVersion');
+  const resource = Object.values(versions)[0] as { Properties: { Content: string } };
+  return JSON.parse(resource.Properties.Content) as unknown;
+};
 
 const makeStack = (props: AppConfigStackProps = {}) => {
   const app = new cdk.App();
@@ -195,16 +211,91 @@ describe('AppConfigStack', () => {
       });
     });
 
-    it('includes all default feature flags in the initial config', () => {
+    it('bootstraps from the manifest in the repository, byte for byte', () => {
       const { template } = makeStack();
-      const versions = template.findResources('AWS::AppConfig::HostedConfigurationVersion');
-      const resource = Object.values(versions)[0] as { Properties: { Content: string } };
-      const content = JSON.parse(resource.Properties.Content) as Record<string, unknown>;
-      expect(content).toHaveProperty('newDashboard', false);
-      expect(content).toHaveProperty('darkModeDefault', true);
-      expect(content).toHaveProperty('maintenanceMode', false);
-      expect(content).toHaveProperty('betaFeatures', false);
-      expect(content).toHaveProperty('rateLimitRequestsPerMinute', 100);
+      expect(bootstrappedContent(template)).toEqual(
+        JSON.parse(fs.readFileSync(DEFAULT_FEATURE_FLAGS_MANIFEST_PATH, 'utf8')),
+      );
+    });
+
+    it('bootstraps a manifest that passes the audit gate', () => {
+      // The initial version is deployed to every environment the moment the
+      // stack is created, and it is the one version no pull request reviews.
+      // Without this, `npm run audit:flags` could be green while the flags CDK
+      // actually ships are anything at all.
+      const { template } = makeStack();
+      expect(auditFeatureFlags(bootstrappedContent(template))).toEqual([]);
+    });
+
+    it('reads a caller-supplied manifest instead when given one', () => {
+      const manifestPath = path.join(os.tmpdir(), 'feature-flags.override.test.json');
+      fs.writeFileSync(
+        manifestPath,
+        JSON.stringify({
+          version: '1',
+          flags: {
+            killSwitch: {
+              description: 'Stop serving writes.',
+              kind: 'operational',
+              owner: '@sre',
+              createdOn: '2026-01-05',
+              enabled: false,
+            },
+          },
+        }),
+      );
+
+      try {
+        const { template } = makeStack({ featureFlagsManifestPath: manifestPath });
+        expect(bootstrappedContent(template)).toHaveProperty('flags.killSwitch');
+      } finally {
+        fs.unlinkSync(manifestPath);
+      }
+    });
+
+    it('attaches the manifest schema as a JSON Schema validator', () => {
+      // AppConfig applies validators on CreateHostedConfigurationVersion, which
+      // is the only check still standing when someone uploads a version by hand
+      // instead of through the workflow.
+      const { template } = makeStack();
+      template.hasResourceProperties('AWS::AppConfig::ConfigurationProfile', {
+        Validators: [
+          Match.objectLike({
+            Type: 'JSON_SCHEMA',
+            Content: Match.serializedJson(
+              Match.objectLike({ required: ['version', 'flags'] }),
+            ),
+          }),
+        ],
+      });
+    });
+
+    it('validates the manifest schema against a flag missing its owner', () => {
+      // Guards the schema itself: `additionalProperties: false` plus a required
+      // list is easy to get subtly wrong, and a validator that accepts
+      // everything looks identical to one that works.
+      const validator = new Ajv({ strict: false }).compile(FEATURE_FLAG_MANIFEST_SCHEMA);
+      const flag = {
+        description: 'Rebuilt dashboard.',
+        kind: 'release',
+        owner: '@web-platform',
+        createdOn: '2026-08-03',
+        enabled: true,
+      };
+
+      expect(validator({ version: '1', flags: { newDashboard: flag } })).toBe(true);
+      expect(
+        validator({ version: '1', flags: { newDashboard: { ...flag, owner: undefined } } }),
+      ).toBe(false);
+      expect(
+        validator({ version: '1', flags: { newDashboard: { ...flag, kind: 'temporary' } } }),
+      ).toBe(false);
+      expect(
+        validator({ version: '1', flags: { newDashboard: { ...flag, rolloutPct: 50 } } }),
+      ).toBe(false);
+      expect(
+        validator({ version: '1', flags: { newDashboard: { ...flag, rolloutPercentage: 101 } } }),
+      ).toBe(false);
     });
   });
 
