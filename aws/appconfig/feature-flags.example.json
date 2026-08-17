@@ -1,7 +1,50 @@
 {
-  "newDashboard": false,
-  "darkModeDefault": true,
-  "maintenanceMode": false,
-  "betaFeatures": false,
-  "rateLimitRequestsPerMinute": 100
+  "version": "1",
+  "flags": {
+    "newDashboard": {
+      "description": "Rebuilt dashboard shell, served to a share of signed-in users while the old one stays available.",
+      "kind": "release",
+      "owner": "@web-platform",
+      "ticket": "WEB-1421",
+      "createdOn": "2026-08-03",
+      "expiresOn": "2026-10-15",
+      "enabled": true,
+      "rolloutPercentage": 25
+    },
+    "darkModeDefault": {
+      "description": "Dark mode as the default theme for users who have expressed no preference.",
+      "kind": "release",
+      "owner": "@design-systems",
+      "ticket": "WEB-1180",
+      "createdOn": "2026-07-20",
+      "expiresOn": "2026-10-01",
+      "enabled": true,
+      "rolloutPercentage": 100
+    },
+    "betaFeatures": {
+      "description": "Opt-in surface for unreleased functionality, measured against the control group.",
+      "kind": "experiment",
+      "owner": "@growth",
+      "ticket": "GRW-318",
+      "createdOn": "2026-08-10",
+      "expiresOn": "2026-09-21",
+      "enabled": true,
+      "rolloutPercentage": 10
+    },
+    "maintenanceMode": {
+      "description": "Kill switch: serve the maintenance page and reject writes. Operated by whoever holds the pager.",
+      "kind": "operational",
+      "owner": "@sre",
+      "createdOn": "2026-02-11",
+      "enabled": false
+    },
+    "rateLimitRequestsPerMinute": {
+      "description": "Per-client request budget enforced at the edge. Lowered under load, raised once an incident is over.",
+      "kind": "operational",
+      "owner": "@sre",
+      "createdOn": "2026-02-11",
+      "enabled": true,
+      "value": 100
+    }
+  }
 }

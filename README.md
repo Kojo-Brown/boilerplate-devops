@@ -19,6 +19,7 @@ Reusable CI/CD workflows and AWS infrastructure templates.
 | Short-lived branch check | `.github/workflows/trunk-guardrails.yml` |
 | Per-PR preview environment (deploy + teardown) | `.github/workflows/preview-environment.yml` |
 | Expand/contract migration playbook + worked example | `db/migrations/` |
+| Feature flag manifest + stale-flag sweep | `aws/appconfig/`, `aws/cdk/lib/feature-flag-lifecycle-stack.ts` |
 
 ## Usage
 
@@ -180,6 +181,34 @@ See [docs/expand-contract-migrations.md](./docs/expand-contract-migrations.md)
 for the release timeline, the lock table, and what the audit cannot check for
 you.
 
+## Feature flags
+
+Flags are declared in `aws/appconfig/feature-flags*.json` with an owner, a kind,
+a ticket, and the day they should be gone. `npm run audit:flags` refuses a flag
+that arrives without them, and the same schema is attached to the AppConfig
+configuration profile as a JSON Schema validator, so a malformed version is
+rejected at `CreateHostedConfigurationVersion` rather than deployed.
+
+Two things are easy to conflate and behave completely differently. AppConfig's
+deployment strategy is a *configuration* rollout — it controls how fast a change
+reaches your fleet, and it is what the rollback alarms watch. `rolloutPercentage`
+is a *flag* rollout — which users see the feature — and AppConfig does not
+implement it. `aws/cdk/lib/feature-flag-bucketing.ts` is the reference
+implementation the application uses: stable per subject, independent per flag,
+nested as the percentage rises, and cheap enough for a request path.
+
+`FeatureFlagLifecycleStack` is the part that runs after the merge. Once a day it
+reads what is *actually deployed* to each environment through the runtime Data
+API and reports every flag that is past its removal date, finished rolling out,
+or was never turned on — as CloudWatch metrics, an SNS summary, and a GitHub
+issue in the owning team's backlog. It never deletes a flag: removing the
+configuration before the code that reads it leaves running processes resolving
+the key to `undefined`, which is falsy, which takes the branch the rollout was
+moving away from.
+
+See [docs/feature-flags.md](./docs/feature-flags.md) for the manifest reference,
+the three flag kinds, and why expiry blocks a deploy rather than a build.
+
 ## OIDC Setup (no long-lived AWS keys)
 See `aws/cloudformation/github-oidc-role.yml` for the IAM role template.
 
@@ -193,6 +222,7 @@ the two mistakes that survive a copy:
 | `npm run scan:identifiers` | Hardcoded AWS account IDs (including those embedded in ARNs and ECR image URIs), AWS access keys, PEM private keys, and provider tokens | `aws/cdk/tools/scan-hardcoded-identifiers.ts` |
 | TruffleHog | Secrets with no distinctive shape, detected by entropy and verification | `workflow-templates/secret-scanning.yml` |
 | `npm run audit:migrations` | Migrations that cannot survive a deployment window: renames, in-place type changes, scans and rewrites under `ACCESS EXCLUSIVE`, unbounded backfills, expand and contract in one file | `aws/cdk/tools/audit-migrations.ts` |
+| `npm run audit:flags` | Feature flags with no owner, ticket, or removal date; deadlines beyond 90 days or before the creation date; a field nothing reads; a percentage on a flag that is off, or a flag on at 0% | `aws/cdk/tools/audit-feature-flags.ts` |
 
 Placeholders must use one of the AWS documentation account IDs
 (`123456789012`, `111122223333`, …) — the scan permits those and nothing else.

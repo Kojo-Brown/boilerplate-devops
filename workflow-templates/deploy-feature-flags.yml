@@ -103,30 +103,95 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      # ── Validate JSON ─────────────────────────────────────────────────────────
-      - name: Validate feature flags JSON
+      # ── Validate the manifest ─────────────────────────────────────────────────
+      # Self-contained on purpose: this template is copied into repositories that
+      # do not have this one's tooling. It checks the shape, and the one rule
+      # that has to block a *deploy* — an expired flag. The full rule set lives
+      # in `npm run audit:flags` and runs on the pull request; AppConfig's own
+      # JSON Schema validator, attached to the configuration profile by
+      # AppConfigStack, rejects a malformed version server-side as the last line.
+      #
+      # Why expiry blocks here and not in CI: a flag's removal date has nothing
+      # to do with whether an unrelated pull request is correct, but shipping
+      # another change on top of a flag that is already overdue is the moment
+      # somebody should have to deal with it. See docs/feature-flags.md.
+      - name: Validate feature flags manifest
+        env:
+          CONFIG_FILE: ${{ inputs.config-file }}
         run: |
           python3 - <<'EOF'
-          import json, sys
+          import datetime, json, os, sys
 
-          path = "${{ inputs.config-file }}"
+          path = os.environ["CONFIG_FILE"]
+          errors = []
+
           try:
-              with open(path) as f:
-                  data = json.load(f)
+              with open(path) as handle:
+                  manifest = json.load(handle)
           except FileNotFoundError:
-              print(f"ERROR: File not found: {path}", file=sys.stderr)
-              sys.exit(1)
+              sys.exit(f"ERROR: file not found: {path}")
           except json.JSONDecodeError as exc:
-              print(f"ERROR: Invalid JSON in {path}: {exc}", file=sys.stderr)
+              sys.exit(f"ERROR: invalid JSON in {path}: {exc}")
+
+          if not isinstance(manifest, dict):
+              sys.exit("ERROR: the manifest must be a JSON object")
+          if manifest.get("version") != "1":
+              sys.exit(f'ERROR: unsupported manifest version {manifest.get("version")!r}')
+
+          flags = manifest.get("flags")
+          if not isinstance(flags, dict):
+              sys.exit("ERROR: the manifest must have a `flags` object")
+
+          KINDS = ("release", "experiment", "operational")
+          TEMPORARY = ("release", "experiment")
+          today = datetime.date.today()
+
+          for key, flag in sorted(flags.items()):
+              where = f"flags.{key}"
+              if not isinstance(flag, dict):
+                  errors.append(f"{where}: a flag declaration must be an object")
+                  continue
+
+              for field in ("description", "kind", "owner", "createdOn", "enabled"):
+                  if field not in flag:
+                      errors.append(f"{where}.{field}: required")
+
+              kind = flag.get("kind")
+              if kind is not None and kind not in KINDS:
+                  errors.append(f"{where}.kind: {kind!r} is not one of {', '.join(KINDS)}")
+
+              rollout = flag.get("rolloutPercentage")
+              if rollout is not None and (
+                  not isinstance(rollout, int) or isinstance(rollout, bool) or not 0 <= rollout <= 100
+              ):
+                  errors.append(f"{where}.rolloutPercentage: {rollout!r} is not a whole 0-100 percentage")
+
+              expires = flag.get("expiresOn")
+              if kind in TEMPORARY and expires is None:
+                  errors.append(f"{where}.expiresOn: a {kind} flag needs a removal date")
+              if expires is not None:
+                  try:
+                      due = datetime.date.fromisoformat(expires)
+                  except (TypeError, ValueError):
+                      errors.append(f"{where}.expiresOn: {expires!r} is not an ISO calendar day")
+                  else:
+                      if due < today:
+                          errors.append(
+                              f"{where}.expiresOn: due for removal on {due} and still here. "
+                              "Remove the flag, or move the date deliberately."
+                          )
+
+          if errors:
+              print(f"{len(errors)} problem(s) in {path}:", file=sys.stderr)
+              for error in errors:
+                  print(f"  {error}", file=sys.stderr)
               sys.exit(1)
 
-          if not isinstance(data, dict):
-              print("ERROR: Feature flags file must be a JSON object ({})", file=sys.stderr)
-              sys.exit(1)
-
-          print(f"✓  Valid JSON — {len(data)} flag(s):")
-          for key, value in data.items():
-              print(f"   {key}: {json.dumps(value)}")
+          print(f"✓  {len(flags)} flag(s) in {path}:")
+          for key, flag in sorted(flags.items()):
+              state = "on" if flag.get("enabled") else "off"
+              rollout = flag.get("rolloutPercentage", 100)
+              print(f"   {key}: {state} at {rollout}% [{flag.get('kind')}] owner {flag.get('owner')}")
           EOF
 
       # ── AWS credentials ───────────────────────────────────────────────────────
