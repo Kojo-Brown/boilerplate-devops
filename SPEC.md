@@ -53,7 +53,7 @@
 - [x] Preview environment per PR with seeded data and teardown on close — everything slow or expensive is shared (`PreviewEnvironmentStack`: one ALB, one ECS cluster, one Postgres instance), because a preview is only worth having if opening a pull request is enough to get one, and a VPC and database each is fifteen minutes of provisioning per branch. `PreviewPrStack` adds a service, a target group, and a listener rule, and deliberately declares the service with **zero tasks**: CloudFormation creates the task definition and the service in one operation, and the seed cannot run until the task definition exists, so one task would start the application against a schemaless database inside that same operation and fail the first deploy. The workflow creates the database, deploys, seeds from the image under review, then scales up. Teardown has two mechanisms because the `closed` event silently fails to reach a runner whenever a run is cancelled or Actions is degraded: an hourly reaper Lambda deletes stacks whose pull request has closed and stacks past their lifetime, and never confuses *cannot reach GitHub* with *closed* — an environment deleted mid-review by a 500 cannot be given back. Both paths call `DeleteStack` rather than `cdk destroy`, since the branch is usually gone by then. Two Checkov findings were fixed rather than suppressed: the ALB drops invalid header fields, and the listener uses `RECOMMENDED_TLS` — `SslPolicy.RECOMMENDED` is still the 2016 policy and negotiates TLS 1.0 (PR #30)
 - [x] Database expand/contract migration playbook with a zero-downtime worked example — `DbMigrationStack` runs migrations from CodeDeploy's `BeforeAllowTraffic` hook, which means that at the moment a migration commits, the only code running is the *old* code; a migration that needs the new release to already be deployed fails at the start of the rollout, against the version being replaced. Nothing here said so and nothing checked for it. `docs/expand-contract-migrations.md` is the playbook (release timeline, lock table, what is reversible, how to check a `safe-after:` claim); `db/migrations/` splits `users.full_name` into `first_name`/`last_name` across five releases, with a sync trigger rather than application dual-write — which only holds while every writer runs a version that does it, and during a rollout it does not — a batched resumable backfill, and `NOT VALID` → `VALIDATE` → `SET NOT NULL` so no step takes a full scan under ACCESS EXCLUSIVE; `npm run audit:migrations` enforces the mechanical half on every PR across seventeen rules, reading inside dollar-quoted bodies because a `DROP TABLE` is no less destructive for being wrapped in PL/pgSQL (PR #31)
 - [x] Feature-flag lifecycle: creation, rollout, and a stale-flag cleanup job — a flag is a branch in production that someone promised to delete, and nothing held anyone to the promise: `AppConfigStack` shipped a flat map of booleans with no owner, no reason and no removal date. The manifest now declares all three plus a kind, and `npm run audit:flags` rejects a flag missing any of them, a date that is not a real calendar day (`2026-02-30` is rejected rather than rolled into March), a deadline over 90 days out or before its own creation, a field nothing reads (`rolloutPct: 50` deploys fine, reads as 100%, looks like 50% in review), and the two rollout states that read as one thing and mean another; the same schema is attached to the AppConfig profile as a validator, so a malformed version is rejected at `CreateHostedConfigurationVersion`. The "gradual rollout" already here was a *configuration* rollout — AppConfig shifts a new version out to polling clients and every process converges on the same value — so `rolloutPercentage` had no implementation at all; `lib/feature-flag-bucketing.ts` is it, stable per subject, decorrelated per flag, and nested so raising 10% to 25% keeps the original cohort. `FeatureFlagLifecycleStack` sweeps daily over what is *actually deployed* via the runtime Data API, classifies expired / readyToRemove / abandoned / expiring, and files the first three as GitHub issues; every reason is published as a metric every run including the zeroes, and an environment it cannot read is `ManifestUnreadable` rather than zero stale flags. It never deletes a flag and its role has no AppConfig write permission — deleting configuration ahead of the code that reads it resolves the key to `undefined`, which is falsy, which takes the branch the rollout moved away from. Expiry blocks a deploy rather than a build, since a gate that reddens every build on a date the pull request did not choose is one teams route around (PR #32)
-- [ ] Deployment metrics: DORA four keys collected and dashboarded
+- [x] Deployment metrics: DORA four keys collected and dashboarded — each key is a ratio or a duration over two events, so the arithmetic is trivial and every wrong pairing still produces a believable number, which is why a wrong DORA dashboard survives for years. Lead time is measured from the *first commit on the branch*, read from the pull request: under the squash-merge policy this repo's own ruleset requires, the deployed commit is authored at merge time, so measuring from it reports deploy-pipeline duration — minutes, elite against any threshold, regardless of how long the change sat in review; the fallback is still published but under `Source=headCommit` in its own colour, so a team measuring the wrong thing can see it. Change failure rate excludes deployments younger than the attribution window from *both* sides, because a deploy from four minutes ago is already in the denominator while the incident it is about to cause has not happened — and publishes no rate at all when nothing is ripe, since zero over zero renders identically to a clean month. Only incidents traceable to a deployment count, otherwise the rate rises when the deploy cadence *falls*; the flag lives on the deployment, so one bad deploy tripping three alarms is one change failure. A flapping alarm is one incident, not six failures each recovering in a minute. DynamoDB rather than metrics alone because attribution is retroactive and a published datapoint cannot be revisited; alarms are mapped to services explicitly because a name-prefix rule reads `production-alb-5xx-elb` as a service called "alb", which matches no deployment and reads as zero failures forever. Nothing gates a deploy; `LeadTimeUnmeasurable` and its alarm cover the real failure mode, a score that quietly stopped being a measurement (PR #33)
 
 Item 1 complete as of PR #27 (2026-08-08). All four checks green: the CDK job
 (typecheck, identifier scan, synth of 39 stacks, 819 tests), actionlint,
@@ -115,6 +115,44 @@ independently of the traffic floor. The SLO is measured on ALB 5xx and request
 count only — an objective on latency, or on an application-level definition of
 "good", would need a second metric source. `minimumRequestsPerWindow` is the
 setting most likely to be wrong for a given environment's traffic.
+
+Item 7 complete as of PR #33 (2026-08-19). All five checks green: the CDK job
+(typecheck, identifier scan, three audits, synth of 40 stacks, 1307 tests),
+actionlint, Checkov, GitGuardian, and the short-lived-branch guardrail.
+
+`DoraMetricsStack` is a *companion* to the deployment stacks rather than an
+alternative to any of them — it observes whichever one you picked. It is a
+single stack, not one per environment, deliberately: the four keys are a
+comparison, and staging and production on the same axes is how "we deploy to
+staging twenty times a day and to production twice a month" becomes visible.
+
+Checkov gained zero new findings and `.checkov.baseline` was not touched. The
+one new finding raised — `CKV_AWS_27` on the recorder's dead letter queue — was
+fixed rather than suppressed, using the `alias/aws/sqs` KMS alias instead of
+SSE-SQS: identical encryption at rest, no key to rotate, and it satisfies the
+check honestly. Both Lambdas carry `Metadata.checkov.skip` for the genuinely
+non-applicable checks (VPC, env-var CMK, and DLQ on the aggregator only), so the
+reasoning travels with the resource.
+
+Known gaps carried forward: **nothing here has been deployed to AWS** — the
+verification is synth, unit tests and static analysis, so the handlers'
+behaviour against live EventBridge deliveries and real alarm transitions is
+unproven. The pipeline is not emitting events yet either;
+`workflow-templates/emit-dora-deployment.yml` ships as a template and wiring it
+into a deploy job plus granting `events:PutEvents` is a consumer step, so until
+then the dashboard is correctly empty rather than broken. One artefact is
+disclosed rather than fixed: merging a flapping episode is retroactive, so the
+close that gets undone has already published a short `RecoveryTimeSeconds`
+datapoint that CloudWatch cannot retract, pulling p50 recovery down slightly —
+incident counts and change failure rate are unaffected, and withholding every
+recovery time for the flap window would delay the honest majority to correct the
+rare exception. `RemovalPolicy.RETAIN` on the table means a redeploy after `cdk
+destroy` fails on the table name until the retained table is deleted or
+imported; that is intentional, since the attribution state is the only record of
+how the delivery system performed and the events that produced it are long gone.
+Author dates understate lead time for a branch rebased with `--reset-author`;
+no better signal exists in the git object graph.
+
 
 ## Phase 8 — Kubernetes Track
 - [ ] EKS cluster via CDK with managed node groups and IRSA
