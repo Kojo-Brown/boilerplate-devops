@@ -1,0 +1,199 @@
+name: Emit DORA deployment event
+
+# Call this once per deployment, after the deploy has finished, from the job
+# that did the deploying.
+#
+# It exists because AWS does not know which commit is running. An ECS
+# "Deployment State Change" event carries a task definition revision; a
+# CodeDeploy event carries a deployment ID. Neither carries a commit, and three
+# of the four DORA keys are about the commit — so the event has to come from the
+# pipeline, which is the only place that knows.
+#
+# Usage:
+#
+#   deploy:
+#     uses: ./.github/workflows/deploy-ecs.yml
+#     # ...
+#
+#   dora:
+#     needs: [deploy]
+#     if: always() && needs.deploy.result != 'cancelled'
+#     uses: YOUR_ORG/YOUR_REPO/.github/workflows/emit-dora-deployment.yml@main
+#     with:
+#       environment: production
+#       service: api
+#       outcome: ${{ needs.deploy.result == 'success' && 'succeeded' || 'failed' }}
+#     secrets:
+#       AWS_ROLE_ARN: ${{ secrets.DORA_EMITTER_ROLE_ARN }}
+#
+# `always()` matters: a deployment that failed is a datapoint, and skipping it
+# would leave change failure rate computed over successes only.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: Environment that was deployed to, e.g. production.
+        required: true
+        type: string
+      service:
+        description: Service that was deployed, e.g. api.
+        required: true
+        type: string
+      outcome:
+        description: succeeded | failed — whether the deployment reached production.
+        required: true
+        type: string
+      commit-sha:
+        description: >-
+          Commit that was deployed. Defaults to the SHA this workflow ran
+          against, which is what you want unless you are deploying a different
+          ref than you built.
+        type: string
+        default: ""
+      pull-request-number:
+        description: >-
+          Pull request the change came from. Strongly recommended, and resolved
+          automatically from the merge commit when omitted — without it, lead
+          time under a squash-merge policy measures the deploy pipeline rather
+          than the change. See docs/dora-metrics.md.
+        type: string
+        default: ""
+      version:
+        description: Optional release identifier recorded alongside the deployment.
+        type: string
+        default: ""
+      event-bus-name:
+        description: EventBridge bus the event is put on.
+        type: string
+        default: default
+      aws-region:
+        type: string
+        default: us-east-1
+    secrets:
+      AWS_ROLE_ARN:
+        description: Role with events:PutEvents on the target bus.
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  emit:
+    name: Emit deployment event
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Validate outcome
+        env:
+          OUTCOME: ${{ inputs.outcome }}
+        run: |
+          set -euo pipefail
+          if [ "$OUTCOME" != "succeeded" ] && [ "$OUTCOME" != "failed" ]; then
+            echo "outcome must be 'succeeded' or 'failed', got '$OUTCOME'" >&2
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # The pull request lookup below reads the merge commit message, which
+          # is not in a shallow clone of depth 1 unless it is HEAD. It usually
+          # is, but a deploy of an older ref is exactly when this matters.
+          fetch-depth: 2
+
+      # Resolving the pull request here rather than in the recorder keeps the
+      # Lambda's GitHub permissions to reading commits. GitHub's squash-merge
+      # subject line is "…(#123)", which is the only place the number survives
+      # onto the default branch.
+      - name: Resolve pull request number
+        id: pr
+        env:
+          GIVEN: ${{ inputs.pull-request-number }}
+          EVENT_PR: ${{ github.event.pull_request.number }}
+          SHA: ${{ inputs.commit-sha || github.sha }}
+        run: |
+          set -euo pipefail
+          number="$GIVEN"
+          if [ -z "$number" ]; then
+            number="$EVENT_PR"
+          fi
+          if [ -z "$number" ]; then
+            subject="$(git log -1 --format=%s "$SHA" 2>/dev/null || echo '')"
+            number="$(printf '%s' "$subject" | sed -n 's/.*(#\([0-9][0-9]*\))[[:space:]]*$/\1/p')"
+          fi
+          if [ -z "$number" ]; then
+            echo "::warning::No pull request number resolved. Lead time will be measured from" \
+              "the deployed commit alone, which under squash merge is the merge time — see" \
+              "docs/dora-metrics.md."
+          fi
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      # `deployedAt` is stamped here rather than left to the recorder, so a
+      # retry or a dead-letter replay records when the deployment happened
+      # rather than when the event was finally processed. `deploymentId` is the
+      # idempotency key: a re-run of this job for the same run and attempt is
+      # discarded instead of counted as a second deployment.
+      - name: Put deployment event
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          SERVICE: ${{ inputs.service }}
+          OUTCOME: ${{ inputs.outcome }}
+          COMMIT_SHA: ${{ inputs.commit-sha || github.sha }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          VERSION: ${{ inputs.version }}
+          BUS_NAME: ${{ inputs.event-bus-name }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+
+          detail="$(jq -nc \
+            --arg environment "$ENVIRONMENT" \
+            --arg service "$SERVICE" \
+            --arg outcome "$OUTCOME" \
+            --arg commitSha "$COMMIT_SHA" \
+            --arg deploymentId "gha-${RUN_ID}-${RUN_ATTEMPT}" \
+            --arg deployedAt "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" \
+            --arg pr "$PR_NUMBER" \
+            --arg version "$VERSION" \
+            '{
+              environment: $environment,
+              service: $service,
+              outcome: $outcome,
+              commitSha: $commitSha,
+              deploymentId: $deploymentId,
+              deployedAt: $deployedAt
+            }
+            + (if $pr == "" then {} else {pullRequestNumber: ($pr | tonumber)} end)
+            + (if $version == "" then {} else {version: $version} end)')"
+
+          entry="$(jq -nc \
+            --arg bus "$BUS_NAME" \
+            --arg detail "$detail" \
+            '[{
+              Source: "dora.deployment",
+              DetailType: "Deployment",
+              EventBusName: $bus,
+              Detail: $detail
+            }]')"
+
+          response="$(aws events put-events --entries "$entry")"
+          echo "$response"
+
+          # PutEvents returns HTTP 200 even when every entry was rejected, so
+          # the response body is the only place a failure shows up. Without this
+          # check a misconfigured bus produces a green deploy and a dashboard
+          # that silently stops updating.
+          failed="$(printf '%s' "$response" | jq -r '.FailedEntryCount')"
+          if [ "$failed" != "0" ]; then
+            echo "EventBridge rejected the deployment event" >&2
+            exit 1
+          fi

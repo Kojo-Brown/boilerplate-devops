@@ -26,6 +26,7 @@ import { WafStack } from '../lib/waf-stack';
 import { StaticSiteStack } from '../lib/static-site-stack';
 import { PreviewEnvironmentStack } from '../lib/preview-environment-stack';
 import { PreviewPrStack } from '../lib/preview-pr-stack';
+import { DoraMetricsStack } from '../lib/dora-metrics-stack';
 
 const app = new cdk.App();
 
@@ -1284,5 +1285,53 @@ new PreviewPrStack(app, `PreviewPrStack-${previewPrNumber}`, {
     region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
   },
   description: `Preview environment for pull request #${previewPrNumber}`,
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+// ── DORA Four Keys ────────────────────────────────────────────────────────────
+// Deployment frequency, lead time for changes, change failure rate, and failed
+// deployment recovery time — collected from two event streams and dashboarded.
+//
+// One stack, not one per environment: the four keys are a comparison. Staging
+// and production on the same axes is how "we deploy to staging twenty times a
+// day and to production twice a month" becomes visible, and that gap is usually
+// the finding.
+//
+// Wiring, in order:
+//
+//   1. Deploy this stack. It creates the DynamoDB table, both handlers, the
+//      EventBridge rules, and the dashboard.
+//   2. Grant the deploy pipeline `events:PutEvents` on the default bus (add it
+//      to the GitHubOidcStack role, or a dedicated one) and call
+//      `workflow-templates/emit-dora-deployment.yml` from every deploy job.
+//   3. Put a GitHub token with `contents: read` in Secrets Manager as
+//      `{"token": "..."}` and set DORA_GITHUB_TOKEN_SECRET_ARN. Without it the
+//      other three keys still work and lead time reports as unmeasurable.
+//
+// The alarm names below must match CloudWatchAlarmsStack's, which builds them
+// as `{envName}-{metricId}`. They are declared with their service rather than
+// parsed, because "production-alb-5xx-elb" parses to a service called "alb"
+// that no deployment ever writes — see docs/dora-metrics.md.
+
+new DoraMetricsStack(app, 'DoraMetricsStack', {
+  services: [
+    { environment: 'staging', service: 'api' },
+    { environment: 'production', service: 'api' },
+  ],
+  incidentAlarms: [
+    { alarmName: 'staging-alb-5xx-elb', environment: 'staging', service: 'api' },
+    { alarmName: 'staging-alb-5xx-target', environment: 'staging', service: 'api' },
+    { alarmName: 'staging-ecs-cpu-high', environment: 'staging', service: 'api' },
+    { alarmName: 'production-alb-5xx-elb', environment: 'production', service: 'api' },
+    { alarmName: 'production-alb-5xx-target', environment: 'production', service: 'api' },
+    { alarmName: 'production-ecs-cpu-high', environment: 'production', service: 'api' },
+  ],
+  repository: 'YOUR_ORG/YOUR_REPO',
+  githubTokenSecretArn: process.env.DORA_GITHUB_TOKEN_SECRET_ARN,
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'DORA four keys — deployment and incident collection, rates, and dashboard',
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
