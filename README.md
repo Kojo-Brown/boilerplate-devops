@@ -20,6 +20,7 @@ Reusable CI/CD workflows and AWS infrastructure templates.
 | Per-PR preview environment (deploy + teardown) | `.github/workflows/preview-environment.yml` |
 | Expand/contract migration playbook + worked example | `db/migrations/` |
 | Feature flag manifest + stale-flag sweep | `aws/appconfig/`, `aws/cdk/lib/feature-flag-lifecycle-stack.ts` |
+| DORA four keys — collection + dashboard | `aws/cdk/lib/dora-metrics-stack.ts`, `workflow-templates/emit-dora-deployment.yml` |
 
 ## Usage
 
@@ -208,6 +209,50 @@ moving away from.
 
 See [docs/feature-flags.md](./docs/feature-flags.md) for the manifest reference,
 the three flag kinds, and why expiry blocks a deploy rather than a build.
+
+## DORA metrics
+
+`DoraMetricsStack` collects the four keys — deployment frequency, lead time for
+changes, change failure rate, and failed deployment recovery time — from two
+event streams: a deployment event the pipeline emits
+(`workflow-templates/emit-dora-deployment.yml`), and CloudWatch alarm state
+changes for a declared set of alarms. Deployments and incidents land in DynamoDB
+because attribution is retroactive: a failure at 14:40 has to find and mark the
+deployment from 14:05, and a published metric datapoint cannot be revisited.
+
+Each of the four keys is a ratio or a duration over two events, so the arithmetic
+is trivial and every wrong pairing still produces a believable number. The four
+this implementation is built around:
+
+- **Lead time is measured from the first commit on the branch**, read from the
+  pull request — not from the deployed commit. Under a squash-merge policy (which
+  this repo's own ruleset requires) the deployed commit is authored at merge
+  time, so measuring from it turns lead time into deploy-pipeline duration:
+  single-digit minutes, elite by any threshold. When no pull request number is
+  available the fallback is still published, but under a separate `Source`
+  dimension and its own colour on the graph, so a team measuring the wrong thing
+  can see that it is.
+- **Change failure rate excludes deployments too recent to have failed yet.** A
+  deploy from four minutes ago is already in the denominator while the incident
+  it is about to cause has not happened, so the naive rate improves the instant
+  you ship. Excluded deployments are graphed beside the rate, and when nothing in
+  the window is ripe no rate is published at all — zero over zero is undefined,
+  not zero percent.
+- **Only incidents traceable to a deployment count as change failures.** Counting
+  all incidents makes the rate rise when the deploy cadence *falls*. The
+  attribution flag lives on the deployment, so one bad deploy that trips three
+  alarms is one change failure.
+- **A flapping alarm is one incident.** Six oscillations in five minutes would
+  otherwise report six failures each recovering in a minute — pushing two of the
+  four keys wrong in opposite directions at once.
+
+Nothing here gates a deployment: a measurement that can block the thing it
+measures stops being one. `LeadTimeUnmeasurable` and an alarm on it cover the
+real failure mode, which is not a bad score but a score that quietly stopped
+being a measurement.
+
+See [docs/dora-metrics.md](./docs/dora-metrics.md) for the wiring, the event
+shape, the full metric list, and the performance bands.
 
 ## OIDC Setup (no long-lived AWS keys)
 See `aws/cloudformation/github-oidc-role.yml` for the IAM role template.
