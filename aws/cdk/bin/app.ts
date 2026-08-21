@@ -2,6 +2,7 @@
 import 'source-map-support/register';
 import * as cdk from 'aws-cdk-lib';
 import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
+import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import { VpcStack } from '../lib/vpc-stack';
 import { EcsStack } from '../lib/ecs-stack';
 import { RdsStack } from '../lib/rds-stack';
@@ -27,6 +28,7 @@ import { StaticSiteStack } from '../lib/static-site-stack';
 import { PreviewEnvironmentStack } from '../lib/preview-environment-stack';
 import { PreviewPrStack } from '../lib/preview-pr-stack';
 import { DoraMetricsStack } from '../lib/dora-metrics-stack';
+import { EksStack } from '../lib/eks-stack';
 
 const app = new cdk.App();
 
@@ -234,6 +236,8 @@ const vpcStackStaging = new VpcStack(app, 'VpcStack-Staging', {
   vpcCidr: '10.1.0.0/16',
   maxAzs: 2,
   natGateways: 1,
+  // EksStack-Staging runs in this VPC; see the EKS section at the end of the file.
+  tagSubnetsForEks: true,
   env: {
     account: process.env.CDK_DEFAULT_ACCOUNT,
     region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
@@ -309,6 +313,8 @@ const vpcStackProduction = new VpcStack(app, 'VpcStack-Production', {
   vpcCidr: '10.0.0.0/16',
   maxAzs: 2,
   natGateways: 2,
+  // EksStack-Production runs in this VPC; see the EKS section at the end of the file.
+  tagSubnetsForEks: true,
   env: {
     account: process.env.CDK_DEFAULT_ACCOUNT,
     region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
@@ -1333,5 +1339,84 @@ new DoraMetricsStack(app, 'DoraMetricsStack', {
     region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
   },
   description: 'DORA four keys — deployment and incident collection, rates, and dashboard',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+// ── EKS (Kubernetes track) ────────────────────────────────────────────────────
+// Both clusters keep the API server endpoint private, so `kubectl` reaches them
+// from inside the VPC — a bastion, a VPN, or an SSM port-forward. To expose the
+// endpoint to an office or VPN range instead, pass the CIDRs:
+//
+//   cdk deploy --context stagingEksPublicAccessCidrs=203.0.113.0/24,198.51.100.7/32
+//   STAGING_EKS_PUBLIC_ACCESS_CIDRS=203.0.113.0/24 cdk deploy
+//
+// An open CIDR is rejected by the stack rather than silently deployed.
+//
+// Cluster administrators are granted through EKS access entries, so the roles
+// that operate the cluster are named here rather than edited into aws-auth by
+// hand after the fact:
+//
+//   cdk deploy --context productionEksAdminRoleArns=arn:aws:iam::<account>:role/PlatformAdmin
+const parseList = (value: string | undefined): string[] =>
+  (value ?? '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+
+const stagingEksPublicAccessCidrs = parseList(
+  (app.node.tryGetContext('stagingEksPublicAccessCidrs') as string | undefined) ??
+    process.env.STAGING_EKS_PUBLIC_ACCESS_CIDRS,
+);
+
+const productionEksPublicAccessCidrs = parseList(
+  (app.node.tryGetContext('productionEksPublicAccessCidrs') as string | undefined) ??
+    process.env.PRODUCTION_EKS_PUBLIC_ACCESS_CIDRS,
+);
+
+const stagingEksAdminRoleArns = parseList(
+  (app.node.tryGetContext('stagingEksAdminRoleArns') as string | undefined) ??
+    process.env.STAGING_EKS_ADMIN_ROLE_ARNS,
+);
+
+const productionEksAdminRoleArns = parseList(
+  (app.node.tryGetContext('productionEksAdminRoleArns') as string | undefined) ??
+    process.env.PRODUCTION_EKS_ADMIN_ROLE_ARNS,
+);
+
+new EksStack(app, 'EksStack-Staging', {
+  vpc: vpcStackStaging.vpc,
+  envName: 'staging',
+  publicApiAccessCidrs: stagingEksPublicAccessCidrs,
+  clusterAdminRoleArns: stagingEksAdminRoleArns,
+  systemNodeGroup: {
+    instanceTypes: [ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.LARGE)],
+    minSize: 2,
+    maxSize: 4,
+    diskSizeGiB: 30,
+  },
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Staging EKS cluster — managed node group + IRSA',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+new EksStack(app, 'EksStack-Production', {
+  vpc: vpcStackProduction.vpc,
+  envName: 'production',
+  publicApiAccessCidrs: productionEksPublicAccessCidrs,
+  clusterAdminRoleArns: productionEksAdminRoleArns,
+  systemNodeGroup: {
+    instanceTypes: [ec2.InstanceType.of(ec2.InstanceClass.M6I, ec2.InstanceSize.LARGE)],
+    minSize: 3,
+    maxSize: 9,
+    diskSizeGiB: 50,
+  },
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Production EKS cluster — managed node group + IRSA',
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });

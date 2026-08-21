@@ -225,4 +225,56 @@ describe('VpcStack', () => {
       });
     });
   });
+
+  describe('Kubernetes subnet discovery tags', () => {
+    /** Every subnet's tags, keyed by the subnet's `Name` tag. */
+    const subnetTags = (template: Template): Record<string, Record<string, string>> =>
+      Object.fromEntries(
+        resourceProps(template, 'AWS::EC2::Subnet').map((subnet) => {
+          const tags = Object.fromEntries(
+            ((subnet.Tags as { Key: string; Value: string }[]) ?? []).map((tag) => [
+              tag.Key,
+              tag.Value,
+            ]),
+          );
+          return [tags.Name, tags];
+        }),
+      );
+
+    it('adds no Kubernetes tags by default', () => {
+      const { template } = makeTemplate();
+
+      for (const tags of Object.values(subnetTags(template))) {
+        expect(Object.keys(tags).join(' ')).not.toContain('kubernetes.io');
+      }
+    });
+
+    it('marks public subnets for internet-facing load balancers', () => {
+      const { template } = makeTemplate({ tagSubnetsForEks: true });
+
+      const publicSubnets = Object.entries(subnetTags(template)).filter(([name]) =>
+        name.includes('PublicSubnet'),
+      );
+
+      expect(publicSubnets).toHaveLength(2);
+      for (const [, tags] of publicSubnets) {
+        expect(tags['kubernetes.io/role/elb']).toBe('1');
+        expect(tags['kubernetes.io/role/internal-elb']).toBeUndefined();
+      }
+    });
+
+    it('marks private subnets for internal load balancers', () => {
+      const { template } = makeTemplate({ tagSubnetsForEks: true });
+
+      const privateSubnets = Object.entries(subnetTags(template)).filter(([name]) =>
+        name.includes('PrivateSubnet'),
+      );
+
+      expect(privateSubnets).toHaveLength(2);
+      for (const [, tags] of privateSubnets) {
+        expect(tags['kubernetes.io/role/internal-elb']).toBe('1');
+        expect(tags['kubernetes.io/role/elb']).toBeUndefined();
+      }
+    });
+  });
 });
