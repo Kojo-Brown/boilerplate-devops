@@ -93,7 +93,7 @@ jobs:
       # few MB to over 60. Checkov reads the templates and nothing else, and the
       # glob keeps the nested stack templates, which it also scans.
       - name: Upload synthesised templates
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cdk-out
           path: aws/cdk/cdk.out/*.template.json
