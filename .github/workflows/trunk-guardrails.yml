@@ -102,7 +102,7 @@ jobs:
       # always report; on merge_group it reports having done nothing.
       - name: Checkout repository
         if: github.event_name == 'pull_request'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # The merge base is only computable with the full graph, and a
           # branch old enough to fail this check is old enough to sit outside
