@@ -21,6 +21,7 @@ Reusable CI/CD workflows and AWS infrastructure templates.
 | Expand/contract migration playbook + worked example | `db/migrations/` |
 | Feature flag manifest + stale-flag sweep | `aws/appconfig/`, `aws/cdk/lib/feature-flag-lifecycle-stack.ts` |
 | DORA four keys — collection + dashboard | `aws/cdk/lib/dora-metrics-stack.ts`, `workflow-templates/emit-dora-deployment.yml` |
+| EKS cluster — managed node groups + IRSA | `aws/cdk/lib/eks-stack.ts` |
 
 ## Usage
 
@@ -253,6 +254,31 @@ being a measurement.
 
 See [docs/dora-metrics.md](./docs/dora-metrics.md) for the wiring, the event
 shape, the full metric list, and the performance bands.
+
+## Kubernetes
+
+`EksStack` provisions a cluster with a private API server endpoint, one managed
+node group, the four EKS-managed add-ons, and the OIDC provider behind IRSA.
+
+The point of IRSA is what the node role is *not* allowed to do. Without it, an
+SDK call from a pod is signed with credentials the instance metadata service
+hands out — the node's role — so every pod on a node holds the union of every
+permission any pod there needs. So the node role carries the worker and ECR-read
+policies and nothing else: the VPC CNI's ENI permissions live on its own role,
+attached to the `aws-node` service account, and nodes require IMDSv2 at a hop
+limit of 1, which puts the metadata service out of reach of a container while
+leaving it reachable to the kubelet. A compromised pod that could simply ask for
+the node role would make the rest of it decoration.
+
+The endpoint is private by default, so `kubectl` works from inside the VPC and
+not from the open internet; `publicApiAccessCidrs` opens it to named ranges and
+refuses `0.0.0.0/0` at synth time. Cluster administrators are granted through
+EKS access entries declared in `bin/app.ts`, not by hand-editing `aws-auth`
+after the fact.
+
+See [docs/eks.md](./docs/eks.md) for the IRSA trust policy, the
+version/kubectl-layer pairing, the subnet tags the load-balancer controller
+needs, and what is deliberately left to later Phase 8 items.
 
 ## OIDC Setup (no long-lived AWS keys)
 See `aws/cloudformation/github-oidc-role.yml` for the IAM role template.

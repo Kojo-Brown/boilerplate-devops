@@ -15,6 +15,20 @@ export interface VpcStackProps extends cdk.StackProps {
   readonly flowLogRetentionDays?: logs.RetentionDays;
   /** Environment name used for resource naming and tagging */
   readonly envName?: string;
+  /**
+   * Tag the subnets for Kubernetes load-balancer discovery (default: false).
+   *
+   * The AWS Load Balancer Controller picks the subnets for an Ingress or a
+   * `Service type=LoadBalancer` by reading `kubernetes.io/role/elb` (public) and
+   * `kubernetes.io/role/internal-elb` (private). Without the tags it finds no
+   * eligible subnet and every load balancer stays pending — a failure that only
+   * shows up the first time an application asks for one, long after the cluster
+   * itself came up healthy.
+   *
+   * The tags live here rather than in {@link EksStack} because CloudFormation
+   * cannot tag a resource another stack owns.
+   */
+  readonly tagSubnetsForEks?: boolean;
 }
 
 /**
@@ -109,6 +123,16 @@ export class VpcStack extends cdk.Stack {
       service: ec2.GatewayVpcEndpointAwsService.DYNAMODB,
       subnets: [{ subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS }],
     });
+
+    // ── Kubernetes subnet discovery tags ──────────────────────────────────────
+    if (props.tagSubnetsForEks) {
+      for (const subnet of this.vpc.publicSubnets) {
+        cdk.Tags.of(subnet).add('kubernetes.io/role/elb', '1');
+      }
+      for (const subnet of this.vpc.privateSubnets) {
+        cdk.Tags.of(subnet).add('kubernetes.io/role/internal-elb', '1');
+      }
+    }
 
     // ── Tags ──────────────────────────────────────────────────────────────────
     cdk.Tags.of(this).add('Environment', envName);

@@ -26,7 +26,8 @@
     "typescript": "^5.5.3"
   },
   "dependencies": {
-    "aws-cdk-lib": "^2.200.0",
+    "@aws-cdk/lambda-layer-kubectl-v33": "^2.2.2",
+    "aws-cdk-lib": "^2.224.0",
     "constructs": "^10.3.0"
   },
   "jest": {
