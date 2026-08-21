@@ -155,13 +155,42 @@ no better signal exists in the git object graph.
 
 
 ## Phase 8 — Kubernetes Track
-- [ ] EKS cluster via CDK with managed node groups and IRSA
+- [x] EKS cluster via CDK with managed node groups and IRSA — private API endpoint, one managed node group, four EKS-managed add-ons, and an OIDC provider; the node role is thin because the CNI holds its ENI permissions through IRSA instead (PR #34)
 - [ ] Helm chart with values per environment and a schema-validated `values.yaml`
 - [ ] Horizontal Pod Autoscaler + Cluster Autoscaler with load-tested thresholds
 - [ ] Pod security: non-root, read-only rootfs, dropped capabilities, seccomp
 - [ ] NetworkPolicy default-deny with explicit allowlists
 - [ ] GitOps with ArgoCD: app-of-apps, sync waves, and drift detection
 - [ ] Ingress with cert-manager, external-dns, and automatic TLS renewal
+
+Item 1 complete as of PR #34 (2026-08-21). What made this one item rather than
+two is that a managed node group without IRSA is a security posture, not an
+unfinished feature: an SDK call from a pod is signed with whatever the instance
+metadata service returns, which is the node's role, so every pod on a node holds
+the union of every permission any pod there needs. So the node role carries the
+worker and ECR-read policies only, the VPC CNI's ENI permissions moved to a role
+bound to `kube-system/aws-node`, and nodes require IMDSv2 at a hop limit of 1 —
+without that last one a compromised pod can ask for the node role and ignore
+IRSA entirely. Every trust policy conditions on both `:sub` and `:aud`.
+
+Checkov needed a deliberate decision. The CDK EKS module emits its own
+deployment-time handlers, and five checks fire on resources no construct prop
+reaches: 25 new findings per environment. `placeClusterHandlerInVpc` fixed the
+VPC finding for real; the rest are suppressed per resource with written reasons
+in `lib/checkov-suppressions.ts`, through an aspect scoped to CDK-internal
+construct paths and pinned by `test/checkov-suppressions.test.ts` so the escape
+hatch cannot spread to resources this repository writes. `.checkov.baseline` was
+deliberately not touched — it records what predated the gate, and new
+infrastructure entering it is the regression the gate exists to catch.
+
+Known gaps carried into item 2: nothing is deployed, so every gate here is
+synth-and-scan — CI proves the templates are well-formed and clean, not that a
+cluster comes up. Pod Security Standards are not enforced cluster-wide (item 4),
+there is no ingress controller or `AWSLoadBalancerControllerIAMPolicy` yet
+(item 7 — the subnet tags it needs are in place behind `tagSubnetsForEks`), and
+the cluster has no application delivery path at all until items 2 and 6. Add-on
+versions are unpinned by choice; a CI artifact narrowed to `*.template.json`
+keeps the two staged Lambda layers out of the upload.
 
 ## Phase 9 — Supply-Chain Security
 - [ ] SBOM generation (CycloneDX) attached to every release artifact
