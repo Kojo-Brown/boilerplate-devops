@@ -1,0 +1,23 @@
+{{- if .Values.podDisruptionBudget.enabled -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "app.fullname" . }}
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+spec:
+  {{- /*
+    A PDB constrains *voluntary* disruptions only — `kubectl drain` during a
+    node upgrade, a Cluster Autoscaler scale-down, a node group rotation. It
+    does not protect against a node failing, and it cannot: nothing gets to veto
+    hardware.
+
+    `minAvailable` equal to `replicaCount` blocks every drain permanently and
+    stalls cluster upgrades, which is why `npm run audit:helm` requires it to
+    stay below the replica count of the environment that sets it.
+  */}}
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable | default 1 }}
+  selector:
+    matchLabels:
+      {{- include "app.selectorLabels" . | nindent 6 }}
+{{- end }}

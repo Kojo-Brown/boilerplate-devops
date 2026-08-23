@@ -1,0 +1,315 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/Kojo-Brown/boilerplate-devops/k8s/charts/app/values.schema.json",
+  "title": "app chart values",
+  "description": "Helm validates the merged values against this schema on lint, template, install and upgrade. Every object closes with additionalProperties:false or a typed additionalProperties, so an unknown key is a failed release rather than a setting that silently did nothing.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "environment",
+    "replicaCount",
+    "image",
+    "serviceAccount",
+    "containerPort",
+    "service",
+    "resources",
+    "probes",
+    "podDisruptionBudget",
+    "strategy",
+    "terminationGracePeriodSeconds"
+  ],
+  "properties": {
+    "environment": {
+      "description": "Which environment this release is. Mirrors the EksStack instances in aws/cdk/bin/app.ts; adding a third means adding it here, adding values-<env>.yaml, and adding it to ENVIRONMENTS in tools/audit-helm-values.ts.",
+      "type": "string",
+      "enum": ["staging", "production"]
+    },
+    "nameOverride": {
+      "description": "Replaces the chart-name half of generated resource names.",
+      "type": "string",
+      "maxLength": 63,
+      "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$"
+    },
+    "fullnameOverride": {
+      "description": "Replaces generated resource names entirely.",
+      "type": "string",
+      "maxLength": 63,
+      "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$"
+    },
+    "replicaCount": {
+      "description": "Desired pods. One replica means every voluntary disruption is an outage, so the floor is 1 and every environment that matters sets more.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "tag", "pullPolicy"],
+      "properties": {
+        "repository": {
+          "description": "Registry path without a tag.",
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[a-z0-9]([a-z0-9._:/-]*[a-z0-9])?$"
+        },
+        "tag": {
+          "description": "Immutable image tag. Moving tags are rejected: with one, the running image depends on when a pod last restarted, so two pods in a ReplicaSet can serve different code and a rollback has no fixed target to return to.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9_][A-Za-z0-9._-]*$",
+          "not": {
+            "enum": ["latest", "main", "master", "stable", "edge", "dev", "prod"]
+          }
+        },
+        "pullPolicy": {
+          "type": "string",
+          "enum": ["Always", "IfNotPresent", "Never"]
+        }
+      }
+    },
+    "imagePullSecrets": {
+      "description": "Names of image pull secrets. Empty for ECR, which is authorised through the node role.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["create", "annotations"],
+      "properties": {
+        "create": { "type": "boolean" },
+        "name": {
+          "description": "Defaults to the release fullname when empty. Must be set when create is false.",
+          "type": "string",
+          "maxLength": 253,
+          "pattern": "^([a-z0-9]([-a-z0-9.]*[a-z0-9])?)?$"
+        },
+        "annotations": {
+          "description": "eks.amazonaws.com/role-arn goes here, bound to a role whose trust policy names this namespace and service account.",
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "automountServiceAccountToken": { "type": "boolean" }
+      }
+    },
+    "containerPort": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "port"],
+      "properties": {
+        "type": {
+          "description": "ClusterIP unless something outside the cluster reaches this Service directly. Ingress is a later Phase 8 item and terminates at a ClusterIP Service.",
+          "type": "string",
+          "enum": ["ClusterIP", "NodePort", "LoadBalancer"]
+        },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "annotations": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    },
+    "resources": {
+      "description": "Required, not optional. No requests means BestEffort scheduling and first eviction under node pressure; no memory limit means one leaking container can evict every other pod on the node.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requests", "limits"],
+      "properties": {
+        "requests": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cpu", "memory"],
+          "properties": {
+            "cpu": { "$ref": "#/definitions/cpuQuantity" },
+            "memory": { "$ref": "#/definitions/memoryQuantity" }
+          }
+        },
+        "limits": {
+          "description": "A memory limit is required and a CPU limit is not: memory is incompressible, while a CPU limit adds CFS throttling latency to a service that is not otherwise short of CPU.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["memory"],
+          "properties": {
+            "cpu": { "$ref": "#/definitions/cpuQuantity" },
+            "memory": { "$ref": "#/definitions/memoryQuantity" }
+          }
+        }
+      }
+    },
+    "probes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["liveness", "readiness"],
+      "properties": {
+        "liveness": { "$ref": "#/definitions/probe" },
+        "readiness": { "$ref": "#/definitions/probe" },
+        "startup": { "$ref": "#/definitions/probe" }
+      }
+    },
+    "config": {
+      "description": "Rendered into a ConfigMap and injected with envFrom. Values must be strings: ConfigMap data is string-valued, so an unquoted 8080 is rejected by the API server at apply time — here it is rejected at lint time instead.",
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "propertyNames": { "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$" }
+    },
+    "extraEnv": {
+      "description": "Environment variables that are not plain configuration — a downward-API field, or one that must be ordered after envFrom.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name"],
+        "oneOf": [{ "required": ["value"] }, { "required": ["valueFrom"] }],
+        "properties": {
+          "name": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$" },
+          "value": { "type": "string" },
+          "valueFrom": {
+            "type": "object",
+            "additionalProperties": false,
+            "minProperties": 1,
+            "maxProperties": 1,
+            "properties": {
+              "fieldRef": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["fieldPath"],
+                "properties": {
+                  "apiVersion": { "type": "string" },
+                  "fieldPath": { "type": "string", "minLength": 1 }
+                }
+              },
+              "resourceFieldRef": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["resource"],
+                "properties": {
+                  "containerName": { "type": "string" },
+                  "resource": { "type": "string", "minLength": 1 },
+                  "divisor": { "type": "string" }
+                }
+              },
+              "configMapKeyRef": { "$ref": "#/definitions/keyRef" },
+              "secretKeyRef": { "$ref": "#/definitions/keyRef" }
+            }
+          }
+        }
+      }
+    },
+    "podAnnotations": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "podLabels": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "podDisruptionBudget": {
+      "description": "What makes a node drain wait for a replacement pod instead of taking the last healthy replica.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "minAvailable": {
+          "description": "A count, not a percentage, so its meaning does not change when replicaCount does. Must stay below replicaCount — a budget equal to the replica count blocks every drain forever, which stops cluster upgrades rather than protecting the service. Checked against replicaCount by npm run audit:helm, which the schema cannot do because JSON Schema cannot compare two properties.",
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "strategy": {
+      "description": "RollingUpdate parameters. maxUnavailable 0 keeps capacity flat through a rollout, at the cost of one extra pod for its duration.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["maxSurge", "maxUnavailable"],
+      "properties": {
+        "maxSurge": { "$ref": "#/definitions/countOrPercent" },
+        "maxUnavailable": { "$ref": "#/definitions/countOrPercent" }
+      }
+    },
+    "terminationGracePeriodSeconds": {
+      "description": "Must exceed the longest in-flight request, or every deploy truncates responses.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 3600
+    },
+    "nodeSelector": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "tolerations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "key": { "type": "string" },
+          "operator": { "type": "string", "enum": ["Exists", "Equal"] },
+          "value": { "type": "string" },
+          "effect": {
+            "type": "string",
+            "enum": ["NoSchedule", "PreferNoSchedule", "NoExecute"]
+          },
+          "tolerationSeconds": { "type": "integer", "minimum": 0 }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "cpuQuantity": {
+      "description": "Kubernetes CPU quantity: cores (1, 1.5) or millicores (500m).",
+      "type": "string",
+      "pattern": "^([0-9]+m|[0-9]+(\\.[0-9]+)?)$"
+    },
+    "memoryQuantity": {
+      "description": "Kubernetes memory quantity. Binary suffixes (Mi, Gi) are what the API server reports back, so using them keeps values and observed limits comparable.",
+      "type": "string",
+      "pattern": "^[0-9]+(\\.[0-9]+)?(Ki|Mi|Gi|Ti|Pi|Ei|k|M|G|T|P|E)?$"
+    },
+    "countOrPercent": {
+      "description": "An absolute pod count or a percentage string, which is what the Deployment API accepts.",
+      "oneOf": [
+        { "type": "integer", "minimum": 0 },
+        { "type": "string", "pattern": "^[0-9]+%$" }
+      ]
+    },
+    "keyRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "key"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "key": { "type": "string", "minLength": 1 },
+        "optional": { "type": "boolean" }
+      }
+    },
+    "probe": {
+      "description": "An HTTP GET probe against the container's named http port.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "periodSeconds", "failureThreshold"],
+      "properties": {
+        "path": { "type": "string", "pattern": "^/" },
+        "initialDelaySeconds": { "type": "integer", "minimum": 0 },
+        "periodSeconds": { "type": "integer", "minimum": 1 },
+        "timeoutSeconds": { "type": "integer", "minimum": 1 },
+        "failureThreshold": { "type": "integer", "minimum": 1 },
+        "successThreshold": { "type": "integer", "minimum": 1 }
+      }
+    }
+  }
+}

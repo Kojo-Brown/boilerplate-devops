@@ -79,6 +79,15 @@ jobs:
       - name: Audit feature flag manifests
         run: npm run audit:flags
 
+      # Helm enforces `values.schema.json` on the values file it is handed. It
+      # has no opinion about an environment that has no values file, a schema
+      # whose objects have drifted open and so catch nothing, or a
+      # `minAvailable` that exceeds its own `replicaCount`. This runs here,
+      # rather than in the Helm job, because it needs no Helm binary — it
+      # validates with ajv, which is already a dependency.
+      - name: Audit Helm chart values
+        run: npm run audit:helm
+
       # Synth runs before the suite deliberately. It is the build step and takes
       # seconds, while the suite takes minutes; ordering it first means a test
       # failure never hides whether the app still synthesises.
@@ -136,6 +145,35 @@ jobs:
       # checks.
       - name: Lint helper scripts
         run: shellcheck .github/scripts/*.sh
+
+  # The name is the required-status-check context in
+  # `.github/rulesets/trunk-based-main.json`; renaming the job renames the
+  # check, and `npm run audit:trunk` fails when the two drift apart.
+  helm:
+    name: Helm chart
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # The cluster version EksStack creates — see docs/eks.md §4. Rendering
+      # against an explicit version rather than whatever the Helm build defaults
+      # to means the manifests CI checks are the manifests the cluster gets.
+      KUBE_VERSION: "1.33.0"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # The chart's schema is enforced at deploy time by Helm's own validator,
+      # which is a different implementation of JSON Schema from the ajv one the
+      # CDK job uses. Both run, because a schema checked only against ajv has
+      # not been checked against the thing that decides whether an upgrade
+      # succeeds.
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.19.0
+
+      - name: Lint and render every chart, and reject the schema fixtures
+        run: .github/scripts/lint-helm-chart.sh
 
   checkov:
     name: Checkov

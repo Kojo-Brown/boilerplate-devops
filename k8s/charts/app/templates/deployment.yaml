@@ -1,0 +1,87 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "app.fullname" . }}
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: {{ .Values.strategy.maxSurge }}
+      maxUnavailable: {{ .Values.strategy.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "app.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        {{- /*
+          Comments in a template render into the manifest, so everything
+          explanatory in this chart is a template comment: what reaches the API
+          server — and what shows up in a `helm diff` — is the manifest alone.
+
+          Without this checksum, editing a value in `config` updates the
+          ConfigMap and changes nothing else: the pod template is
+          byte-identical, so the Deployment does not roll and the running pods
+          keep the old configuration until something unrelated restarts them.
+          Hashing the rendered ConfigMap into the pod template makes a
+          configuration change a rollout, and a bad one a `kubectl rollout undo`.
+        */}}
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "app.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "app.serviceAccountName" . }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.containerPort }}
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: {{ include "app.configMapName" . }}
+          {{- with .Values.extraEnv }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.probes.startup }}
+          {{- /*
+            While a startup probe is failing the kubelet suppresses the liveness
+            probe, so a slow boot cannot be killed by liveness before it has
+            finished starting. The alternative — a large `initialDelaySeconds`
+            on liveness — delays the reaction to every wedged container for the
+            lifetime of the deployment, not just the first minute of it.
+          */}}
+          startupProbe:
+            {{- include "app.httpProbe" . | nindent 12 }}
+          {{- end }}
+          livenessProbe:
+            {{- include "app.httpProbe" .Values.probes.liveness | nindent 12 }}
+          readinessProbe:
+            {{- include "app.httpProbe" .Values.probes.readiness | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

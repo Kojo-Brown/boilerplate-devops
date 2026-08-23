@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "app.configMapName" . }}
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+data:
+  {{- /*
+    Set from the values file rather than from `.Release.Namespace` so that the
+    value a pod reports matches the values file it was deployed from, even if
+    someone installs the staging values into a namespace called production.
+  */}}
+  APP_ENVIRONMENT: {{ .Values.environment | quote }}
+  {{- range $key, $value := .Values.config }}
+  {{ $key }}: {{ $value | quote }}
+  {{- end }}

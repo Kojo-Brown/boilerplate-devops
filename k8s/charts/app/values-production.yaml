@@ -1,0 +1,56 @@
+# Production overrides.
+#
+#   helm upgrade --install app-production k8s/charts/app \
+#     --namespace production --create-namespace \
+#     --values k8s/charts/app/values-production.yaml \
+#     --set image.tag="$RELEASE_TAG" \
+#     --atomic --wait --timeout 5m
+#
+# `--atomic --wait` matter more here than anywhere else: without them
+# `helm upgrade` returns as soon as the API server accepts the manifests, so a
+# deploy that never becomes ready is reported as a successful release and the
+# rollback has to be someone noticing.
+
+environment: production
+
+# Four replicas across the node group's availability zones. Enough that
+# `minAvailable: 3` still permits one node to drain at a time during a cluster
+# upgrade — see the PDB note below.
+replicaCount: 4
+
+image:
+  repository: 123456789012.dkr.ecr.us-east-1.amazonaws.com/production-app
+  # Set per release from the release tag. `EcrStack-Production` retains images,
+  # so the tag a rollback names is still there.
+  tag: "0.1.0"
+
+serviceAccount:
+  annotations:
+    # Trust policy names `production/app-production`. A staging role ARN here
+    # would fail closed — `AssumeRoleWithWebIdentity` rejects a token whose
+    # `sub` does not match the trust policy — but it would fail at the first
+    # AWS call rather than at deploy time, so the two files are checked against
+    # their own environment by `npm run audit:helm`.
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/production-app-irsa
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    memory: 1Gi
+
+config:
+  LOG_LEVEL: info
+  LOG_FORMAT: json
+
+# Three of four must stay up. That permits exactly one voluntary disruption at a
+# time, which is what a rolling node upgrade needs, and refuses the drain that
+# would take the service to two replicas while another is already down.
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 3
+
+# Longer than staging: production connections are real, and anything shorter
+# than the longest in-flight request truncates responses on every deploy.
+terminationGracePeriodSeconds: 60

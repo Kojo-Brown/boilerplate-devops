@@ -1,0 +1,32 @@
+{{ include "app.fullname" . }} released into namespace {{ .Release.Namespace }}.
+
+  environment   {{ .Values.environment }}
+  image         {{ .Values.image.repository }}:{{ .Values.image.tag }}
+  replicas      {{ .Values.replicaCount }}
+  service       {{ .Values.service.type }} on port {{ .Values.service.port }}
+{{- if .Values.podDisruptionBudget.enabled }}
+  PDB           minAvailable {{ .Values.podDisruptionBudget.minAvailable | default 1 }} of {{ .Values.replicaCount }}
+{{- end }}
+
+Watch the rollout finish — `helm upgrade` returns before the pods are ready
+unless it was given `--wait`:
+
+  kubectl rollout status deployment/{{ include "app.fullname" . }} -n {{ .Release.Namespace }}
+
+Reach it from inside the cluster at:
+
+  http://{{ include "app.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.service.port }}
+
+The Service is {{ .Values.service.type }}, and the cluster's API endpoint is
+private (docs/eks.md §3), so from a workstation use a port-forward rather than
+expecting an address:
+
+  kubectl port-forward svc/{{ include "app.fullname" . }} 8080:{{ .Values.service.port }} -n {{ .Release.Namespace }}
+
+{{- if not .Values.serviceAccount.annotations }}
+
+This release's service account carries no `eks.amazonaws.com/role-arn`
+annotation, so its pods have no AWS identity of their own. Any AWS SDK call
+they make will fall back to the node role — see docs/eks.md §2 for why that is
+worth avoiding, and `EksStack.addIrsaRole` for the role to annotate it with.
+{{- end }}

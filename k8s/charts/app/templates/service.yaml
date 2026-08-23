@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "app.fullname" . }}
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      {{- /*
+        By name, not by number: the container port can move without the Service
+        silently continuing to point at the port it used to be.
+      */}}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "app.selectorLabels" . | nindent 4 }}

@@ -1,0 +1,156 @@
+# Chart defaults.
+#
+# These are the values every environment starts from; `values-staging.yaml` and
+# `values-production.yaml` override the ones that differ. Helm merges maps
+# deeply and replaces scalars and arrays wholesale, so an environment file lists
+# only what it changes.
+#
+# Every key here is constrained by `values.schema.json`, which Helm enforces on
+# `lint`, `template`, `install` and `upgrade`. A key that is not in the schema is
+# rejected rather than ignored: `replicas: 3` is a typo for `replicaCount`, and a
+# chart that silently accepts it deploys one replica and reports success.
+
+# Which environment this release is. Carried into the `app.kubernetes.io/…`
+# labels and into `APP_ENVIRONMENT` in the container, so a pod can be traced
+# back to the values file that produced it. There is no safe default — every
+# environment file sets it, and `npm run audit:helm` fails if one disagrees with
+# its own filename.
+environment: staging
+
+# Release-level naming. `nameOverride` changes the chart-name half of the
+# generated resource names; `fullnameOverride` replaces the generated name
+# entirely. Both empty means names are derived from the release, which is what
+# lets two releases of this chart coexist in one namespace.
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 2
+
+image:
+  # ECR repositories created by `EcrStack-Staging` / `EcrStack-Production`. The
+  # account and region are the consumer's, so the default is deliberately a
+  # placeholder that fails to pull rather than a public image that succeeds:
+  # a chart that comes up running something is harder to notice than one that
+  # does not come up at all.
+  repository: 123456789012.dkr.ecr.us-east-1.amazonaws.com/staging-app
+  # Immutable tags only. The schema rejects `latest`, `main`, `master`, `stable`
+  # and `edge` outright: a moving tag makes the running image a function of when
+  # a pod happened to restart, so two pods in one ReplicaSet can serve different
+  # code and a rollback has nothing to roll back to.
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+# Only needed for registries outside the cluster's IRSA/ECR path. ECR pulls are
+# authorised by the node role, so this stays empty for the repositories above.
+imagePullSecrets: []
+
+serviceAccount:
+  create: true
+  # Defaults to the release's fullname when empty.
+  name: ""
+  # IRSA lives here: `eks.amazonaws.com/role-arn` bound to a role whose trust
+  # policy names this namespace and service account. See docs/eks.md §2 and
+  # `EksStack.addIrsaRole`. Left empty by default because a role ARN is
+  # account-specific — each environment file supplies its own.
+  annotations: {}
+  # A pod that makes no Kubernetes API calls does not need a projected API
+  # token; `automountServiceAccountToken: false` removes one credential from the
+  # container filesystem without removing IRSA, which is delivered through a
+  # separate projected volume the AWS SDK reads.
+  automountServiceAccountToken: false
+
+# The port the container listens on. Named `http` in the pod spec, and referred
+# to by name from the Service and the probes, so changing it here changes it
+# everywhere.
+containerPort: 8080
+
+service:
+  type: ClusterIP
+  port: 80
+  annotations: {}
+
+# Requests and limits are required by the schema, not optional. A container with
+# no requests is scheduled as BestEffort and is the first thing evicted under
+# node pressure; a container with no memory limit can take the node's other pods
+# down with it. Both failures happen under load, in production, and nowhere else.
+#
+# CPU has requests but no limit on purpose: CFS throttling adds tail latency to
+# a service that is not otherwise short of CPU, and the request is what actually
+# reserves capacity. Memory is not compressible, so it carries both, and
+# `requests.memory == limits.memory` puts the pod in the Guaranteed QoS class.
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 256Mi
+
+probes:
+  # Liveness restarts a container that is wedged. Point it at something that
+  # says "this process is alive" and nothing more — a liveness probe that checks
+  # a database turns one dependency outage into a cluster-wide restart loop.
+  liveness:
+    path: /healthz
+    initialDelaySeconds: 0
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  # Readiness gates traffic. This one may check dependencies: a pod that cannot
+  # serve should leave the Service's endpoints and come back when it can.
+  readiness:
+    path: /readyz
+    initialDelaySeconds: 0
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 3
+  # Startup gives a slow boot room to finish without a lenient
+  # `initialDelaySeconds` on liveness — which is the usual alternative, and it
+  # delays every restart for the lifetime of the deployment, not just the first.
+  # failureThreshold × periodSeconds is the budget: 30 × 2s = 60s here.
+  startup:
+    path: /healthz
+    periodSeconds: 2
+    timeoutSeconds: 2
+    failureThreshold: 30
+
+# Rendered into a ConfigMap and injected with `envFrom`, so adding a key here
+# adds an environment variable. The pod template carries a checksum of the
+# ConfigMap, so changing a value rolls the Deployment instead of leaving the
+# running pods on the old configuration until something else restarts them.
+#
+# Configuration only. Anything secret comes from Secrets Manager through
+# External Secrets or an IRSA-authorised SDK call — never from here, because a
+# ConfigMap is readable by anything with `get configmaps` in the namespace.
+config:
+  LOG_LEVEL: info
+  LOG_FORMAT: json
+
+# Extra environment variables that are not simple configuration — a value from
+# the downward API, or one that must be ordered after `envFrom`.
+extraEnv: []
+
+podAnnotations: {}
+podLabels: {}
+
+# A PDB is what makes a voluntary disruption — a node drain during a cluster
+# upgrade, a Cluster Autoscaler scale-down — wait for a replacement pod instead
+# of taking the last healthy replica. `minAvailable` is expressed as a count
+# rather than a percentage so its meaning does not change when replicaCount does.
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# Surge one pod above the desired count and never drop below it, so a rollout
+# never reduces capacity. Costs one pod's worth of resources for the duration of
+# the rollout, which is the trade every rollout makes.
+strategy:
+  maxSurge: 1
+  maxUnavailable: 0
+
+# Long enough for in-flight requests to finish after the pod leaves the Service
+# endpoints. Shorter than the longest request means truncated responses during
+# every deploy.
+terminationGracePeriodSeconds: 30
+
+nodeSelector: {}
+tolerations: []

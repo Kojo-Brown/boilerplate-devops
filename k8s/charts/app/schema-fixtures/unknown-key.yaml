@@ -1,0 +1,4 @@
+# `replicas` is the Deployment field; the chart value is `replicaCount`. Without
+# `additionalProperties: false` this installs one replica and reports success.
+environment: staging
+replicas: 3
