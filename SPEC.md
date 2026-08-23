@@ -156,7 +156,7 @@ no better signal exists in the git object graph.
 
 ## Phase 8 — Kubernetes Track
 - [x] EKS cluster via CDK with managed node groups and IRSA — private API endpoint, one managed node group, four EKS-managed add-ons, and an OIDC provider; the node role is thin because the CNI holds its ENI permissions through IRSA instead (PR #34)
-- [ ] Helm chart with values per environment and a schema-validated `values.yaml`
+- [x] Helm chart with values per environment and a schema-validated `values.yaml` — `k8s/charts/app`, installed with `values-staging.yaml` or `values-production.yaml`; the schema closes every object, and two gates plus five must-fail fixtures keep it from quietly stopping to catch anything (PR #35)
 - [ ] Horizontal Pod Autoscaler + Cluster Autoscaler with load-tested thresholds
 - [ ] Pod security: non-root, read-only rootfs, dropped capabilities, seccomp
 - [ ] NetworkPolicy default-deny with explicit allowlists
@@ -191,6 +191,61 @@ there is no ingress controller or `AWSLoadBalancerControllerIAMPolicy` yet
 the cluster has no application delivery path at all until items 2 and 6. Add-on
 versions are unpinned by choice; a CI artifact narrowed to `*.template.json`
 keeps the two staged Lambda layers out of the upload.
+
+Item 2 complete as of PR #35 (2026-08-23). `k8s/charts/app` is the delivery path
+the cluster did not have: Deployment, Service, ServiceAccount annotated for
+IRSA, a config ConfigMap hashed into the pod template, and a
+PodDisruptionBudget, with `values-staging.yaml` and `values-production.yaml`
+carrying only what each environment changes.
+
+The schema is the item, and its point is not documentation. `replicas: 3` is
+the Deployment field and not this chart's value; without
+`additionalProperties: false` it installs the default replica count and reports
+success — invisible in review, invisible at deploy, and visible later as
+capacity that was never there. So every object in `values.schema.json` closes,
+and the policy rules ride along with the typing: no moving image tags (a
+rollback needs a fixed target), `resources` required rather than optional
+(BestEffort scheduling and an unbounded memory limit both fail only under
+load), and string-typed `config` values (ConfigMap data is string-valued, so an
+unquoted `PORT: 8080` is otherwise rejected by the API server after the release
+has started).
+
+Two gates, because a schema is only a gate while it still rejects something and
+the way that stops being true is quiet — one dropped line reopens a subtree and
+nothing else changes. `npm run audit:helm` runs in the CDK job, validates with
+ajv so it needs no Helm binary, walks the schema for objects that have drifted
+open, checks environment coverage in both directions, and enforces what JSON
+Schema cannot express because it compares two properties: `minAvailable` below
+`replicaCount`, no single-replica production, and a values file whose
+`environment` disagrees with its own filename. The new `Helm chart` job runs
+`helm lint --strict` and `helm template` per environment, because the validator
+that decides whether a real `helm upgrade` succeeds is Helm's own
+`xeipuuv/gojsonschema` and not ajv. `schema-fixtures/` holds five values files
+that must each be rejected, asserted against the specific keyword that should
+catch each one, by both validators. Checked against the failure it names:
+removing the root `additionalProperties: false` makes the script exit 1 on
+`unknown-key.yaml` and the audit exit 1 with `schema-open-object`.
+
+`get.helm.sh` is blocked by the scheduled agent's egress policy (403 on
+CONNECT), so the local Helm was 3.10.1 from the `helm-binary-linux` npm package
+while CI installs 3.19.0 through `azure/setup-helm@v4`. That is why
+`--kube-version` is passed on `template` and not on `lint`, which did not accept
+the flag before Helm 3.12 — and passing it explicitly is right anyway, since the
+render should not depend on which Kubernetes version the local Helm build
+defaults to.
+
+Known gaps carried into item 3: the rendered pods run with the cluster's
+security defaults, which is exactly item 3's scope — and Checkov deliberately
+does not scan the rendered manifests yet for the same reason, since its
+Kubernetes checks are almost entirely those pod-security checks and wiring the
+scan up now would mean implementing item 3 early or writing a suppression list
+that then has to be unwound. Nothing is deployed: both gates are
+lint-and-render, so there are no `helm test` hooks and no chart-testing install
+test, and no `deploy-helm.yml` template — the rollout path is item 6, and a
+`helm upgrade` workflow written now would be replaced by it. `azure/setup-helm`
+is on `node20` at its latest major, so the runner's Node 20 deprecation warning
+now names it alongside the `actions/*@v4` pins Dependabot is already opening
+pull requests against.
 
 ## Phase 9 — Supply-Chain Security
 - [ ] SBOM generation (CycloneDX) attached to every release artifact
