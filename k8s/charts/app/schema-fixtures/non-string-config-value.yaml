@@ -1,0 +1,5 @@
+# ConfigMap data is string-valued. Unquoted, this is a YAML integer, and the API
+# server rejects the ConfigMap at apply time — after the release has started.
+environment: staging
+config:
+  PORT: 8080

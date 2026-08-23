@@ -1,0 +1,3 @@
+# No `values-qa.yaml` exists, so a release claiming to be `qa` is a release with
+# no per-environment configuration at all.
+environment: qa

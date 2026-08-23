@@ -22,6 +22,7 @@ Reusable CI/CD workflows and AWS infrastructure templates.
 | Feature flag manifest + stale-flag sweep | `aws/appconfig/`, `aws/cdk/lib/feature-flag-lifecycle-stack.ts` |
 | DORA four keys — collection + dashboard | `aws/cdk/lib/dora-metrics-stack.ts`, `workflow-templates/emit-dora-deployment.yml` |
 | EKS cluster — managed node groups + IRSA | `aws/cdk/lib/eks-stack.ts` |
+| Helm chart — per-environment values, schema-validated | `k8s/charts/app/` |
 
 ## Usage
 
@@ -280,6 +281,27 @@ See [docs/eks.md](./docs/eks.md) for the IRSA trust policy, the
 version/kubectl-layer pairing, the subnet tags the load-balancer controller
 needs, and what is deliberately left to later Phase 8 items.
 
+`k8s/charts/app` is what gets deployed onto it: a Deployment, Service,
+ServiceAccount annotated for IRSA, ConfigMap and PodDisruptionBudget, installed
+with `values-staging.yaml` or `values-production.yaml`.
+
+Every value is constrained by `values.schema.json`, and the point of that is not
+documentation — it is that `replicas: 3`, which is the Deployment field and not
+the chart's, fails the release instead of installing the default replica count
+and reporting success. Two gates keep the schema honest: `npm run audit:helm`
+validates every environment's merged values, walks the schema for objects that
+have drifted open, and checks the rules JSON Schema cannot express
+(`minAvailable` below `replicaCount`, a values file whose `environment`
+disagrees with its own filename); the `Helm chart` job runs `helm lint --strict`
+and `helm template` per environment, because the validator that decides whether
+a real upgrade succeeds is Helm's own and not ajv's. `schema-fixtures/` holds
+five values files that must each be rejected, so a schema that has stopped
+catching anything fails rather than passing quietly.
+
+See [docs/helm-chart.md](./docs/helm-chart.md) for the deploy commands, the
+per-environment differences, the `null`-deletes-the-default trap, and how to add
+an environment.
+
 ## OIDC Setup (no long-lived AWS keys)
 See `aws/cloudformation/github-oidc-role.yml` for the IAM role template.
 
@@ -294,6 +316,7 @@ the two mistakes that survive a copy:
 | TruffleHog | Secrets with no distinctive shape, detected by entropy and verification | `workflow-templates/secret-scanning.yml` |
 | `npm run audit:migrations` | Migrations that cannot survive a deployment window: renames, in-place type changes, scans and rewrites under `ACCESS EXCLUSIVE`, unbounded backfills, expand and contract in one file | `aws/cdk/tools/audit-migrations.ts` |
 | `npm run audit:flags` | Feature flags with no owner, ticket, or removal date; deadlines beyond 90 days or before the creation date; a field nothing reads; a percentage on a flag that is off, or a flag on at 0% | `aws/cdk/tools/audit-feature-flags.ts` |
+| `npm run audit:helm` | Chart values that fail the schema once merged; a schema object that accepts unknown keys and so catches nothing; an environment with no values file, or a values file for one that does not exist; `key: null`, which deletes a chart default rather than overriding it; a PodDisruptionBudget that permits no drain | `aws/cdk/tools/audit-helm-values.ts` |
 
 Placeholders must use one of the AWS documentation account IDs
 (`123456789012`, `111122223333`, …) — the scan permits those and nothing else.

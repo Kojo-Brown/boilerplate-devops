@@ -1,0 +1,4 @@
+# `null` in a values file deletes the chart default rather than overriding it,
+# so this leaves the container with no requests and no limits at all.
+environment: staging
+resources: null

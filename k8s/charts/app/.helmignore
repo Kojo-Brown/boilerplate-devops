@@ -1,0 +1,19 @@
+# Patterns excluded from `helm package`. The chart tarball is what a consumer
+# installs; anything that only exists to test the chart is weight it does not
+# need — and, for the schema fixtures, weight that is deliberately invalid.
+.DS_Store
+.git/
+.gitignore
+*.swp
+*.bak
+*.tmp
+*.orig
+*~
+.project
+.idea/
+.vscode/
+
+# Values files that fail values.schema.json on purpose. `npm run audit:helm`
+# renders the chart against each one and requires it to be rejected; packaging
+# them would ship a set of invalid examples next to the valid ones.
+schema-fixtures/

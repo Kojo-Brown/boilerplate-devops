@@ -33,6 +33,7 @@
           { "context": "CDK typecheck, test, synth", "integration_id": 15368 },
           { "context": "actionlint", "integration_id": 15368 },
           { "context": "Checkov", "integration_id": 15368 },
+          { "context": "Helm chart", "integration_id": 15368 },
           { "context": "Short-lived branch", "integration_id": 15368 }
         ]
       }

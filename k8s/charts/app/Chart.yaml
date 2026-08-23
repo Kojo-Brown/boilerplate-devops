@@ -1,0 +1,41 @@
+apiVersion: v2
+name: app
+description: >-
+  A stateless HTTP service on EKS: Deployment, Service, ServiceAccount wired for
+  IRSA, a configuration ConfigMap, and a PodDisruptionBudget. Every value is
+  constrained by values.schema.json, and every environment supplies its own
+  values file.
+type: application
+
+# `version` is the chart's own version and `appVersion` is the default version
+# of the thing it deploys. They move independently: a chart change that adds a
+# probe is a chart version bump and no appVersion bump, and a release of the
+# application is the reverse. Chart consumers pin `version`; `image.tag` — not
+# `appVersion` — is what actually selects the image, because appVersion is
+# chart metadata and cannot be set per environment.
+version: 0.1.0
+appVersion: "0.1.0"
+
+# The floor is a real constraint, not a formality:
+#   • policy/v1 PodDisruptionBudget    1.21
+#   • `minDomains` on spread, PDB      1.25+ semantics
+#   • EKS supports 1.28 and later on the standard support calendar
+# `-0` makes the constraint match pre-release versions of 1.28 too, which is
+# how EKS reports some of its patched control planes. Without it a cluster
+# reporting `v1.33.0-eks-1234567` fails the constraint it plainly satisfies.
+kubeVersion: ">=1.28.0-0"
+
+home: https://github.com/Kojo-Brown/boilerplate-devops
+sources:
+  - https://github.com/Kojo-Brown/boilerplate-devops
+keywords:
+  - eks
+  - deployment
+  - boilerplate
+maintainers:
+  - name: Kojo-Brown
+    url: https://github.com/Kojo-Brown
+annotations:
+  # Rendered by tooling that reads chart metadata (ArgoCD, Artifact Hub). Kept
+  # here rather than in a README so it travels with the packaged chart.
+  category: Application

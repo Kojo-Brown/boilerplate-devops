@@ -1,0 +1,4 @@
+# A moving tag makes the running image a function of when a pod last restarted.
+environment: staging
+image:
+  tag: latest

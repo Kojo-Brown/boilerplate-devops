@@ -1,0 +1,47 @@
+# Staging overrides.
+#
+#   helm upgrade --install app-staging k8s/charts/app \
+#     --namespace staging --create-namespace \
+#     --values k8s/charts/app/values-staging.yaml \
+#     --set image.tag="$GIT_SHA"
+#
+# Only the keys that differ from `values.yaml` belong here. Helm merges maps
+# deeply, so this file does not repeat the defaults — and a key set to `null`
+# here *deletes* the chart default rather than overriding it, which
+# `npm run audit:helm` fails on when the deleted key is a required one.
+
+environment: staging
+
+# Two replicas is the floor at which a rolling update, a node drain, or a single
+# crash is not an outage. Staging carries no traffic worth scaling for.
+replicaCount: 2
+
+image:
+  repository: 123456789012.dkr.ecr.us-east-1.amazonaws.com/staging-app
+  # Overwritten per deploy with the commit SHA. The literal here is what a
+  # `helm template` in CI renders, and what someone gets if they install this
+  # file by hand — a real tag rather than a moving one, so the failure is a
+  # missing image and not the wrong image.
+  tag: "0.1.0"
+
+serviceAccount:
+  annotations:
+    # Created by `EksStack.addIrsaRole` — see docs/eks.md §2. The trust policy
+    # names `staging/app-staging`, so this annotation and that role have to
+    # agree on both the namespace and the service account name.
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/staging-app-irsa
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 128Mi
+
+config:
+  LOG_LEVEL: debug
+  LOG_FORMAT: json
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
