@@ -17,6 +17,7 @@ import {
   formatViolations,
   nullifiedPaths,
   readCharts,
+  replicaFloor,
 } from '../tools/audit-helm-values';
 
 const REPO_ROOT = path.resolve(__dirname, '..', '..', '..');
@@ -297,6 +298,164 @@ describe('auditEnvironment', () => {
   });
 });
 
+describe('auditEnvironment with an HPA', () => {
+  const defaults = {
+    environment: 'staging',
+    replicaCount: 2,
+    autoscaling: { enabled: true, minReplicas: 2, maxReplicas: 6 },
+    podDisruptionBudget: { enabled: true, minAvailable: 1 },
+  };
+
+  const validate = compileSchema({
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      environment: { type: 'string', enum: ['staging', 'production'] },
+      replicaCount: { type: 'integer', minimum: 1 },
+      autoscaling: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          enabled: { type: 'boolean' },
+          minReplicas: { type: 'integer', minimum: 1 },
+          maxReplicas: { type: 'integer', minimum: 1 },
+        },
+      },
+      podDisruptionBudget: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { enabled: { type: 'boolean' }, minAvailable: { type: 'integer' } },
+      },
+    },
+    required: ['environment', 'replicaCount'],
+  });
+
+  const audit = (environment: string, document: unknown): ViolationRule[] =>
+    rules(auditEnvironment(environmentWith(environment, document), defaults, validate));
+
+  it('accepts a coherent autoscaled environment', () => {
+    expect(
+      audit('production', {
+        environment: 'production',
+        replicaCount: 4,
+        autoscaling: { minReplicas: 4, maxReplicas: 20 },
+        podDisruptionBudget: { enabled: true, minAvailable: 3 },
+      }),
+    ).toEqual([]);
+  });
+
+  it('checks the disruption budget against minReplicas, not replicaCount', () => {
+    // Eight nominal replicas make `minAvailable: 4` look generous. The HPA can
+    // take the fleet to 4, and at that size the budget permits no disruption at
+    // all — which is when the 4am drain arrives.
+    expect(
+      audit('production', {
+        environment: 'production',
+        replicaCount: 8,
+        autoscaling: { minReplicas: 4, maxReplicas: 20 },
+        podDisruptionBudget: { enabled: true, minAvailable: 4 },
+      }),
+    ).toEqual(['budget-blocks-drain']);
+  });
+
+  it('names the floor it used, so the message points at the value to change', () => {
+    const [violation] = auditEnvironment(
+      environmentWith('production', {
+        environment: 'production',
+        replicaCount: 8,
+        autoscaling: { minReplicas: 4, maxReplicas: 20 },
+        podDisruptionBudget: { enabled: true, minAvailable: 4 },
+      }),
+      defaults,
+      validate,
+    );
+
+    expect(violation.message).toContain('autoscaling.minReplicas 4');
+  });
+
+  it('falls back to replicaCount when the HPA is disabled', () => {
+    expect(
+      audit('production', {
+        environment: 'production',
+        replicaCount: 2,
+        autoscaling: { enabled: false, minReplicas: 8, maxReplicas: 20 },
+        podDisruptionBudget: { enabled: true, minAvailable: 2 },
+      }),
+    ).toEqual(['budget-blocks-drain']);
+  });
+
+  it('flags a production floor of one even when replicaCount is higher', () => {
+    expect(
+      audit('production', {
+        environment: 'production',
+        replicaCount: 6,
+        autoscaling: { minReplicas: 1, maxReplicas: 20 },
+        podDisruptionBudget: { enabled: false },
+      }),
+    ).toEqual(['single-replica']);
+  });
+
+  it('flags an HPA whose ceiling is not above its floor', () => {
+    expect(
+      audit('staging', {
+        environment: 'staging',
+        replicaCount: 3,
+        autoscaling: { minReplicas: 3, maxReplicas: 3 },
+        podDisruptionBudget: { enabled: false },
+      }),
+    ).toEqual(['autoscaling-bounds']);
+  });
+
+  it('flags a replicaCount outside the range the HPA would enforce', () => {
+    // Inert while the HPA is on, and the fleet size the moment it is turned
+    // off — so it is only ever wrong in the middle of a change.
+    expect(
+      audit('staging', {
+        environment: 'staging',
+        replicaCount: 12,
+        autoscaling: { minReplicas: 2, maxReplicas: 6 },
+        podDisruptionBudget: { enabled: false },
+      }),
+    ).toEqual(['replica-count-outside-range']);
+  });
+
+  it('leaves replicaCount alone when the HPA is disabled', () => {
+    expect(
+      audit('staging', {
+        environment: 'staging',
+        replicaCount: 12,
+        autoscaling: { enabled: false, minReplicas: 2, maxReplicas: 6 },
+        podDisruptionBudget: { enabled: false },
+      }),
+    ).toEqual([]);
+  });
+});
+
+describe('replicaFloor', () => {
+  it('reads the HPA floor when autoscaling is on', () => {
+    expect(replicaFloor({ replicaCount: 8, autoscaling: { enabled: true, minReplicas: 3 } })).toEqual(
+      { count: 3, source: 'autoscaling.minReplicas' },
+    );
+  });
+
+  it('reads replicaCount when it is off', () => {
+    expect(
+      replicaFloor({ replicaCount: 8, autoscaling: { enabled: false, minReplicas: 3 } }),
+    ).toEqual({ count: 8, source: 'replicaCount' });
+  });
+
+  it('reads replicaCount when there is no autoscaling block at all', () => {
+    expect(replicaFloor({ replicaCount: 8 })).toEqual({ count: 8, source: 'replicaCount' });
+  });
+
+  it('reports no floor rather than guessing when the value is not a number', () => {
+    expect(replicaFloor({ replicaCount: 'four' })).toEqual({
+      count: undefined,
+      source: 'replicaCount',
+    });
+  });
+});
+
 describe('auditChart', () => {
   it('accepts a conforming chart', () => {
     expect(auditChart(CONFORMING_CHART)).toEqual([]);
@@ -396,6 +555,12 @@ describe('the schema fixtures', () => {
     ['mutable-image-tag.yaml', 'not', '/image/tag'],
     ['non-string-config-value.yaml', 'type', '/config/PORT'],
     ['nullified-required-key.yaml', 'required', ''],
+    ['zero-min-replicas.yaml', 'minimum', '/autoscaling/minReplicas'],
+    // The scale-down floor is expressed as an `allOf` branch over the shared
+    // `hpaScalingRules` definition, so what has to still catch it is the
+    // `minimum` in that branch — not the one on the shared definition, which is
+    // 0 and is correct for scale-up.
+    ['flapping-scale-down.yaml', 'minimum', '/autoscaling/behavior/scaleDown/stabilizationWindowSeconds'],
   ];
 
   it.each(FIXTURES)('rejects %s with the %s keyword', (file, keyword, instancePath) => {

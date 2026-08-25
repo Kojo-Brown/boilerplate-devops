@@ -48,6 +48,13 @@
  *                             every cluster upgrade
  *   single-replica            one replica in production, where any voluntary
  *                             disruption is then an outage
+ *   autoscaling-bounds        an HPA whose ceiling is not above its floor, so
+ *                             it is a fixed replica count wearing an autoscaler
+ *   replica-count-outside-range
+ *                             `replicaCount` outside the HPA's range. It is not
+ *                             rendered while the HPA is on, so nothing catches
+ *                             it until autoscaling is turned off — at which
+ *                             point the fleet silently resizes
  *
  * Usage:
  *   npm run audit:helm                       # audits the repository root
@@ -86,7 +93,9 @@ export type ViolationRule =
   | 'nullified-key'
   | 'schema-violation'
   | 'budget-blocks-drain'
-  | 'single-replica';
+  | 'single-replica'
+  | 'autoscaling-bounds'
+  | 'replica-count-outside-range';
 
 export interface Violation {
   readonly rule: ViolationRule;
@@ -391,9 +400,34 @@ export const auditEnvironment = (
   return violations;
 };
 
+const asNumber = (value: unknown): number | undefined =>
+  typeof value === 'number' ? value : undefined;
+
 /**
- * The two availability rules JSON Schema cannot express, because both compare
- * one value to another.
+ * The smallest number of pods the release can be running, and where that number
+ * comes from.
+ *
+ * With the HPA on it is `autoscaling.minReplicas`, not `replicaCount`: the
+ * Deployment renders no `replicas` field at all in that case, so `replicaCount`
+ * is a value nothing reads. Every availability rule below has to be checked
+ * against the floor rather than the nominal size, because the disruption that
+ * matters — a node drain at 4am — arrives when the fleet is at its smallest.
+ */
+export const replicaFloor = (
+  merged: Record<string, unknown>,
+): { readonly count: number | undefined; readonly source: string } => {
+  const autoscaling = asRecord(merged.autoscaling);
+
+  if (autoscaling?.enabled === true) {
+    return { count: asNumber(autoscaling.minReplicas), source: 'autoscaling.minReplicas' };
+  }
+
+  return { count: asNumber(merged.replicaCount), source: 'replicaCount' };
+};
+
+/**
+ * The availability rules JSON Schema cannot express, because every one of them
+ * compares one value to another.
  */
 const auditAvailability = (
   merged: Record<string, unknown>,
@@ -401,29 +435,84 @@ const auditAvailability = (
   file: string,
 ): Violation[] => {
   const violations: Violation[] = [];
-  const replicas = typeof merged.replicaCount === 'number' ? merged.replicaCount : undefined;
+  const floor = replicaFloor(merged);
   const budget = asRecord(merged.podDisruptionBudget);
   const minAvailable = typeof budget?.minAvailable === 'number' ? budget.minAvailable : 1;
 
-  if (budget?.enabled === true && replicas !== undefined && minAvailable >= replicas) {
+  if (budget?.enabled === true && floor.count !== undefined && minAvailable >= floor.count) {
     violations.push({
       rule: 'budget-blocks-drain',
       file,
       message:
-        `podDisruptionBudget.minAvailable is ${minAvailable} with replicaCount ${replicas}, so ` +
-        'the budget permits no voluntary disruption at all. `kubectl drain` then blocks forever ' +
-        'and every node rotation and cluster upgrade stalls on it — a PDB that protects the ' +
-        'service from the platform by stopping the platform.',
+        `podDisruptionBudget.minAvailable is ${minAvailable} with ${floor.source} ` +
+        `${floor.count}, so the budget permits no voluntary disruption at the smallest size ` +
+        'this release runs at. `kubectl drain` then blocks forever and every node rotation, ' +
+        'cluster upgrade and Cluster Autoscaler scale-down stalls on it — a PDB that protects ' +
+        'the service from the platform by stopping the platform.',
     });
   }
 
-  if (environment.environment === 'production' && replicas !== undefined && replicas < 2) {
+  if (environment.environment === 'production' && floor.count !== undefined && floor.count < 2) {
     violations.push({
       rule: 'single-replica',
       file,
       message:
-        'production runs a single replica, so a node drain, a rolling update, or one crash is ' +
-        'an outage. Two is the floor at which none of those are.',
+        `production can run a single replica (${floor.source} is ${floor.count}), so a node ` +
+        'drain, a rolling update, or one crash is an outage. Two is the floor at which none of ' +
+        'those are.',
+    });
+  }
+
+  violations.push(...auditAutoscaling(merged, file));
+
+  return violations;
+};
+
+/**
+ * The HPA's own bounds, and the relationship between them and `replicaCount`.
+ *
+ * Both rules are about a misconfiguration that produces no error anywhere: an
+ * HPA with `maxReplicas` at its floor reports itself healthy while scaling
+ * nothing, and a `replicaCount` outside the range is inert right up until
+ * someone sets `autoscaling.enabled: false` and the fleet resizes on the next
+ * upgrade.
+ */
+const auditAutoscaling = (merged: Record<string, unknown>, file: string): Violation[] => {
+  const autoscaling = asRecord(merged.autoscaling);
+  if (autoscaling?.enabled !== true) return [];
+
+  const minReplicas = asNumber(autoscaling.minReplicas);
+  const maxReplicas = asNumber(autoscaling.maxReplicas);
+  const replicas = asNumber(merged.replicaCount);
+  const violations: Violation[] = [];
+
+  if (minReplicas !== undefined && maxReplicas !== undefined && maxReplicas <= minReplicas) {
+    violations.push({
+      rule: 'autoscaling-bounds',
+      file,
+      message:
+        `autoscaling.maxReplicas is ${maxReplicas} and minReplicas is ${minReplicas}, so the ` +
+        'HPA has no room to scale. Kubernetes accepts it and the HPA reports itself healthy ' +
+        'while pinning the fleet at one size — a fixed replica count with an extra controller ' +
+        'in front of it. Raise the ceiling, or set `autoscaling.enabled: false` and mean it.',
+    });
+  }
+
+  if (
+    replicas !== undefined &&
+    minReplicas !== undefined &&
+    maxReplicas !== undefined &&
+    (replicas < minReplicas || replicas > maxReplicas)
+  ) {
+    violations.push({
+      rule: 'replica-count-outside-range',
+      file,
+      message:
+        `replicaCount is ${replicas}, outside the HPA's range of ${minReplicas}–${maxReplicas}. ` +
+        'While autoscaling is on the Deployment renders no `replicas` field, so this value ' +
+        'reaches nothing and nothing contradicts it. It becomes the fleet size the moment ' +
+        'someone sets `autoscaling.enabled: false` — which is meant to change the mechanism, ' +
+        'not the capacity.',
     });
   }
 

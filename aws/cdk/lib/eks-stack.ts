@@ -21,6 +21,29 @@ const DEFAULT_KUBERNETES_VERSION = eks.KubernetesVersion.V1_33;
 /** Namespace the EKS-managed add-ons and their service accounts live in. */
 const KUBE_SYSTEM = 'kube-system';
 
+/**
+ * Helm chart version for the Cluster Autoscaler.
+ *
+ * The chart's `appVersion` is the autoscaler release it installs, and that
+ * release tracks the Kubernetes minor version: chart 9.51.0 ships autoscaler
+ * v1.33.0, which is the last 1.33 line and matches
+ * {@link DEFAULT_KUBERNETES_VERSION}. Cluster Autoscaler is explicitly not
+ * version-skew tolerant — it reads scheduler internals to decide whether a
+ * pending pod would fit a hypothetical node — so overriding the cluster version
+ * means overriding this too, the same way `kubectlLayer` has to move with it.
+ */
+const DEFAULT_CLUSTER_AUTOSCALER_CHART_VERSION = '9.51.0';
+
+/** Service account the Cluster Autoscaler chart runs under, in {@link KUBE_SYSTEM}. */
+const CLUSTER_AUTOSCALER_SERVICE_ACCOUNT = 'cluster-autoscaler';
+
+/**
+ * A Go duration string, which is what every Cluster Autoscaler flag that takes a
+ * time expects. Seconds are always valid and always unambiguous —
+ * `Duration.toIsoString()` is not, and a bare number is read as nanoseconds.
+ */
+const goDuration = (duration: cdk.Duration): string => `${duration.toSeconds()}s`;
+
 /** Root device name for the Amazon Linux 2023 EKS-optimised AMI family. */
 const AL2023_ROOT_DEVICE = '/dev/xvda';
 
@@ -68,6 +91,58 @@ export interface ManagedNodeGroupOptions {
   readonly maxUnavailablePercentage?: number;
 }
 
+/**
+ * Options for the Cluster Autoscaler installed by {@link EksStack}.
+ *
+ * The defaults are the ones derived in `docs/autoscaling.md` §4 — every one of
+ * them is a trade between paying for idle nodes and making a pod wait for one,
+ * and the shape of that trade is what the numbers encode.
+ */
+export interface ClusterAutoscalerOptions {
+  /** Install it at all (default: true) */
+  readonly enabled?: boolean;
+  /**
+   * Helm chart version, which selects the autoscaler release through the
+   * chart's `appVersion` (default: {@link DEFAULT_CLUSTER_AUTOSCALER_CHART_VERSION},
+   * whose autoscaler matches {@link DEFAULT_KUBERNETES_VERSION}).
+   */
+  readonly chartVersion?: string;
+  /**
+   * Which node group to grow when more than one could take the pending pod
+   * (default: `least-waste`, the group that leaves the least idle CPU and
+   * memory after the pod lands). Only meaningful with several node groups.
+   */
+  readonly expander?: 'least-waste' | 'most-pods' | 'priority' | 'random';
+  /**
+   * How long a node must look removable before it is removed (default: 10 min).
+   *
+   * This is the whole of the scale-down hysteresis. Shorter reclaims cost
+   * sooner and thrashes on traffic that comes back; longer pays for nodes that
+   * are genuinely idle.
+   */
+  readonly scaleDownUnneededTime?: cdk.Duration;
+  /**
+   * Quiet period after any scale-up before scale-down is considered again
+   * (default: 10 min). Without it a burst that adds a node can be followed
+   * straight away by a decision to remove a different one.
+   */
+  readonly scaleDownDelayAfterAdd?: cdk.Duration;
+  /**
+   * Fraction of a node's requested-to-allocatable ratio below which it counts
+   * as under-used (default: 0.5).
+   *
+   * Requests, not usage: the autoscaler has to simulate the scheduler, and the
+   * scheduler packs on requests. A fleet whose requests are far above its real
+   * usage never scales down however idle it looks in a dashboard.
+   */
+  readonly scaleDownUtilizationThreshold?: number;
+  /**
+   * How long a node may take to join before the autoscaler gives up on it and
+   * retries elsewhere (default: 15 min).
+   */
+  readonly maxNodeProvisionTime?: cdk.Duration;
+}
+
 export interface EksStackProps extends cdk.StackProps {
   /** VPC from VpcStack (required) — nodes and the kubectl handler run in its private subnets */
   readonly vpc: ec2.IVpc;
@@ -101,6 +176,8 @@ export interface EksStackProps extends cdk.StackProps {
   readonly clusterLogging?: eks.ClusterLoggingTypes[];
   /** Overrides for the system node group created with the cluster */
   readonly systemNodeGroup?: ManagedNodeGroupOptions;
+  /** Cluster Autoscaler configuration (default: installed, with the thresholds in docs/autoscaling.md) */
+  readonly clusterAutoscaler?: ClusterAutoscalerOptions;
   /**
    * Attach `AmazonSSMManagedInstanceCore` to the node role so operators can
    * open a Session Manager shell on a node (default: false — nodes are cattle,
@@ -121,6 +198,11 @@ export interface EksStackProps extends cdk.StackProps {
  *   Identity       — an OIDC provider fronting the cluster's issuer, so a pod's
  *                    service account token is exchanged for scoped AWS
  *                    credentials instead of borrowing the node's role
+ *   Node scaling   — the Cluster Autoscaler, IRSA-authorised and discovering
+ *                    node groups by ASG tag. It is the second half of the
+ *                    scaling story: the chart's HPA adds pods, and pods that do
+ *                    not fit stay Pending until something adds a node. See
+ *                    docs/autoscaling.md.
  *
  * Security defaults:
  *   - API server endpoint is private; `publicApiAccessCidrs` opens it to an
@@ -148,6 +230,8 @@ export class EksStack extends cdk.Stack {
   public readonly systemNodeGroup: eks.Nodegroup;
   /** KMS key envelope-encrypting Kubernetes secrets */
   public readonly secretsKey: kms.IKey;
+  /** IRSA role the Cluster Autoscaler assumes; `undefined` when it is disabled */
+  public readonly clusterAutoscalerRole?: iam.Role;
 
   private readonly envName: string;
 
@@ -312,6 +396,13 @@ export class EksStack extends cdk.Stack {
     // adopt it before nodes join rather than reconfiguring a running data plane.
     this.systemNodeGroup.node.addDependency(vpcCni, kubeProxy);
 
+    // ── Cluster Autoscaler ────────────────────────────────────────────────────
+    const clusterAutoscaler = props.clusterAutoscaler ?? {};
+
+    if (clusterAutoscaler.enabled ?? true) {
+      this.clusterAutoscalerRole = this.addClusterAutoscaler(clusterAutoscaler);
+    }
+
     // ── Cluster access ────────────────────────────────────────────────────────
     for (const [index, roleArn] of (props.clusterAdminRoleArns ?? []).entries()) {
       this.cluster.grantAccess(`ClusterAdminAccess${index}`, roleArn, [
@@ -373,6 +464,187 @@ export class EksStack extends cdk.Stack {
       description: 'EKS-managed cluster security group (control plane ↔ nodes)',
       exportName: `${envName}-eks-cluster-security-group-id`,
     });
+
+    if (this.clusterAutoscalerRole) {
+      new cdk.CfnOutput(this, 'ClusterAutoscalerRoleArn', {
+        value: this.clusterAutoscalerRole.roleArn,
+        description: 'IRSA role assumed by the Cluster Autoscaler',
+        exportName: `${envName}-eks-cluster-autoscaler-role-arn`,
+      });
+    }
+  }
+
+  /**
+   * Install the Cluster Autoscaler: an IRSA role, and the upstream Helm chart
+   * configured to discover this cluster's node groups by ASG tag.
+   *
+   * **Why auto-discovery rather than named groups.** The alternative is
+   * `autoscalingGroups: [{name, minSize, maxSize}]`, which needs the ASG's
+   * name — and EKS, not CloudFormation, creates the ASG behind a managed node
+   * group, so the name does not exist at synth time. Auto-discovery matches on
+   * two tags instead, `k8s.io/cluster-autoscaler/enabled` and
+   * `k8s.io/cluster-autoscaler/<cluster>`, both of which EKS applies to the ASGs
+   * it creates for managed node groups. Nothing here has to tag anything; a
+   * *self-managed* ASG added later does, and will be invisible to the
+   * autoscaler until it is tagged.
+   *
+   * **Where the bounds come from.** Not from this chart. The autoscaler never
+   * moves a group outside the ASG's own min and max, which are the `minSize` and
+   * `maxSize` on {@link addManagedNodeGroup}. That is the ceiling an HPA's
+   * `maxReplicas` has to fit inside — past it, scaling up produces Pending pods
+   * and an HPA that reports success. docs/autoscaling.md §3 does that
+   * arithmetic for the shipped environments.
+   *
+   * **What it will not remove.** By default the autoscaler leaves alone any
+   * node running a kube-system pod that is not part of a DaemonSet
+   * (`--skip-nodes-with-system-pods`, left at its default), and any node running
+   * a pod with local storage. With a single node group hosting CoreDNS and the
+   * EBS CSI controller, that pins a couple of nodes above the group's minimum.
+   * Both defaults are kept: the alternative is an autoscaler that evicts CoreDNS
+   * to save a node.
+   */
+  private addClusterAutoscaler(options: ClusterAutoscalerOptions): iam.Role {
+    const clusterName = this.cluster.clusterName;
+
+    // The cluster name is a `Ref`, so the condition *key* is only known at
+    // deploy time. A plain object literal stringifies the token into the
+    // template as `aws:ResourceTag/k8s.io/cluster-autoscaler/${Token[...]}`;
+    // CfnJson defers the whole map to resolution, the same way the IRSA trust
+    // conditions in `addIrsaRole` do.
+    const ownedByThisCluster = new cdk.CfnJson(this, 'ClusterAutoscalerTagCondition', {
+      value: { [`aws:ResourceTag/k8s.io/cluster-autoscaler/${clusterName}`]: 'owned' },
+    });
+
+    const role = this.addIrsaRole('ClusterAutoscalerRole', {
+      namespace: KUBE_SYSTEM,
+      serviceAccountName: CLUSTER_AUTOSCALER_SERVICE_ACCOUNT,
+      description: `Cluster Autoscaler for the ${this.envName} EKS cluster`,
+      inlinePolicyStatements: [
+        new iam.PolicyStatement({
+          sid: 'DiscoverScalableCapacity',
+          // Documented wildcard, per CLAUDE.md. Every action here is a
+          // read, and none of them supports resource-level permissions —
+          // `autoscaling:DescribeAutoScalingGroups` with a resource ARN
+          // returns an access denied for every group, including the ones the
+          // ARN names. The autoscaler also has to see groups it does not
+          // manage: its decision is "would this pending pod fit anywhere",
+          // which it cannot answer from a filtered view of the account.
+          actions: [
+            'autoscaling:DescribeAutoScalingGroups',
+            'autoscaling:DescribeAutoScalingInstances',
+            'autoscaling:DescribeLaunchConfigurations',
+            'autoscaling:DescribeScalingActivities',
+            'autoscaling:DescribeTags',
+            'ec2:DescribeImages',
+            'ec2:DescribeInstanceTypes',
+            'ec2:DescribeLaunchTemplateVersions',
+            'ec2:GetInstanceTypesFromInstanceRequirements',
+            'eks:DescribeNodegroup',
+          ],
+          resources: ['*'],
+        }),
+        new iam.PolicyStatement({
+          sid: 'ScaleTaggedNodeGroups',
+          // The two actions that change anything, and the only ones scoped.
+          // The resource pattern cannot name a group — see the method
+          // docstring — so the tag condition is what actually bounds this:
+          // without it, the role could resize every Auto Scaling group in the
+          // account, including another cluster's.
+          actions: [
+            'autoscaling:SetDesiredCapacity',
+            'autoscaling:TerminateInstanceInAutoScalingGroup',
+          ],
+          resources: [
+            `arn:${this.partition}:autoscaling:${this.region}:${this.account}:autoScalingGroup:*:autoScalingGroupName/*`,
+          ],
+          conditions: { StringEquals: ownedByThisCluster },
+        }),
+      ],
+    });
+
+    const chart = this.cluster.addHelmChart('ClusterAutoscaler', {
+      chart: 'cluster-autoscaler',
+      repository: 'https://kubernetes.github.io/autoscaler',
+      release: CLUSTER_AUTOSCALER_SERVICE_ACCOUNT,
+      namespace: KUBE_SYSTEM,
+      version: options.chartVersion ?? DEFAULT_CLUSTER_AUTOSCALER_CHART_VERSION,
+      // `wait` turns a chart that installs but never becomes ready into a failed
+      // stack update instead of a green deploy with no autoscaler running.
+      wait: true,
+      timeout: cdk.Duration.minutes(15),
+      values: {
+        cloudProvider: 'aws',
+        awsRegion: this.region,
+        autoDiscovery: { clusterName },
+        rbac: {
+          serviceAccount: {
+            create: true,
+            name: CLUSTER_AUTOSCALER_SERVICE_ACCOUNT,
+            // The other half of IRSA. The trust policy above names
+            // `kube-system:cluster-autoscaler`; this names the role from the
+            // Kubernetes side, and the two have to agree or every AWS call the
+            // autoscaler makes fails with an access denied that looks like a
+            // policy problem.
+            annotations: { 'eks.amazonaws.com/role-arn': role.roleArn },
+          },
+        },
+        extraArgs: {
+          expander: options.expander ?? 'least-waste',
+          // Keeps groups that are interchangeable at similar sizes, which is
+          // what makes a multi-AZ fleet stay multi-AZ under scale-up.
+          'balance-similar-node-groups': true,
+          'scale-down-utilization-threshold': options.scaleDownUtilizationThreshold ?? 0.5,
+          'scale-down-unneeded-time': goDuration(
+            options.scaleDownUnneededTime ?? cdk.Duration.minutes(10),
+          ),
+          'scale-down-delay-after-add': goDuration(
+            options.scaleDownDelayAfterAdd ?? cdk.Duration.minutes(10),
+          ),
+          'max-node-provision-time': goDuration(
+            options.maxNodeProvisionTime ?? cdk.Duration.minutes(15),
+          ),
+          // Explicit rather than inherited: a node with an emptyDir or a
+          // hostPath is left alone, because removing it destroys data the pod
+          // believes is still there. It is also the flag most often flipped by
+          // someone chasing a node that will not go away, so it is written down
+          // here with the reason attached.
+          'skip-nodes-with-local-storage': true,
+          // The chart defaults to v=4, which logs a scheduler simulation per
+          // scan interval.
+          v: 2,
+        },
+        // Without this the autoscaler can evict itself while draining a node it
+        // has just decided to remove, and the decision dies with the pod.
+        podAnnotations: { 'cluster-autoscaler.kubernetes.io/safe-to-evict': 'false' },
+        priorityClassName: 'system-cluster-critical',
+        securityContext: {
+          runAsNonRoot: true,
+          runAsUser: 65534,
+          runAsGroup: 65534,
+          fsGroup: 65534,
+          seccompProfile: { type: 'RuntimeDefault' },
+        },
+        containerSecurityContext: {
+          allowPrivilegeEscalation: false,
+          readOnlyRootFilesystem: true,
+          capabilities: { drop: ['ALL'] },
+        },
+        // Memory equal to its request: the autoscaler holds a model of every
+        // node and pending pod, so its footprint grows with the cluster and a
+        // BestEffort autoscaler is evicted by exactly the node pressure it
+        // exists to resolve.
+        resources: {
+          requests: { cpu: '100m', memory: '300Mi' },
+          limits: { memory: '300Mi' },
+        },
+      },
+    });
+
+    // The chart is a Deployment, and a Deployment that cannot schedule leaves
+    // `wait: true` hanging until the timeout.
+    chart.node.addDependency(this.systemNodeGroup);
+
+    return role;
   }
 
   /**

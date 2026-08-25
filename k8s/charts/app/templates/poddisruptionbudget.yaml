@@ -12,9 +12,12 @@ spec:
     does not protect against a node failing, and it cannot: nothing gets to veto
     hardware.
 
-    `minAvailable` equal to `replicaCount` blocks every drain permanently and
+    `minAvailable` equal to the fleet's floor blocks every drain permanently and
     stalls cluster upgrades, which is why `npm run audit:helm` requires it to
-    stay below the replica count of the environment that sets it.
+    stay below that floor — `autoscaling.minReplicas` when the HPA is on, and
+    `replicaCount` when it is not. Checking against `replicaCount` while an HPA
+    is running would miss it: a budget that looks generous against the busy-hour
+    size is a budget that blocks every drain at 4am.
   */}}
   minAvailable: {{ .Values.podDisruptionBudget.minAvailable | default 1 }}
   selector:

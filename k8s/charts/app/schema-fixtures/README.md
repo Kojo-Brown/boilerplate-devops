@@ -15,6 +15,8 @@ violation, checked against the specific keyword that should catch it:
 | `mutable-image-tag.yaml` | `image.tag: latest` | `not` |
 | `non-string-config-value.yaml` | an unquoted number in `config` | `type` |
 | `nullified-required-key.yaml` | `resources: null`, which deletes rather than overrides | `required` |
+| `zero-min-replicas.yaml` | `autoscaling.minReplicas: 0` without the HPAScaleToZero gate | `minimum` |
+| `flapping-scale-down.yaml` | a scale-down with no stabilization window | `minimum` (via `allOf`) |
 
 `aws/cdk/test/audit-helm-values.test.ts` asserts each is rejected, and by the
 keyword named above rather than by any error at all. `.github/scripts/lint-helm-chart.sh`

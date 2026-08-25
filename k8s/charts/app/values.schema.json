@@ -8,6 +8,7 @@
   "required": [
     "environment",
     "replicaCount",
+    "autoscaling",
     "image",
     "serviceAccount",
     "containerPort",
@@ -37,10 +38,62 @@
       "pattern": "^([a-z0-9]([-a-z0-9]*[a-z0-9])?)?$"
     },
     "replicaCount": {
-      "description": "Desired pods. One replica means every voluntary disruption is an outage, so the floor is 1 and every environment that matters sets more.",
+      "description": "Desired pods when autoscaling.enabled is false. With the HPA on, the Deployment renders no replicas field at all and this value does not reach the cluster — npm run audit:helm keeps it inside the HPA's range so that turning autoscaling off is not also a change of capacity.",
       "type": "integer",
       "minimum": 1,
       "maximum": 100
+    },
+    "autoscaling": {
+      "description": "Horizontal Pod Autoscaler. Scales pods against CPU utilization; the Cluster Autoscaler in EksStack scales the nodes underneath. docs/autoscaling.md derives every threshold here.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "minReplicas", "maxReplicas", "targetCPUUtilizationPercentage", "behavior"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "minReplicas": {
+          "description": "The HPA's floor, and the number the PodDisruptionBudget is checked against when autoscaling is on. Kubernetes requires at least 1 without the HPAScaleToZero feature gate, which EKS does not enable.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "maxReplicas": {
+          "description": "The ceiling. Must exceed minReplicas — checked by npm run audit:helm, since JSON Schema cannot compare two properties — and maxReplicas × resources.requests.cpu must fit what the Cluster Autoscaler's maximum node count can supply, or the HPA scales into Pending pods.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "targetCPUUtilizationPercentage": {
+          "description": "Percentage of the CPU request, not of the limit or the node. The gap between this and the service's latency knee is the headroom that covers the ~90s between load arriving and a new pod serving.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "targetMemoryUtilizationPercentage": {
+          "description": "Optional, and usually wrong when requests.memory equals limits.memory: a runtime that holds freed pages sits near its target permanently, so the HPA scales up and never back down. Set it only for a service whose memory tracks concurrency.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "behavior": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["scaleUp", "scaleDown"],
+          "properties": {
+            "scaleUp": { "$ref": "#/definitions/hpaScalingRules" },
+            "scaleDown": {
+              "allOf": [
+                { "$ref": "#/definitions/hpaScalingRules" },
+                {
+                  "description": "A scale-down with no stabilization window removes pods on the first low sample and adds them back on the next, which turns ordinary traffic noise into a rollout. Kubernetes itself defaults to 300s; this chart's floor is 60s, deliberately lower than that default so a service with a genuinely short trough can opt into a faster one without editing the schema.",
+                  "properties": {
+                    "stabilizationWindowSeconds": { "minimum": 60 }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      }
     },
     "image": {
       "type": "object",
@@ -270,6 +323,43 @@
     }
   },
   "definitions": {
+    "hpaScalingRules": {
+      "description": "One direction of an HPA's behavior. The two policy kinds are named keys rather than the API's array, because Helm replaces arrays wholesale: an environment file changing one policy in a list would have to restate the others, and the one it forgot would vanish.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stabilizationWindowSeconds", "selectPolicy"],
+      "anyOf": [{ "required": ["percent"] }, { "required": ["pods"] }],
+      "properties": {
+        "stabilizationWindowSeconds": {
+          "description": "The window the HPA takes its most conservative recommendation from. Absent is not the same as 0: absent falls back to the API default, which is 0 for scale-up and 300 for scale-down. The chart always renders it, so it is required here.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3600
+        },
+        "selectPolicy": {
+          "description": "Which policy wins when both percent and pods are set: Max takes the larger change, Min the smaller, Disabled blocks movement in this direction entirely. Irrelevant with a single policy.",
+          "type": "string",
+          "enum": ["Max", "Min", "Disabled"]
+        },
+        "percent": { "$ref": "#/definitions/hpaScalingPolicy" },
+        "pods": { "$ref": "#/definitions/hpaScalingPolicy" }
+      }
+    },
+    "hpaScalingPolicy": {
+      "description": "How much the HPA may move the replica count in one period, in percent of the current count or in absolute pods.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["value", "periodSeconds"],
+      "properties": {
+        "value": { "type": "integer", "minimum": 1 },
+        "periodSeconds": {
+          "description": "The API caps this at 1800.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1800
+        }
+      }
+    },
     "cpuQuantity": {
       "description": "Kubernetes CPU quantity: cores (1, 1.5) or millicores (500m).",
       "type": "string",

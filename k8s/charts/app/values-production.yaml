@@ -16,7 +16,41 @@ environment: production
 # Four replicas across the node group's availability zones. Enough that
 # `minAvailable: 3` still permits one node to drain at a time during a cluster
 # upgrade — see the PDB note below.
+#
+# With the HPA enabled this is not what the cluster runs; it is what the cluster
+# would run if the HPA were turned off, and `npm run audit:helm` keeps it inside
+# the range below so that turning it off is not also a capacity change.
 replicaCount: 4
+
+# Derived in docs/autoscaling.md §3, which shows the arithmetic and is explicit
+# about which inputs have been measured and which have not. `k8s/load-test` is
+# the ramp that produces those inputs for a service that is not the reference
+# one.
+#
+#   minReplicas 4  — the PDB's `minAvailable: 3` needs a floor of at least 4 to
+#                    permit one voluntary disruption, and four pods over three
+#                    AZs survives losing one.
+#   maxReplicas 20 — 20 × 500m = 10 vCPU of requests. The production node group
+#                    tops out at 9 × m6i.large ≈ 17.4 vCPU allocatable, so the
+#                    ceiling is reachable with room for system pods. It is also
+#                    ~4× the reference profile's peak, which is the point: a
+#                    ceiling the fleet can actually reach is a ceiling, and one
+#                    it cannot is a queue of Pending pods. Raising it means
+#                    raising the node group's `maxSize` in bin/app.ts too.
+autoscaling:
+  minReplicas: 4
+  maxReplicas: 20
+  targetCPUUtilizationPercentage: 60
+  behavior:
+    # Maps merge deeply, so `selectPolicy` and the 25%/60s policy come from the
+    # chart defaults; only the window changes here.
+    scaleDown:
+      # Ten minutes rather than the chart's five. Production traffic has a
+      # daily shape with troughs longer than five minutes and spikes shorter
+      # than it, so the longer window removes capacity on the shape and not on
+      # the spikes. The cost is paying for pods for an extra five minutes after
+      # a peak, which is the cheaper of the two mistakes.
+      stabilizationWindowSeconds: 600
 
 image:
   repository: 123456789012.dkr.ecr.us-east-1.amazonaws.com/production-app

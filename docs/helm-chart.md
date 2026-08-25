@@ -2,8 +2,9 @@
 
 `k8s/charts/app` is the application delivery path the EKS cluster did not have.
 It installs a stateless HTTP service — Deployment, Service, ServiceAccount wired
-for IRSA, a configuration ConfigMap, and a PodDisruptionBudget — and every value
-it accepts is constrained by `values.schema.json`.
+for IRSA, a configuration ConfigMap, a PodDisruptionBudget and a
+HorizontalPodAutoscaler — and every value it accepts is constrained by
+`values.schema.json`.
 
 ```
 k8s/charts/app/
@@ -57,15 +58,28 @@ VPC — a bastion, a VPN, or a CI job in a self-hosted runner — not from a lap
 | `Service` | ClusterIP, `targetPort` referenced by name |
 | `ServiceAccount` | Where the IRSA `eks.amazonaws.com/role-arn` annotation goes |
 | `ConfigMap` | `config` values as environment variables, hashed into the pod template |
-| `PodDisruptionBudget` | `minAvailable` as a count, checked against `replicaCount` |
+| `PodDisruptionBudget` | `minAvailable` as a count, checked against the fleet's floor |
+| `HorizontalPodAutoscaler` | `autoscaling/v2`, CPU against the request, with an explicit `behavior` |
 
-Not here, and each its own Phase 8 item: the HPA and Cluster Autoscaler
-thresholds, the pod security context (non-root, read-only rootfs, dropped
-capabilities, seccomp), the default-deny NetworkPolicy, the ArgoCD app-of-apps,
-and the Ingress with cert-manager. The chart is the delivery path; hardening it
-and automating its rollout come next. **Until the pod security item lands, the
-rendered pods run with the cluster's defaults** — that is a real gap, not an
-omission from the docs.
+Not here, and each its own Phase 8 item: the pod security context (non-root,
+read-only rootfs, dropped capabilities, seccomp), the default-deny NetworkPolicy,
+the ArgoCD app-of-apps, and the Ingress with cert-manager. The chart is the
+delivery path; hardening it and automating its rollout come next. **Until the pod
+security item lands, the rendered pods run with the cluster's defaults** — that
+is a real gap, not an omission from the docs.
+
+The HPA and the Cluster Autoscaler in `EksStack` are two halves of one thing and
+are documented together in [docs/autoscaling.md](./autoscaling.md), including
+where every threshold comes from. Two consequences land in this chart and are
+worth knowing before reading the templates:
+
+- **With the HPA enabled the Deployment renders no `replicas` field.** If it
+  did, every `helm upgrade` would reset the replica count and the HPA would
+  climb back — a capacity dip on every deploy. The cost is that a first install
+  starts at one pod until the HPA's next sync.
+- **`replicaCount` stops reaching the cluster** but stays required, and
+  `audit:helm` keeps it inside `[minReplicas, maxReplicas]` so that turning
+  autoscaling off changes the mechanism and not the capacity.
 
 Two decisions inside the chart are worth knowing about because they look like
 oversights:
@@ -91,6 +105,8 @@ under `resources` from the defaults.
 |  | staging | production |
 |---|---|---|
 | `replicaCount` | 2 | 4 |
+| `autoscaling.minReplicas` / `maxReplicas` | 2 / 4 | 4 / 20 |
+| `autoscaling.behavior.scaleDown` window | 300s (default) | 600s |
 | `resources.requests` | 50m / 128Mi | 500m / 1Gi |
 | `config.LOG_LEVEL` | `debug` | `info` |
 | `podDisruptionBudget.minAvailable` | 1 | 3 |
@@ -150,7 +166,18 @@ The rules the schema carries that are policy rather than typing:
 - **`resources` is required**, with `requests.cpu`, `requests.memory` and
   `limits.memory`. A container with no requests is scheduled BestEffort and is
   the first thing evicted under node pressure; one with no memory limit can take
-  every other pod on its node down with it.
+  every other pod on its node down with it. `requests.cpu` is also the
+  denominator of the HPA's percentage: without it the HPA reports `<unknown>`
+  and scales nothing, silently and only under the load meant to trigger it.
+- **`autoscaling.minReplicas` may not be 0.** Scaling to zero needs the
+  `HPAScaleToZero` feature gate, which EKS does not enable, so the manifest is
+  rejected by the API server — after the Deployment in the same release has
+  already been updated.
+- **A scale-down `stabilizationWindowSeconds` below 60 is refused.** Zero is
+  legal Kubernetes and it flaps: the HPA removes pods on the first low sample
+  and adds them back on the next, which turns ordinary traffic noise into a
+  rollout. The floor is deliberately below Kubernetes' own default of 300, so a
+  service with genuinely short troughs can opt into a faster one.
 - **`config` values must be strings.** ConfigMap data is string-valued, so an
   unquoted `PORT: 8080` is rejected by the API server at apply time — after the
   release has started. Here it is rejected at lint time.
@@ -162,12 +189,19 @@ The rules the schema carries that are policy rather than typing:
 JSON Schema cannot compare two properties, so these are in
 `aws/cdk/tools/audit-helm-values.ts` instead:
 
-- `podDisruptionBudget.minAvailable` must stay below `replicaCount`. A budget
-  equal to the replica count permits no voluntary disruption at all: `kubectl
-  drain` blocks forever, and every node rotation and cluster upgrade stalls on
-  it. It is a PDB that protects the service from the platform by stopping the
-  platform.
-- Production may not run a single replica.
+- `podDisruptionBudget.minAvailable` must stay below the fleet's **floor** —
+  `autoscaling.minReplicas` when the HPA is on, `replicaCount` when it is not. A
+  budget equal to the floor permits no voluntary disruption at all: `kubectl
+  drain` blocks forever, and every node rotation, cluster upgrade and Cluster
+  Autoscaler scale-down stalls on it. It is a PDB that protects the service from
+  the platform by stopping the platform. Checking against `replicaCount` while
+  an HPA is running would miss it entirely: `minAvailable: 4` looks generous
+  against eight replicas and blocks every drain once the fleet settles to four.
+- Production may not run a single replica, floor included.
+- `autoscaling.maxReplicas` must be above `minReplicas`. Equal is accepted by
+  Kubernetes and reports itself healthy while pinning the fleet at one size.
+- `replicaCount` must sit inside the HPA's range. It reaches nothing while
+  autoscaling is on and becomes the fleet size the moment it is turned off.
 - `values-production.yaml` must declare `environment: production`. A file that
   leaves it to the default deploys production pods labelled `staging`, and the
   label is what an incident responder reads.
@@ -200,7 +234,7 @@ an `additionalProperties: false` is dropped to let one key through, and the
 schema goes on passing every valid file while catching nothing. A passing gate
 and a gate with nothing left to catch look identical.
 
-`k8s/charts/app/schema-fixtures/` is what tells them apart — five values files
+`k8s/charts/app/schema-fixtures/` is what tells them apart — seven values files
 that must each be **rejected**, checked against the specific keyword that should
 catch each one:
 
@@ -211,6 +245,8 @@ catch each one:
 | `mutable-image-tag.yaml` | `not` |
 | `non-string-config-value.yaml` | `type` |
 | `nullified-required-key.yaml` | `required` |
+| `zero-min-replicas.yaml` | `minimum` |
+| `flapping-scale-down.yaml` | `minimum`, in the `allOf` branch over `hpaScalingRules` |
 
 `aws/cdk/test/audit-helm-values.test.ts` asserts the ajv side; the shell script
 asserts Helm's. Checked against the failure it names: removing the root

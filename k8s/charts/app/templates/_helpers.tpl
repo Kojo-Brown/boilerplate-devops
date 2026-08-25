@@ -104,3 +104,42 @@ successThreshold: {{ .successThreshold }}
 {{- define "app.configMapName" -}}
 {{- printf "%s-config" (include "app.fullname" .) | trunc 63 | trimSuffix "-" }}
 {{- end }}
+
+{{/*
+One direction of an HPA's `behavior`, rendered from one entry of
+`.Values.autoscaling.behavior`. Called with that entry as its context.
+
+The values file names the two policy kinds as `percent` and `pods` rather than
+supplying the API's list of `{type, value, periodSeconds}` objects, for the same
+reason every other list in this chart is a map: Helm replaces arrays wholesale
+instead of merging them, so an environment file that wanted to change the
+scale-down period would have to restate every policy — and the one it forgot
+would disappear silently.
+
+`with` is safe on both: a policy is a non-empty map or it is absent, and the
+schema requires at least one of the two, so `policies` is never rendered empty.
+An empty `policies` list is not the same as no `policies` key — the API server
+rejects it, which is a better failure than the one below, but only at apply
+time.
+
+`stabilizationWindowSeconds: 0` must render, so it is emitted unconditionally
+rather than through `with`: `with 0` is false in Go templates, and an absent
+window is not zero — it falls back to the API default, which for scale-down is
+300 seconds. That is the difference between "scale up immediately" and "wait
+five minutes", written identically.
+*/}}
+{{- define "app.hpaScalingRules" -}}
+stabilizationWindowSeconds: {{ .stabilizationWindowSeconds }}
+selectPolicy: {{ .selectPolicy }}
+policies:
+{{- with .percent }}
+  - type: Percent
+    value: {{ .value }}
+    periodSeconds: {{ .periodSeconds }}
+{{- end }}
+{{- with .pods }}
+  - type: Pods
+    value: {{ .value }}
+    periodSeconds: {{ .periodSeconds }}
+{{- end }}
+{{- end }}
