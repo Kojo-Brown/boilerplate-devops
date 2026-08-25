@@ -1,0 +1,7 @@
+# `minReplicas: 0` is only legal with the HPAScaleToZero feature gate, which EKS
+# does not enable. Without the `minimum: 1` it renders an HPA the API server
+# rejects at apply time — after the Deployment in the same release has already
+# been updated.
+environment: staging
+autoscaling:
+  minReplicas: 0

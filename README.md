@@ -277,13 +277,21 @@ refuses `0.0.0.0/0` at synth time. Cluster administrators are granted through
 EKS access entries declared in `bin/app.ts`, not by hand-editing `aws-auth`
 after the fact.
 
+The Cluster Autoscaler runs in `kube-system`, discovering the managed node
+groups by the ASG tags EKS applies to them and growing them when a pod cannot be
+scheduled. Its IRSA role splits in two: reads on `*`, because none of those
+actions supports a resource ARN, and the two mutating actions scoped to Auto
+Scaling group ARNs and conditioned on this cluster's ownership tag — without
+that condition the role could resize every ASG in the account.
+
 See [docs/eks.md](./docs/eks.md) for the IRSA trust policy, the
 version/kubectl-layer pairing, the subnet tags the load-balancer controller
 needs, and what is deliberately left to later Phase 8 items.
 
 `k8s/charts/app` is what gets deployed onto it: a Deployment, Service,
-ServiceAccount annotated for IRSA, ConfigMap and PodDisruptionBudget, installed
-with `values-staging.yaml` or `values-production.yaml`.
+ServiceAccount annotated for IRSA, ConfigMap, PodDisruptionBudget and
+HorizontalPodAutoscaler, installed with `values-staging.yaml` or
+`values-production.yaml`.
 
 Every value is constrained by `values.schema.json`, and the point of that is not
 documentation — it is that `replicas: 3`, which is the Deployment field and not
@@ -291,12 +299,21 @@ the chart's, fails the release instead of installing the default replica count
 and reporting success. Two gates keep the schema honest: `npm run audit:helm`
 validates every environment's merged values, walks the schema for objects that
 have drifted open, and checks the rules JSON Schema cannot express
-(`minAvailable` below `replicaCount`, a values file whose `environment`
+(`minAvailable` below the fleet's floor, a values file whose `environment`
 disagrees with its own filename); the `Helm chart` job runs `helm lint --strict`
 and `helm template` per environment, because the validator that decides whether
 a real upgrade succeeds is Helm's own and not ajv's. `schema-fixtures/` holds
-five values files that must each be rejected, so a schema that has stopped
+seven values files that must each be rejected, so a schema that has stopped
 catching anything fails rather than passing quietly.
+
+Scaling is two loops, and they only work together. The chart's HPA moves pods
+against CPU as a fraction of the request and reacts in about ninety seconds; the
+Cluster Autoscaler moves nodes and takes two to four minutes. An HPA whose
+`maxReplicas` exceeds what the node group can hold does not fail — it produces
+Pending pods and a dashboard that says the autoscaler is working — so
+[docs/autoscaling.md](./docs/autoscaling.md) does that arithmetic explicitly, for
+both environments, along with where every threshold comes from and what has not
+been measured.
 
 See [docs/helm-chart.md](./docs/helm-chart.md) for the deploy commands, the
 per-environment differences, the `null`-deletes-the-default trap, and how to add

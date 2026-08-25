@@ -24,7 +24,82 @@ environment: staging
 nameOverride: ""
 fullnameOverride: ""
 
+# Desired pods when `autoscaling.enabled` is false.
+#
+# When the HPA is enabled the Deployment is rendered *without* a `replicas`
+# field, so this value stops reaching the cluster — see the comment on
+# `autoscaling` below. It is still required, and `npm run audit:helm` requires it
+# to sit inside the HPA's range, so that turning autoscaling off is a change of
+# mechanism and not a silent change of capacity.
 replicaCount: 2
+
+# Horizontal Pod Autoscaler.
+#
+# The HPA scales pods; the Cluster Autoscaler scales the nodes underneath them
+# (`EksStack`, docs/eks.md §7). They are two loops with different periods —
+# roughly 90 seconds to a serving pod versus two to four minutes to a serving
+# node — and docs/autoscaling.md derives every number below, states the four
+# inputs each one falls out of, and says plainly which of those have been
+# measured and which have not.
+#
+# Two things about enabling this are not obvious and both bite in production:
+#
+#   • The Deployment stops declaring `replicas`. If it kept declaring one, every
+#     `helm upgrade` would reset the replica count to `replicaCount` and the HPA
+#     would scale back up afterwards — a capacity dip on every deploy, worst at
+#     exactly the busy moments when the fleet is far above its floor.
+#   • Because the field is absent, the *first* install creates the Deployment
+#     with the Kubernetes default of one replica, and the HPA raises it to
+#     `minReplicas` within a sync period (15s). Upgrades are unaffected: the
+#     field is absent, so the running count is left alone.
+autoscaling:
+  enabled: true
+  # The floor. This is what the PodDisruptionBudget is checked against when
+  # autoscaling is on, not `replicaCount` — a drain that arrives while the HPA
+  # sits at its floor is the drain that has the least room to succeed.
+  minReplicas: 2
+  # The ceiling, and the number that has to fit the node group. `maxReplicas ×
+  # resources.requests.cpu` above what the Cluster Autoscaler's maximum node
+  # count can supply does not fail — it leaves Pending pods that never schedule
+  # and an HPA that reports success. See docs/autoscaling.md §3.
+  maxReplicas: 6
+  # A percentage of the CPU *request*, not of the limit and not of the node.
+  # Above the reference profile's knee (~85% of request) latency degrades
+  # sharply, and the gap between the target and the knee is the headroom that
+  # covers the ~90s it takes a scale-up to start serving.
+  targetCPUUtilizationPercentage: 60
+  # Memory scaling is off by default and is usually wrong for this shape of
+  # service: `requests.memory` equals `limits.memory` here, so a runtime that
+  # holds freed pages (a JVM heap, a Go heap between releases) sits near its
+  # target permanently — the HPA then scales up and never scales back down.
+  # Set it only for a service whose memory tracks concurrency.
+  # targetMemoryUtilizationPercentage: 75
+  behavior:
+    # Up fast: no stabilization window, and whichever of the two policies moves
+    # more. Doubling every 30 seconds takes the fleet from its floor to its
+    # ceiling in about a minute and a half, which is the same order as the
+    # HPA's own reaction time — making it slower would not help, and making it
+    # faster only queues pods the nodes cannot yet hold.
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      selectPolicy: Max
+      percent:
+        value: 100
+        periodSeconds: 30
+      pods:
+        value: 4
+        periodSeconds: 30
+    # Down slowly. `stabilizationWindowSeconds` is the window the HPA takes the
+    # *highest* recommendation from, so five minutes means a trough has to last
+    # five minutes before it removes anything — and removing at most a quarter
+    # of the fleet per minute means a scale-down that turns out to be wrong is
+    # undone by one scale-up period.
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      selectPolicy: Max
+      percent:
+        value: 25
+        periodSeconds: 60
 
 image:
   # ECR repositories created by `EcrStack-Staging` / `EcrStack-Production`. The
@@ -136,6 +211,10 @@ podLabels: {}
 # upgrade, a Cluster Autoscaler scale-down — wait for a replacement pod instead
 # of taking the last healthy replica. `minAvailable` is expressed as a count
 # rather than a percentage so its meaning does not change when replicaCount does.
+#
+# It has to stay below the *floor* of the fleet, which is `autoscaling.minReplicas`
+# when the HPA is on and `replicaCount` when it is not. A budget that only holds
+# at the fleet's busy-hour size is a budget that blocks every drain at 4am.
 podDisruptionBudget:
   enabled: true
   minAvailable: 1

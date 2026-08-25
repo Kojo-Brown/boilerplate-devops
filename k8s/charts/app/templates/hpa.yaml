@@ -1,0 +1,53 @@
+{{- if .Values.autoscaling.enabled -}}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "app.fullname" . }}
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+spec:
+  {{- /*
+    `autoscaling/v2` rather than `v2beta2`: v2 is GA from 1.23 and is the only
+    version that carries `behavior`, which is where every number that decides
+    whether this autoscaler is safe actually lives. The chart's `kubeVersion`
+    floor is 1.28, so there is no cluster it installs on that lacks it.
+
+    `scaleTargetRef` names the Deployment by the same helper the Deployment uses
+    for its own name — an HPA pointing at a name that does not exist does not
+    fail. It reports `FailedGetScale` in its status and scales nothing, and the
+    Deployment goes on running whatever it was left at.
+  */}}
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "app.fullname" . }}
+  minReplicas: {{ .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+  metrics:
+    {{- /*
+      `Utilization` is a percentage of the container's *request*, so this metric
+      only exists because `resources.requests.cpu` is required by the schema. A
+      container with no CPU request makes the HPA report `<unknown>` for the
+      current utilization and scale nothing at all — silently, and only under
+      the load that was supposed to trigger it.
+    */}}
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage }}
+    {{- with .Values.autoscaling.targetMemoryUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ . }}
+    {{- end }}
+  behavior:
+    scaleUp:
+      {{- include "app.hpaScalingRules" .Values.autoscaling.behavior.scaleUp | nindent 6 }}
+    scaleDown:
+      {{- include "app.hpaScalingRules" .Values.autoscaling.behavior.scaleDown | nindent 6 }}
+{{- end }}

@@ -1,0 +1,8 @@
+# A scale-down with no stabilization window acts on the first low sample, so
+# ordinary traffic noise removes pods that the next sample asks for again. The
+# API server accepts it; the chart does not.
+environment: staging
+autoscaling:
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 0

@@ -200,14 +200,53 @@ for environment variables CDK writes itself).
 
 ---
 
-## 7. What this stack does not do
+## 7. Cluster Autoscaler
+
+Installed by default, from the upstream Helm chart, into `kube-system`. It grows
+and shrinks the managed node groups' Auto Scaling groups in response to pods
+that cannot be scheduled — the other half of the chart's HPA, which can ask for
+pods but cannot create anywhere to put them.
+
+Three things about it are specific to this stack:
+
+- **Discovery is by ASG tag**, not by name. EKS creates the ASG behind a managed
+  node group, so no name exists at synth time; `k8s.io/cluster-autoscaler/enabled`
+  and `k8s.io/cluster-autoscaler/<cluster>` are applied by EKS itself, so nothing
+  here tags anything. A self-managed ASG added later needs both tags by hand.
+- **The bounds are the node group's**, `minSize` and `maxSize` on
+  `addManagedNodeGroup`. No autoscaler flag can move a group outside them, which
+  makes `maxSize` the real ceiling an HPA's `maxReplicas` has to fit inside.
+- **The chart version is pinned to the cluster version.** The autoscaler reads
+  scheduler internals to decide whether a pending pod would fit a hypothetical
+  node, so its release is not skew tolerant: chart `9.51.0` ships autoscaler
+  `v1.33.0` for the 1.33 control plane §4 creates. Overriding `kubernetesVersion`
+  means overriding `clusterAutoscaler.chartVersion` too, the same way
+  `kubectlLayer` has to move with it.
+
+The IRSA role splits into a read-only statement on `*` — those actions support
+no resource-level permissions — and a mutating statement scoped to Auto Scaling
+group ARNs and conditioned on this cluster's ownership tag. Without that
+condition the role could resize every ASG in the account.
+
+Set `clusterAutoscaler: { enabled: false }` to leave it out; the thresholds and
+the reasoning behind each one are in
+[docs/autoscaling.md](./autoscaling.md) §4.
+
+---
+
+## 8. What this stack does not do
 
 Later Phase 8 items, deliberately out of scope here:
 
-- No Helm chart, no HPA or Cluster Autoscaler, no NetworkPolicy, no ArgoCD, no
-  ingress controller. The cluster has capacity and identity; it has no
-  application delivery path yet.
+- No NetworkPolicy, no ArgoCD, no ingress controller. The cluster has capacity,
+  identity, node scaling and an application chart; it has no policy boundary and
+  no automated rollout path.
+- **No metrics-server**, which the chart's HPA reads and EKS does not ship as a
+  managed add-on. Without it the HPA reports `<unknown>` and scales nothing.
 - No pod security defaults are enforced cluster-wide. The node hardening above
   is the host side; Pod Security Standards are their own item.
+- One node group, shared by system and application workloads. That is why the
+  autoscaler leaves a couple of nodes above the group's minimum pinned — see
+  [docs/autoscaling.md](./autoscaling.md) §4.
 - `enableSsmAccess` is off, so nodes carry no `AmazonSSMManagedInstanceCore`.
   Turn it on if you need a Session Manager shell on a node.

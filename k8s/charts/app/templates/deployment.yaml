@@ -5,7 +5,25 @@ metadata:
   labels:
     {{- include "app.labels" . | nindent 4 }}
 spec:
+  {{- /*
+    Omitted entirely when the HPA is enabled, rather than set to `replicaCount`
+    or to `minReplicas`.
+
+    `replicas` is not a field Helm leaves alone: it is part of the manifest, so
+    every `helm upgrade` writes whatever the template renders. With an HPA also
+    writing it, the two fight — the upgrade resets the fleet to the rendered
+    number and the HPA spends the next few minutes climbing back. The dip is
+    largest exactly when the fleet is largest, which is when a deploy can least
+    afford it.
+
+    Leaving the field out means the Deployment's replica count is owned by one
+    controller. The cost is that the *first* install creates it at the
+    Kubernetes default of one pod until the HPA's first sync; see the comment on
+    `autoscaling` in values.yaml.
+  */}}
+  {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
+  {{- end }}
   strategy:
     type: RollingUpdate
     rollingUpdate:

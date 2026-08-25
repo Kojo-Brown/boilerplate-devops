@@ -16,6 +16,18 @@ environment: staging
 # crash is not an outage. Staging carries no traffic worth scaling for.
 replicaCount: 2
 
+# The HPA is on in staging for one reason: an autoscaler that is only ever
+# exercised in production is one whose thresholds nobody has watched behave.
+# The ceiling is deliberately low — 4 pods at 50m is a fifth of one t3.large,
+# so a runaway scale-up in staging cannot consume the node group.
+autoscaling:
+  minReplicas: 2
+  maxReplicas: 4
+  # Same target as production, so a load test here measures the same control
+  # loop. What differs is what sits behind it: 50m of CPU request per pod
+  # rather than 500m, so 60% of the request is a tenth of the traffic.
+  targetCPUUtilizationPercentage: 60
+
 image:
   repository: 123456789012.dkr.ecr.us-east-1.amazonaws.com/staging-app
   # Overwritten per deploy with the commit SHA. The literal here is what a

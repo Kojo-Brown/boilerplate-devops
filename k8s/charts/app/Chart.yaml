@@ -2,9 +2,9 @@ apiVersion: v2
 name: app
 description: >-
   A stateless HTTP service on EKS: Deployment, Service, ServiceAccount wired for
-  IRSA, a configuration ConfigMap, and a PodDisruptionBudget. Every value is
-  constrained by values.schema.json, and every environment supplies its own
-  values file.
+  IRSA, a configuration ConfigMap, a PodDisruptionBudget, and a
+  HorizontalPodAutoscaler. Every value is constrained by values.schema.json, and
+  every environment supplies its own values file.
 type: application
 
 # `version` is the chart's own version and `appVersion` is the default version
@@ -13,11 +13,12 @@ type: application
 # application is the reverse. Chart consumers pin `version`; `image.tag` — not
 # `appVersion` — is what actually selects the image, because appVersion is
 # chart metadata and cannot be set per environment.
-version: 0.1.0
+version: 0.2.0
 appVersion: "0.1.0"
 
 # The floor is a real constraint, not a formality:
 #   • policy/v1 PodDisruptionBudget    1.21
+#   • autoscaling/v2 HPA, `behavior`   1.23
 #   • `minDomains` on spread, PDB      1.25+ semantics
 #   • EKS supports 1.28 and later on the standard support calendar
 # `-0` makes the constraint match pre-release versions of 1.28 too, which is

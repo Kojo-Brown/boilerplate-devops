@@ -7,7 +7,13 @@ import * as kms from 'aws-cdk-lib/aws-kms';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import { EksStack, EksStackProps } from '../lib/eks-stack';
 import { VpcStack } from '../lib/vpc-stack';
-import { flattenIntrinsic, managedPolicyArns, outputByExportName, resourceProps } from './support/cfn';
+import {
+  TOKEN,
+  flattenIntrinsic,
+  managedPolicyArns,
+  outputByExportName,
+  resourceProps,
+} from './support/cfn';
 
 const ENV = { account: '123456789012', region: 'us-east-1' };
 
@@ -41,6 +47,47 @@ const nodegroupByName = (template: Template, nodegroupName: string): Record<stri
   ) ??
   (() => {
     throw new Error(`no node group named "${nodegroupName}"`);
+  })();
+
+const helmChartByRelease = (template: Template, release: string): Record<string, any> =>
+  resourceProps(template, 'Custom::AWSCDK-EKS-HelmChart').find(
+    (chart) => chart.Release === release,
+  ) ??
+  (() => {
+    throw new Error(`no Helm chart released as "${release}"`);
+  })();
+
+/**
+ * A Helm release's values, as one JSON string.
+ *
+ * CDK serialises the values map to JSON and then splices the deploy-time tokens
+ * back in, so the template holds an `Fn::Join` of JSON fragments rather than a
+ * structure. Flattening it produces the JSON a reader would expect, with each
+ * unresolved token replaced by a placeholder — which is why the assertions below
+ * match on fragments such as `"name":"cluster-autoscaler"` and not on parsed
+ * objects.
+ */
+const helmValues = (template: Template, release: string): string =>
+  flattenIntrinsic(helmChartByRelease(template, release).Values);
+
+/** The inline policy carrying the Cluster Autoscaler's statements. */
+const clusterAutoscalerPolicy = (template: Template): Record<string, any>[] =>
+  resourceProps(template, 'AWS::IAM::Policy')
+    .map((policy) => (policy.PolicyDocument as any).Statement as Record<string, any>[])
+    .find((statements) =>
+      statements.some((statement) => statement.Sid === 'DiscoverScalableCapacity'),
+    ) ??
+  (() => {
+    throw new Error('no IAM policy carrying the Cluster Autoscaler statements');
+  })();
+
+const statementBySid = (
+  statements: Record<string, any>[],
+  sid: string,
+): Record<string, any> =>
+  statements.find((statement) => statement.Sid === sid) ??
+  (() => {
+    throw new Error(`no statement with Sid "${sid}"`);
   })();
 
 /**
@@ -546,6 +593,147 @@ describe('EksStack', () => {
     });
   });
 
+  describe('Cluster Autoscaler', () => {
+    it('installs the upstream chart, pinned, into kube-system', () => {
+      const { template } = makeStack();
+      const chart = helmChartByRelease(template, 'cluster-autoscaler');
+
+      expect(chart.Chart).toBe('cluster-autoscaler');
+      expect(chart.Repository).toBe('https://kubernetes.github.io/autoscaler');
+      expect(chart.Namespace).toBe('kube-system');
+      // The chart version selects the autoscaler release, which is not skew
+      // tolerant against the control plane. An unpinned chart would drift off
+      // the cluster's Kubernetes version on the next deploy.
+      expect(chart.Version).toBe('9.51.0');
+      // Without `Wait`, a chart that installs but never becomes ready is a
+      // green deploy with no autoscaler running.
+      expect(chart.Wait).toBe(true);
+    });
+
+    it('discovers node groups by this cluster’s tag rather than by name', () => {
+      const { template } = makeStack();
+      const values = helmValues(template, 'cluster-autoscaler');
+
+      // EKS, not CloudFormation, creates the ASG behind a managed node group,
+      // so its name does not exist at synth time and auto-discovery is the
+      // only option that works.
+      expect(values).toContain('"autoDiscovery":{"clusterName":"');
+      expect(values).not.toContain('autoscalingGroups');
+    });
+
+    it('runs under the service account its IRSA role trusts', () => {
+      const { template } = makeStack();
+      const values = helmValues(template, 'cluster-autoscaler');
+      const conditions = resourceProps(template, 'Custom::AWSCDKCfnJson').map((json) =>
+        flattenIntrinsic(json.Value),
+      );
+
+      // Both halves of IRSA, which nothing in Kubernetes reconciles: the trust
+      // policy names the service account, the annotation names the role, and a
+      // disagreement fails at the first AWS call rather than at deploy time.
+      expect(values).toContain('"name":"cluster-autoscaler"');
+      expect(values).toContain('"eks.amazonaws.com/role-arn"');
+      expect(conditions).toContainEqual(
+        expect.stringContaining('system:serviceaccount:kube-system:cluster-autoscaler'),
+      );
+    });
+
+    it('scopes every mutating action to groups tagged as owned by this cluster', () => {
+      const { template } = makeStack();
+      const scaling = statementBySid(clusterAutoscalerPolicy(template), 'ScaleTaggedNodeGroups');
+
+      expect(scaling.Action).toEqual([
+        'autoscaling:SetDesiredCapacity',
+        'autoscaling:TerminateInstanceInAutoScalingGroup',
+      ]);
+      // The partition is a token, not `aws`: this template has to synthesize
+      // the same way in GovCloud and China, where the literal would be wrong.
+      expect(flattenIntrinsic(scaling.Resource)).toBe(
+        `arn:${TOKEN}:autoscaling:us-east-1:123456789012:autoScalingGroup:*:autoScalingGroupName/*`,
+      );
+      // The resource pattern cannot name a group, so the condition is what
+      // stops this role resizing another cluster's node groups. It is built
+      // through CfnJson because the cluster name — and so the condition key —
+      // only exists once the cluster does.
+      expect(Object.keys(scaling.Condition)).toEqual(['StringEquals']);
+      expect(
+        resourceProps(template, 'Custom::AWSCDKCfnJson').map((json) => flattenIntrinsic(json.Value)),
+      ).toContainEqual(expect.stringContaining('aws:ResourceTag/k8s.io/cluster-autoscaler/'));
+    });
+
+    it('grants nothing but reads on the unscoped statement', () => {
+      const { template } = makeStack();
+      const discovery = statementBySid(
+        clusterAutoscalerPolicy(template),
+        'DiscoverScalableCapacity',
+      );
+
+      // The wildcard is unavoidable — these actions do not support
+      // resource-level permissions — so what keeps it safe is that every action
+      // in it is a read. This is the assertion that fails if someone adds a
+      // write to the convenient statement.
+      expect(discovery.Resource).toBe('*');
+      for (const action of discovery.Action as string[]) {
+        expect(action).toMatch(/:(Describe|Get|List)[A-Za-z]+$/);
+      }
+    });
+
+    it('renders every threshold as a Go duration the autoscaler can parse', () => {
+      const { template } = makeStack();
+      const values = helmValues(template, 'cluster-autoscaler');
+
+      // A bare number is nanoseconds to Go's duration parser, and CDK's own ISO
+      // string is not a duration it accepts at all.
+      expect(values).toContain('"scale-down-unneeded-time":"600s"');
+      expect(values).toContain('"scale-down-delay-after-add":"600s"');
+      expect(values).toContain('"max-node-provision-time":"900s"');
+      expect(values).toContain('"scale-down-utilization-threshold":0.5');
+      expect(values).toContain('"expander":"least-waste"');
+    });
+
+    it('takes overridden thresholds', () => {
+      const { template } = makeStack({
+        clusterAutoscaler: {
+          expander: 'most-pods',
+          scaleDownUnneededTime: cdk.Duration.minutes(30),
+          scaleDownUtilizationThreshold: 0.7,
+        },
+      });
+      const values = helmValues(template, 'cluster-autoscaler');
+
+      expect(values).toContain('"scale-down-unneeded-time":"1800s"');
+      expect(values).toContain('"scale-down-utilization-threshold":0.7');
+      expect(values).toContain('"expander":"most-pods"');
+    });
+
+    it('keeps itself out of its own scale-down decisions', () => {
+      const { template } = makeStack();
+      const values = helmValues(template, 'cluster-autoscaler');
+
+      // Draining a node it has decided to remove would otherwise be able to
+      // evict the pod holding the decision.
+      expect(values).toContain('"cluster-autoscaler.kubernetes.io/safe-to-evict":"false"');
+      expect(values).toContain('"priorityClassName":"system-cluster-critical"');
+    });
+
+    it('waits for the node group, since a Deployment needs somewhere to land', () => {
+      const { template } = makeStack();
+      const [logicalId] = Object.keys(template.findResources('Custom::AWSCDK-EKS-HelmChart'));
+      const nodegroupId = Object.keys(template.findResources('AWS::EKS::Nodegroup'))[0];
+      const chart = template.findResources('Custom::AWSCDK-EKS-HelmChart')[logicalId];
+
+      expect((chart.DependsOn ?? []) as string[]).toContain(nodegroupId);
+    });
+
+    it('can be left out entirely', () => {
+      const { stack, template } = makeStack({ clusterAutoscaler: { enabled: false } });
+
+      template.resourceCountIs('Custom::AWSCDK-EKS-HelmChart', 0);
+      expect(stack.clusterAutoscalerRole).toBeUndefined();
+      expect(outputByExportName(template, 'staging-eks-cluster-autoscaler-role-arn')).toBeUndefined();
+    });
+  });
+
   describe('Outputs', () => {
     it.each([
       'staging-eks-cluster-name',
@@ -555,6 +743,7 @@ describe('EksStack', () => {
       'staging-eks-oidc-issuer-url',
       'staging-eks-node-role-arn',
       'staging-eks-cluster-security-group-id',
+      'staging-eks-cluster-autoscaler-role-arn',
     ])('exports %s', (exportName) => {
       const { template } = makeStack();
       expect(outputByExportName(template, exportName)).toBeDefined();
