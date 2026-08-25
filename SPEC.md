@@ -157,7 +157,7 @@ no better signal exists in the git object graph.
 ## Phase 8 — Kubernetes Track
 - [x] EKS cluster via CDK with managed node groups and IRSA — private API endpoint, one managed node group, four EKS-managed add-ons, and an OIDC provider; the node role is thin because the CNI holds its ENI permissions through IRSA instead (PR #34)
 - [x] Helm chart with values per environment and a schema-validated `values.yaml` — `k8s/charts/app`, installed with `values-staging.yaml` or `values-production.yaml`; the schema closes every object, and two gates plus five must-fail fixtures keep it from quietly stopping to catch anything (PR #35)
-- [ ] Horizontal Pod Autoscaler + Cluster Autoscaler with load-tested thresholds
+- [x] Horizontal Pod Autoscaler + Cluster Autoscaler with load-tested thresholds — an `autoscaling/v2` HPA in the chart and the upstream Cluster Autoscaler in `EksStack`, pinned to the cluster's Kubernetes version and discovering node groups by ASG tag; the thresholds are derived rather than measured, because there is no cluster to measure against (PR #36)
 - [ ] Pod security: non-root, read-only rootfs, dropped capabilities, seccomp
 - [ ] NetworkPolicy default-deny with explicit allowlists
 - [ ] GitOps with ArgoCD: app-of-apps, sync waves, and drift detection
@@ -246,6 +246,70 @@ test, and no `deploy-helm.yml` template — the rollout path is item 6, and a
 is on `node20` at its latest major, so the runner's Node 20 deprecation warning
 now names it alongside the `actions/*@v4` pins Dependabot is already opening
 pull requests against.
+
+Item 3 complete as of PR #36 (2026-08-25). One item rather than two because
+neither half is useful alone: an HPA with no room underneath it turns a spike
+into Pending pods and reports success, and a Cluster Autoscaler under a fixed
+replica count adds nodes nothing schedules onto. The chart gains an
+`autoscaling/v2` HPA with an explicit `behavior` — up fast, down slowly — and
+`EksStack` gains the upstream Cluster Autoscaler, IRSA-authorised and
+discovering node groups by ASG tag.
+
+Two decisions inside the chart look like bugs and are not. The Deployment
+renders **no `replicas` field** while the HPA is on: `replicas` is part of the
+manifest, so every `helm upgrade` writes whatever the template says, and with an
+HPA also writing it the two fight — a capacity dip on every deploy, worst when
+the fleet is largest. The cost is that a first install starts at one pod until
+the HPA's next sync, which is documented rather than papered over. And the
+`behavior` policies are named keys (`percent`, `pods`) rather than the API's
+array, because Helm replaces arrays wholesale: an environment file changing one
+policy in a list would have to restate the others, and the one it forgot would
+vanish.
+
+The autoscaler discovers by ASG tag rather than by name because EKS, not
+CloudFormation, creates the ASG behind a managed node group — no name exists at
+synth time. Its chart version is pinned to the cluster's Kubernetes version
+(9.51.0 → autoscaler v1.33.0) for the same reason `kubectlLayer` is: the
+autoscaler reads scheduler internals to decide whether a pending pod would fit a
+hypothetical node, so it is not skew tolerant. The IRSA role splits into reads
+on `*` — none of those actions supports resource-level permissions, and the
+autoscaler has to see groups it does not manage to answer "would this pod fit
+anywhere" — and two mutating actions scoped to ASG ARNs under this cluster's
+ownership tag, without which the role could resize every group in the account. A
+test asserts every action in the wildcard statement is a `Describe`/`Get`/`List`,
+which is what keeps that statement safe as it grows.
+
+`audit:helm` now checks availability against the fleet's **floor** rather than
+its nominal size. `minAvailable: 4` looks generous against eight replicas and
+permits no disruption at all once the HPA settles to four — and the drain that
+matters is the one that arrives at 4am. Two new rules join it: an HPA whose
+ceiling is not above its floor (accepted by Kubernetes, reports itself healthy,
+scales nothing) and a `replicaCount` outside the HPA's range, which is inert
+while autoscaling is on and becomes the fleet size the moment it is turned off.
+
+**The spec item says "load-tested thresholds" and nothing was load tested.**
+There is no cluster in CI and none was created, so `docs/autoscaling.md` §3
+ships the arithmetic every threshold falls out of and states explicitly that its
+four inputs are the reference profile's stated characteristics, not numbers read
+off a run. `k8s/load-test/hpa-ramp.js` is the k6 ramp that produces those inputs
+— an open-model staircase with a trough long enough to observe scale-down — and
+it is a procedure, not a gate. The one arithmetic tie nobody else checks is
+worth repeating: `maxReplicas × requests.cpu` above what the node group's
+`maxSize` can supply does not fail anywhere, it just leaves Pending pods behind
+a dashboard that says the autoscaler is working.
+
+Known gaps carried into item 4: **no metrics-server**, which the HPA reads and
+EKS does not ship as a managed add-on — without it the HPA reports `<unknown>`
+and scales nothing, so this is the first thing to install before any of the
+above runs. The single node group means the autoscaler leaves a couple of nodes
+pinned above the group's minimum, because it will not drain a node running a
+kube-system Deployment; the fix is a second node group, not a flag. Item 4's pod
+security context is still the reason Checkov does not scan the rendered
+manifests. No custom or external metrics (CPU is a poor proxy for a service that
+blocks on I/O), no VPA, no Karpenter, and no pod topology spread — four replicas
+over three AZs is what the scheduler happens to do, not something the chart
+requires, and that belongs with item 4 since it is the next thing to touch the
+pod spec.
 
 ## Phase 9 — Supply-Chain Security
 - [ ] SBOM generation (CycloneDX) attached to every release artifact
