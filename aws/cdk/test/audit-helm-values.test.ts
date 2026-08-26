@@ -11,6 +11,7 @@ import {
   auditChart,
   auditChartMetadata,
   auditEnvironment,
+  auditPodSecurity,
   auditSchemaHygiene,
   coalesceValues,
   compileSchema,
@@ -431,6 +432,120 @@ describe('auditEnvironment with an HPA', () => {
   });
 });
 
+describe('auditPodSecurity', () => {
+  /**
+   * A container context the schema is happy with. Each test breaks one thing,
+   * so what a case asserts is the rule named in its title and not the shape of
+   * the fixture around it.
+   */
+  const HARDENED = {
+    containerPort: 8080,
+    securityContext: {
+      allowPrivilegeEscalation: false,
+      privileged: false,
+      readOnlyRootFilesystem: true,
+      capabilities: { drop: ['ALL'], add: [] as string[] },
+    },
+    writableVolumes: [{ name: 'tmp', mountPath: '/tmp', sizeLimit: '64Mi' }],
+  };
+
+  const security = (overrides: Record<string, unknown>): ViolationRule[] =>
+    rules(auditPodSecurity({ ...HARDENED, ...overrides }, 'k8s/charts/app/values-staging.yaml'));
+
+  const withCapabilities = (add: string[]): Record<string, unknown> => ({
+    securityContext: { ...HARDENED.securityContext, capabilities: { drop: ['ALL'], add } },
+  });
+
+  it('accepts a hardened container on an unprivileged port', () => {
+    expect(security({})).toEqual([]);
+  });
+
+  it('flags a capability granted back after dropping ALL', () => {
+    expect(security(withCapabilities(['SYS_ADMIN']))).toEqual(['capability-added-back']);
+  });
+
+  it('reports every added capability, not just the first', () => {
+    expect(security(withCapabilities(['SYS_ADMIN', 'SYS_PTRACE']))).toEqual([
+      'capability-added-back',
+      'capability-added-back',
+    ]);
+  });
+
+  it('points at the escape hatch rather than only refusing', () => {
+    const [violation] = auditPodSecurity(
+      { ...HARDENED, ...withCapabilities(['SYS_TIME']) },
+      'k8s/charts/app/values-staging.yaml',
+    );
+
+    expect(violation.message).toContain('ALLOWED_ADDED_CAPABILITIES');
+  });
+
+  it('allows NET_BIND_SERVICE for a container that actually binds a privileged port', () => {
+    expect(security({ containerPort: 80, ...withCapabilities(['NET_BIND_SERVICE']) })).toEqual([]);
+  });
+
+  it('flags a privileged port the container cannot bind', () => {
+    // Admitted, rolled out, and then EACCES on bind(). Nothing between the
+    // values file and the CrashLoopBackOff says so.
+    expect(security({ containerPort: 80 })).toEqual(['privileged-port-unbindable']);
+  });
+
+  it('treats 1024 itself as unprivileged, which is where the kernel puts it', () => {
+    expect(security({ containerPort: 1024 })).toEqual([]);
+    expect(security({ containerPort: 1023 })).toEqual(['privileged-port-unbindable']);
+  });
+
+  it('flags NET_BIND_SERVICE granted to a container that does not need it', () => {
+    expect(security(withCapabilities(['NET_BIND_SERVICE']))).toEqual(['unnecessary-capability']);
+  });
+
+  it('flags two scratch volumes mounted on one path', () => {
+    expect(
+      security({
+        writableVolumes: [
+          { name: 'tmp', mountPath: '/tmp', sizeLimit: '64Mi' },
+          { name: 'cache', mountPath: '/tmp', sizeLimit: '128Mi' },
+        ],
+      }),
+    ).toEqual(['duplicate-writable-mount']);
+  });
+
+  it('flags two scratch volumes sharing a name', () => {
+    expect(
+      security({
+        writableVolumes: [
+          { name: 'tmp', mountPath: '/tmp', sizeLimit: '64Mi' },
+          { name: 'tmp', mountPath: '/var/run', sizeLimit: '8Mi' },
+        ],
+      }),
+    ).toEqual(['duplicate-writable-mount']);
+  });
+
+  it('accepts distinct scratch volumes', () => {
+    expect(
+      security({
+        writableVolumes: [
+          { name: 'tmp', mountPath: '/tmp', sizeLimit: '64Mi' },
+          { name: 'run', mountPath: '/var/run', sizeLimit: '8Mi' },
+        ],
+      }),
+    ).toEqual([]);
+  });
+
+  it('reports nothing rather than throwing on values the schema would have rejected', () => {
+    // This runs on merged values before anything guarantees the schema passed,
+    // so every read has to survive the wrong type.
+    expect(
+      rules(
+        auditPodSecurity(
+          { containerPort: 'eighty', securityContext: 'hardened', writableVolumes: 'tmp' },
+          'k8s/charts/app/values-staging.yaml',
+        ),
+      ),
+    ).toEqual([]);
+  });
+});
+
 describe('replicaFloor', () => {
   it('reads the HPA floor when autoscaling is on', () => {
     expect(replicaFloor({ replicaCount: 8, autoscaling: { enabled: true, minReplicas: 3 } })).toEqual(
@@ -561,6 +676,17 @@ describe('the schema fixtures', () => {
     // `minimum` in that branch — not the one on the shared definition, which is
     // 0 and is correct for scale-up.
     ['flapping-scale-down.yaml', 'minimum', '/autoscaling/behavior/scaleDown/stabilizationWindowSeconds'],
+    ['privileged-container.yaml', 'const', '/securityContext/privileged'],
+    ['writable-root-filesystem.yaml', 'const', '/securityContext/readOnlyRootFilesystem'],
+    // `contains`, not `enum` on the items: dropping NET_RAW and SYS_CHROOT is a
+    // legal list of capabilities that simply is not the one that matters. What
+    // has to catch it is the requirement that ALL be among them.
+    ['capabilities-retained.yaml', 'contains', '/securityContext/capabilities/drop'],
+    // `minimum` rather than the `const: true` on runAsNonRoot: the two are
+    // contradictory but each is individually valid, and JSON Schema cannot
+    // compare them — so root is excluded at the UID instead.
+    ['root-user.yaml', 'minimum', '/podSecurityContext/runAsUser'],
+    ['unconfined-seccomp.yaml', 'enum', '/podSecurityContext/seccompProfile/type'],
   ];
 
   it.each(FIXTURES)('rejects %s with the %s keyword', (file, keyword, instancePath) => {

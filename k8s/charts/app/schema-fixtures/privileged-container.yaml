@@ -1,0 +1,7 @@
+# A privileged container has every capability and the host's devices, which
+# makes the `drop: [ALL]` above it decoration. Without the `const: false` this
+# renders a pod that is admitted anywhere the restricted Pod Security Standard
+# is not enforced, and nothing in the manifest reads as unusual.
+environment: staging
+securityContext:
+  privileged: true

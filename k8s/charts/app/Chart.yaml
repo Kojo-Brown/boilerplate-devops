@@ -13,7 +13,7 @@ type: application
 # application is the reverse. Chart consumers pin `version`; `image.tag` — not
 # `appVersion` — is what actually selects the image, because appVersion is
 # chart metadata and cannot be set per environment.
-version: 0.2.0
+version: 0.3.0
 appVersion: "0.1.0"
 
 # The floor is a real constraint, not a formality:

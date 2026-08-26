@@ -11,6 +11,8 @@
     "autoscaling",
     "image",
     "serviceAccount",
+    "podSecurityContext",
+    "securityContext",
     "containerPort",
     "service",
     "resources",
@@ -152,6 +154,87 @@
           "additionalProperties": { "type": "string" }
         },
         "automountServiceAccountToken": { "type": "boolean" }
+      }
+    },
+    "podSecurityContext": {
+      "description": "Pod-level security context: the identity every container runs as. Fields that belong to the container context (capabilities, readOnlyRootFilesystem, allowPrivilegeEscalation) are not valid here and are rejected rather than silently ignored. The constants below are the restricted Pod Security Standard's non-negotiable half — a chart that lets an environment file override them cannot be admitted to a namespace enforcing that standard. fsGroup is what owns the writableVolumes emptyDirs: without it they are root-owned, and a read-only root filesystem then leaves the container with nowhere to write at all.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runAsNonRoot", "runAsUser", "runAsGroup", "fsGroup", "seccompProfile"],
+      "properties": {
+        "runAsNonRoot": {
+          "description": "Fixed true. This is the assertion the kubelet checks before starting the container, and it is the only one that catches an image whose USER is root when the manifest forgot to say otherwise.",
+          "const": true
+        },
+        "runAsUser": { "$ref": "#/definitions/unprivilegedId" },
+        "runAsGroup": { "$ref": "#/definitions/unprivilegedId" },
+        "fsGroup": { "$ref": "#/definitions/unprivilegedId" },
+        "seccompProfile": { "$ref": "#/definitions/seccompProfile" }
+      }
+    },
+    "securityContext": {
+      "description": "Container-level security context: what the process may do once it is running. Every constraint here is a const rather than a default, because an environment file relaxing one is not tuning a setting — it is opting out of the posture the chart is built on, and it should fail to render rather than deploy.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowPrivilegeEscalation", "privileged", "readOnlyRootFilesystem", "capabilities"],
+      "properties": {
+        "allowPrivilegeEscalation": {
+          "description": "Fixed false. Blocks setuid binaries and file capabilities from raising privileges mid-process, which is the step most container escapes take after gaining code execution as an unprivileged user.",
+          "const": false
+        },
+        "privileged": {
+          "description": "Fixed false. A privileged container has the host's devices and every capability; nothing this chart deploys is an agent or a CSI driver.",
+          "const": false
+        },
+        "readOnlyRootFilesystem": {
+          "description": "Fixed true. Scratch space comes from writableVolumes instead — see the note there on why an unbounded emptyDir is refused.",
+          "const": true
+        },
+        "capabilities": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["drop"],
+          "properties": {
+            "drop": {
+              "description": "Must contain ALL. Enumerating the capabilities to drop instead means revisiting the list whenever a runtime changes its default set, and nothing announces when that happens.",
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "contains": { "const": "ALL" },
+              "items": { "$ref": "#/definitions/capability" }
+            },
+            "add": {
+              "description": "Capabilities granted back after the drop. npm run audit:helm allows NET_BIND_SERVICE and nothing else, and only when containerPort is below 1024 — a capability that is granted and unused is a capability nobody will remember was granted.",
+              "type": "array",
+              "uniqueItems": true,
+              "items": { "$ref": "#/definitions/capability" }
+            }
+          }
+        }
+      }
+    },
+    "writableVolumes": {
+      "description": "emptyDir volumes mounted read-write into the container, which is how a read-only root filesystem stays workable. Mounted at the same paths in every environment: scratch space that exists only in staging is scratch space production discovers it needs during an incident. sizeLimit is required — an emptyDir with no limit draws on the node's shared ephemeral storage, so a service that leaks temporary files evicts its neighbours before itself and the eviction names the node rather than the cause.",
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "mountPath", "sizeLimit"],
+        "properties": {
+          "name": {
+            "description": "Volume name, and a DNS label because it becomes one in the pod spec.",
+            "type": "string",
+            "maxLength": 63,
+            "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+          },
+          "mountPath": {
+            "description": "Absolute, with no trailing slash and no empty segment. Bare `/` is unrepresentable here on purpose: mounting a writable volume over the root would undo readOnlyRootFilesystem while leaving it set to true.",
+            "type": "string",
+            "pattern": "^/([A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+$"
+          },
+          "sizeLimit": { "$ref": "#/definitions/memoryQuantity" }
+        }
       }
     },
     "containerPort": {
@@ -359,6 +442,45 @@
           "maximum": 1800
         }
       }
+    },
+    "unprivilegedId": {
+      "description": "A UID or GID that is not root. 0 is excluded here rather than left to runAsNonRoot, because the two disagreeing — runAsNonRoot: true with runAsUser: 0 — is a manifest the API server accepts and the kubelet then refuses to start, so the failure lands as a CreateContainerConfigError on the cluster instead of on the person editing the values file. The ceiling is the 16-bit range: a UID above it falls outside what most base images' /etc/passwd and the default userns mapping cover, and an unmapped UID appears as `nobody`.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535
+    },
+    "capability": {
+      "description": "A Linux capability as Kubernetes names it — without the CAP_ prefix, which the runtime adds. `CAP_NET_BIND_SERVICE` here becomes `CAP_CAP_NET_BIND_SERVICE`, which no runtime grants and none reports as an error, so the prefix is rejected rather than passed through.",
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9_]*$",
+      "not": { "pattern": "^CAP_" }
+    },
+    "seccompProfile": {
+      "description": "The seccomp filter applied to every container in the pod. Absent is not neutral — it means Unconfined, which is the weakest of the three settings and the Kubernetes default, so Unconfined is not offered as a value here.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {
+        "type": { "type": "string", "enum": ["RuntimeDefault", "Localhost"] },
+        "localhostProfile": {
+          "description": "Path of a profile relative to the kubelet's seccomp root, for type: Localhost.",
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "oneOf": [
+        {
+          "description": "RuntimeDefault takes no profile path. One supplied alongside it is silently ignored by the kubelet, which reads as a custom profile being enforced when the runtime's default is.",
+          "properties": { "type": { "const": "RuntimeDefault" } },
+          "required": ["type"],
+          "not": { "required": ["localhostProfile"] }
+        },
+        {
+          "description": "Localhost without a profile path is a pod the API server rejects outright.",
+          "properties": { "type": { "const": "Localhost" } },
+          "required": ["type", "localhostProfile"]
+        }
+      ]
     },
     "cpuQuantity": {
       "description": "Kubernetes CPU quantity: cores (1, 1.5) or millicores (500m).",

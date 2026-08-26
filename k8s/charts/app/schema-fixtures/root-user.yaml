@@ -1,0 +1,7 @@
+# `runAsUser: 0` alongside `runAsNonRoot: true`. The API server accepts the
+# contradiction and the kubelet resolves it at container start, so without the
+# `minimum: 1` the failure is a CreateContainerConfigError on the cluster rather
+# than a rejected values file.
+environment: staging
+podSecurityContext:
+  runAsUser: 0

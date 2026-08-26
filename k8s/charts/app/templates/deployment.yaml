@@ -63,10 +63,22 @@ spec:
       {{- end }}
       serviceAccountName: {{ include "app.serviceAccountName" . }}
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- /*
+        Rendered unconditionally rather than through `with`. An absent
+        securityContext is not a neutral setting: it means root, no seccomp
+        filter, and containerd's default capability set — so a values file that
+        managed to empty this block would weaken the pod without changing a
+        line that says so. `values.schema.json` requires it and fixes the fields
+        that must not vary; see the note above `podSecurityContext` there.
+      */}}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
         - name: {{ .Chart.Name }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
           ports:
             - name: http
               containerPort: {{ .Values.containerPort }}
@@ -95,6 +107,27 @@ spec:
             {{- include "app.httpProbe" .Values.probes.readiness | nindent 12 }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+          {{- with .Values.writableVolumes }}
+          {{- /*
+            The mounts and the volumes are rendered from one list, so a scratch
+            path cannot be declared in one place and forgotten in the other —
+            which is a pod that starts, mounts nothing, and fails on the first
+            write, at the layer that looks correct in `kubectl get pod`.
+          */}}
+          volumeMounts:
+            {{- range . }}
+            - name: {{ .name }}
+              mountPath: {{ .mountPath | quote }}
+            {{- end }}
+          {{- end }}
+      {{- with .Values.writableVolumes }}
+      volumes:
+        {{- range . }}
+        - name: {{ .name }}
+          emptyDir:
+            sizeLimit: {{ .sizeLimit | quote }}
+        {{- end }}
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

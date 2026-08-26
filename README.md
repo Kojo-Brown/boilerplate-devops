@@ -303,8 +303,20 @@ have drifted open, and checks the rules JSON Schema cannot express
 disagrees with its own filename); the `Helm chart` job runs `helm lint --strict`
 and `helm template` per environment, because the validator that decides whether
 a real upgrade succeeds is Helm's own and not ajv's. `schema-fixtures/` holds
-seven values files that must each be rejected, so a schema that has stopped
+twelve values files that must each be rejected, so a schema that has stopped
 catching anything fails rather than passing quietly.
+
+The pods run non-root as UID 10001, under `RuntimeDefault` seccomp, with a
+read-only root filesystem, `allowPrivilegeEscalation: false` and every Linux
+capability dropped — the [restricted Pod Security Standard][pss], so a namespace
+enforcing that label admits them. Those fields are `const` in the schema rather
+than defaults: an environment file cannot relax one, because doing so is not
+tuning a value but leaving the posture the rest of the chart assumes. The cost of
+a read-only root filesystem is real and is paid in `writableVolumes` — one
+size-limited `emptyDir` at `/tmp`, since nearly every runtime writes there —
+rather than by turning the flag off.
+
+[pss]: https://kubernetes.io/docs/concepts/security/pod-security-standards/
 
 Scaling is two loops, and they only work together. The chart's HPA moves pods
 against CPU as a fraction of the request and reacts in about ninety seconds; the

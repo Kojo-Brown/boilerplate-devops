@@ -134,6 +134,109 @@ serviceAccount:
   # separate projected volume the AWS SDK reads.
   automountServiceAccountToken: false
 
+# Pod-level security context: the identity every container in the pod runs as.
+#
+# The split between this block and `securityContext` below is not cosmetic — the
+# Kubernetes API puts different fields in each, and a field written in the wrong
+# one is either rejected or, worse, accepted and ignored. Identity (`runAsUser`,
+# `runAsGroup`, `fsGroup`) and `seccompProfile` are pod-level; `capabilities`,
+# `readOnlyRootFilesystem` and `allowPrivilegeEscalation` are container-level and
+# do not exist here.
+#
+# Together the two blocks satisfy the `restricted` Pod Security Standard, which
+# is what a namespace labelled `pod-security.kubernetes.io/enforce: restricted`
+# admits. The chart does not label the namespace — that is the cluster
+# operator's call — but a chart that cannot pass the standard makes the label
+# unavailable to them.
+#
+# Every value here is fixed by `values.schema.json` rather than merely defaulted:
+# `runAsNonRoot` must be `true`, and the UIDs must not be 0. An environment file
+# that wants a root container is not overriding a default, it is opting out of
+# the posture the rest of this chart is built on, and it fails to render.
+podSecurityContext:
+  runAsNonRoot: true
+  # 10001 rather than the more common 1000: a low UID collides with the first
+  # real account in most base images, and inheriting that account's home
+  # directory and supplementary groups is not something the image intended to
+  # grant. It has to exist in the image, or the container starts with a UID that
+  # has no passwd entry — which works, but breaks anything that calls
+  # `getpwuid()`, including most language runtimes' `os.homedir()`.
+  runAsUser: 10001
+  runAsGroup: 10001
+  # Applied to the emptyDir volumes below, so a process running as 10001 can
+  # write to them. Without it the volume is owned by root and a read-only root
+  # filesystem leaves the container with nowhere to write at all.
+  fsGroup: 10001
+  # `RuntimeDefault` is containerd's seccomp profile — the one that blocks the
+  # ~50 syscalls no ordinary workload issues. Unconfined is the Kubernetes
+  # default when this field is absent, so leaving the block out is not "no
+  # opinion", it is the weakest of the three. `Localhost` is the third option
+  # and requires a profile the node already carries; the schema demands
+  # `localhostProfile` alongside it, because `type: Localhost` on its own is a
+  # manifest the API server rejects.
+  seccompProfile:
+    type: RuntimeDefault
+
+# Container-level security context: what the process may do once it is running.
+#
+# `readOnlyRootFilesystem` is the one with a cost, and it is paid in
+# `writableVolumes` below rather than by turning it off. The others are free for
+# an ordinary HTTP service: it binds a high port, writes to a scratch directory,
+# and needs no kernel capability to do either.
+securityContext:
+  # Blocks `setuid` binaries and file capabilities from raising privileges
+  # mid-process — the mechanism behind most container escapes that start from
+  # code execution as an unprivileged user. Setting `privileged: false` without
+  # this leaves that path open.
+  allowPrivilegeEscalation: false
+  privileged: false
+  # The container filesystem is immutable, so a compromise cannot drop a binary
+  # into it and nothing that gets written survives a restart — which also means
+  # a process that writes to disk expecting persistence fails immediately and
+  # visibly rather than losing data quietly at the next rollout.
+  readOnlyRootFilesystem: true
+  capabilities:
+    # `ALL` rather than an enumerated list. The default set containerd grants is
+    # 14 capabilities including `CAP_NET_RAW` (raw sockets, so ARP spoofing
+    # inside the pod network) and `CAP_CHOWN`; enumerating what to drop means
+    # revisiting the list every time a runtime adds to its default, and nothing
+    # tells you when that happens.
+    drop:
+      - ALL
+    # Anything here is granted back after the drop. `npm run audit:helm` allows
+    # `NET_BIND_SERVICE` and nothing else, and only when `containerPort` is
+    # actually privileged — see `ALLOWED_ADDED_CAPABILITIES` in
+    # `tools/audit-helm-values.ts`.
+    add: []
+
+# Scratch space, because the root filesystem is read-only.
+#
+# Almost every runtime writes somewhere: Node to `/tmp` for its inspector socket
+# and `os.tmpdir()`, the JVM to `/tmp` for `hsperfdata`, Go's `os.CreateTemp`,
+# and any TLS library that spools a large request body. A read-only root
+# filesystem with no writable path is the configuration that looks correct in
+# review and CrashLoopBackOffs on the first request that needs a temporary file.
+#
+# `sizeLimit` is required by the schema. An unbounded `emptyDir` shares the
+# node's ephemeral storage with every other pod on it, so a service that leaks
+# temporary files evicts its neighbours before it evicts itself, and the
+# eviction message names the node rather than the culprit.
+#
+# The volumes are disk-backed, not `medium: Memory`. A tmpfs `emptyDir` counts
+# against the container's memory limit, and `requests.memory == limits.memory`
+# here — so a full `/tmp` would arrive as an OOMKill with no stack and would
+# quietly shrink the heap available to the process long before that.
+#
+# This is a list, and Helm replaces lists wholesale rather than merging them —
+# so an environment file that adds a second scratch path has to restate `tmp`
+# alongside it or lose it. That failure is a container with no `/tmp` in one
+# environment only, which is the shape of bug that reaches production because
+# staging never exercised it.
+writableVolumes:
+  - name: tmp
+    mountPath: /tmp
+    sizeLimit: 64Mi
+
 # The port the container listens on. Named `http` in the pod spec, and referred
 # to by name from the Service and the probes, so changing it here changes it
 # everywhere.
