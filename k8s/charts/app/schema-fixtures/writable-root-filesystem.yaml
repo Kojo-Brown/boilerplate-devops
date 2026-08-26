@@ -1,0 +1,7 @@
+# Turning the root filesystem writable is how a read-only rootfs gets "fixed"
+# the first time a runtime fails on a temporary file. The supported fix is a
+# `writableVolumes` entry for the path it wants; without the `const: true` this
+# one silently gives up the whole control instead.
+environment: staging
+securityContext:
+  readOnlyRootFilesystem: false

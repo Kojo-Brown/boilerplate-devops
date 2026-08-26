@@ -1,0 +1,10 @@
+# Dropping named capabilities instead of ALL. Arrays replace wholesale in Helm,
+# so this leaves the other twelve of containerd's default set — CAP_CHOWN,
+# CAP_SETUID, CAP_MKNOD — granted, while the values file reads as a file that
+# drops capabilities. `contains: ALL` is what tells the two apart.
+environment: staging
+securityContext:
+  capabilities:
+    drop:
+      - NET_RAW
+      - SYS_CHROOT

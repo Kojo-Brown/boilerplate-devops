@@ -1,0 +1,8 @@
+# `Unconfined` is the Kubernetes default when the profile is absent, so writing
+# it out changes nothing and looks like a decision. The enum offers
+# RuntimeDefault and Localhost only: opting out of syscall filtering is not a
+# value this chart can express.
+environment: staging
+podSecurityContext:
+  seccompProfile:
+    type: Unconfined

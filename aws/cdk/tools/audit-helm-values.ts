@@ -55,6 +55,16 @@
  *                             rendered while the HPA is on, so nothing catches
  *                             it until autoscaling is turned off — at which
  *                             point the fleet silently resizes
+ *   capability-added-back     a Linux capability granted back after dropping
+ *                             ALL, which is the drop undone one line later
+ *   unnecessary-capability    NET_BIND_SERVICE granted to a container that
+ *                             binds an unprivileged port and does not need it
+ *   privileged-port-unbindable
+ *                             a containerPort below 1024 on a non-root
+ *                             container with no NET_BIND_SERVICE, which is a
+ *                             pod that starts and then cannot bind
+ *   duplicate-writable-mount  two scratch volumes sharing a name or a mount
+ *                             path, which the API server rejects at apply time
  *
  * Usage:
  *   npm run audit:helm                       # audits the repository root
@@ -79,6 +89,27 @@ export const ENVIRONMENTS: readonly string[] = ['staging', 'production'];
 /** Directory holding the charts, relative to the repository root. */
 export const CHARTS_DIRECTORY = path.posix.join('k8s', 'charts');
 
+/**
+ * Capabilities a chart may grant back after `drop: [ALL]`.
+ *
+ * The list is here, in code, rather than in the schema, because adding to it is
+ * meant to be a change somebody reviews with a reason attached — the same shape
+ * as `lib/checkov-suppressions.ts`. `NET_BIND_SERVICE` is on it because binding
+ * a port below 1024 as a non-root user is impossible without it and is
+ * occasionally unavoidable; it is still reported when the container's port does
+ * not need it, since a granted capability nobody uses is one nobody will
+ * remember was granted.
+ */
+export const ALLOWED_ADDED_CAPABILITIES: readonly string[] = ['NET_BIND_SERVICE'];
+
+/**
+ * Ports below this are privileged: binding one requires `CAP_NET_BIND_SERVICE`
+ * or UID 0. `net.ipv4.ip_unprivileged_port_start` can lower it per node, but it
+ * is an unsafe sysctl that EKS does not set, so 1024 is the number that holds
+ * on the clusters this chart deploys to.
+ */
+export const PRIVILEGED_PORT_CEILING = 1024;
+
 export type ViolationRule =
   | 'schema-unreadable'
   | 'schema-invalid'
@@ -95,7 +126,11 @@ export type ViolationRule =
   | 'budget-blocks-drain'
   | 'single-replica'
   | 'autoscaling-bounds'
-  | 'replica-count-outside-range';
+  | 'replica-count-outside-range'
+  | 'capability-added-back'
+  | 'unnecessary-capability'
+  | 'privileged-port-unbindable'
+  | 'duplicate-writable-mount';
 
 export interface Violation {
   readonly rule: ViolationRule;
@@ -396,6 +431,7 @@ export const auditEnvironment = (
   }
 
   violations.push(...auditAvailability(merged, environment, file));
+  violations.push(...auditPodSecurity(merged, file));
 
   return violations;
 };
@@ -514,6 +550,113 @@ const auditAutoscaling = (merged: Record<string, unknown>, file: string): Violat
         'someone sets `autoscaling.enabled: false` — which is meant to change the mechanism, ' +
         'not the capacity.',
     });
+  }
+
+  return violations;
+};
+
+const asStringArray = (value: unknown): string[] =>
+  Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string') : [];
+
+/**
+ * The pod-security rules `values.schema.json` cannot express.
+ *
+ * The schema already fixes everything that is a single value — `privileged` is
+ * `false`, `readOnlyRootFilesystem` is `true`, `drop` contains `ALL`, the UIDs
+ * are not 0. What is left are the rules that compare one value to another, and
+ * every one of them describes a pod that Kubernetes accepts and then does
+ * something unhelpful with:
+ *
+ *   • A capability granted back after `drop: [ALL]` is the drop undone one line
+ *     later, and it reads as hardening in review because the `drop` is still
+ *     right there above it.
+ *   • `containerPort: 80` on a non-root container is a Deployment that rolls
+ *     out cleanly, passes admission, and CrashLoopBackOffs on `bind()` —
+ *     `EACCES` from a process that is doing exactly what the manifest says.
+ *   • Two scratch volumes on one path is rejected by the API server, but at
+ *     apply time and with an error that names neither values file.
+ */
+export const auditPodSecurity = (merged: Record<string, unknown>, file: string): Violation[] => {
+  const violations: Violation[] = [];
+  const container = asRecord(merged.securityContext);
+  const capabilities = asRecord(container?.capabilities);
+  const added = asStringArray(capabilities?.add);
+  const port = asNumber(merged.containerPort);
+  const privilegedPort = port !== undefined && port < PRIVILEGED_PORT_CEILING;
+
+  for (const capability of added) {
+    if (ALLOWED_ADDED_CAPABILITIES.includes(capability)) continue;
+
+    violations.push({
+      rule: 'capability-added-back',
+      file,
+      message:
+        `securityContext.capabilities.add grants ${capability} back after dropping ALL. The ` +
+        'drop above it then describes a posture the container does not have, which is the ' +
+        'version of this mistake that survives review. If the workload genuinely needs it, add ' +
+        'it to ALLOWED_ADDED_CAPABILITIES in tools/audit-helm-values.ts with the reason, so the ' +
+        'grant is reviewed once rather than inherited forever.',
+    });
+  }
+
+  if (privilegedPort && !added.includes('NET_BIND_SERVICE')) {
+    violations.push({
+      rule: 'privileged-port-unbindable',
+      file,
+      message:
+        `containerPort is ${port}, below ${PRIVILEGED_PORT_CEILING}, and the container drops ` +
+        'every capability while running as a non-root user — so it cannot bind the port it ' +
+        'declares. Nothing rejects this: the Deployment rolls out, the pod is admitted, and the ' +
+        'process fails with EACCES on bind() into a CrashLoopBackOff. Move the listener to a ' +
+        'port above 1024 and let the Service map 80 to it, which is what `service.port` is for.',
+    });
+  }
+
+  if (!privilegedPort && added.includes('NET_BIND_SERVICE')) {
+    violations.push({
+      rule: 'unnecessary-capability',
+      file,
+      message:
+        `securityContext.capabilities.add grants NET_BIND_SERVICE, but containerPort is ` +
+        `${String(port)} — an unprivileged port, which needs no capability to bind. A grant ` +
+        'that is not exercised is one nobody notices is still there, and it stops being ' +
+        'harmless the day the listener moves.',
+    });
+  }
+
+  const volumes = Array.isArray(merged.writableVolumes) ? merged.writableVolumes : [];
+  const seenNames = new Set<string>();
+  const seenPaths = new Set<string>();
+
+  for (const entry of volumes) {
+    const volume = asRecord(entry);
+    const name = asString(volume?.name);
+    const mountPath = asString(volume?.mountPath);
+
+    if (name !== undefined && seenNames.has(name)) {
+      violations.push({
+        rule: 'duplicate-writable-mount',
+        file,
+        message:
+          `writableVolumes declares the name ${JSON.stringify(name)} twice. The API server ` +
+          'rejects the pod at apply time, which means the release fails after CI was green and ' +
+          'the error names the pod rather than the values file that produced it.',
+      });
+    }
+
+    if (mountPath !== undefined && seenPaths.has(mountPath)) {
+      violations.push({
+        rule: 'duplicate-writable-mount',
+        file,
+        message:
+          `writableVolumes mounts ${JSON.stringify(mountPath)} twice. Only one of the two can ` +
+          'win and the pod spec does not say which, so the container gets a scratch directory ' +
+          'that is not the one the second entry describes.',
+      });
+    }
+
+    if (name !== undefined) seenNames.add(name);
+    if (mountPath !== undefined) seenPaths.add(mountPath);
   }
 
   return violations;

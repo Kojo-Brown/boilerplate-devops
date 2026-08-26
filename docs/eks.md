@@ -243,8 +243,12 @@ Later Phase 8 items, deliberately out of scope here:
   no automated rollout path.
 - **No metrics-server**, which the chart's HPA reads and EKS does not ship as a
   managed add-on. Without it the HPA reports `<unknown>` and scales nothing.
-- No pod security defaults are enforced cluster-wide. The node hardening above
-  is the host side; Pod Security Standards are their own item.
+- No pod security defaults are enforced cluster-wide. The `app` chart's pods
+  satisfy the `restricted` Pod Security Standard on their own (see
+  [docs/helm-chart.md](./helm-chart.md) §2.1), but no namespace carries a
+  `pod-security.kubernetes.io/enforce` label, so nothing stops a *different*
+  workload from running privileged. The chart being admissible is what makes
+  applying that label a one-line change rather than a migration.
 - One node group, shared by system and application workloads. That is why the
   autoscaler leaves a couple of nodes above the group's minimum pinned — see
   [docs/autoscaling.md](./autoscaling.md) §4.

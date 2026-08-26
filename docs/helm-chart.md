@@ -61,12 +61,65 @@ VPC — a bastion, a VPN, or a CI job in a self-hosted runner — not from a lap
 | `PodDisruptionBudget` | `minAvailable` as a count, checked against the fleet's floor |
 | `HorizontalPodAutoscaler` | `autoscaling/v2`, CPU against the request, with an explicit `behavior` |
 
-Not here, and each its own Phase 8 item: the pod security context (non-root,
-read-only rootfs, dropped capabilities, seccomp), the default-deny NetworkPolicy,
-the ArgoCD app-of-apps, and the Ingress with cert-manager. The chart is the
-delivery path; hardening it and automating its rollout come next. **Until the pod
-security item lands, the rendered pods run with the cluster's defaults** — that
-is a real gap, not an omission from the docs.
+Not here, and each its own Phase 8 item: the default-deny NetworkPolicy, the
+ArgoCD app-of-apps, and the Ingress with cert-manager. The chart is the delivery
+path; automating its rollout and closing the pod network come next. **The pods
+have no NetworkPolicy, so anything in the cluster can reach them** — that is a
+real gap, not an omission from the docs.
+
+The pod security context landed with §2.1 below: the rendered pods no longer run
+with the cluster's defaults.
+
+### 2.1 Pod security
+
+The two security contexts together satisfy the [restricted Pod Security
+Standard][pss], which is what a namespace labelled
+`pod-security.kubernetes.io/enforce: restricted` admits. The chart does not
+apply that label — the namespace belongs to the cluster operator — but a chart
+that cannot pass the standard takes the label away from them.
+
+| Setting | Where | Why |
+|---|---|---|
+| `runAsNonRoot: true`, `runAsUser`/`runAsGroup`/`fsGroup: 10001` | pod | Root in a container is root on the node the moment anything else goes wrong |
+| `seccompProfile.type: RuntimeDefault` | pod | Absent means `Unconfined`, so leaving it out is the weakest setting, not no setting |
+| `allowPrivilegeEscalation: false` | container | Blocks setuid binaries and file capabilities from raising privileges mid-process |
+| `privileged: false` | container | Nothing here is an agent or a CSI driver |
+| `readOnlyRootFilesystem: true` | container | A compromise cannot drop a binary into the image, and a stray write fails visibly instead of vanishing at the next rollout |
+| `capabilities.drop: [ALL]` | container | Drops `CAP_NET_RAW`, `CAP_CHOWN`, `CAP_SETUID` and the rest of containerd's default 14 |
+
+Four things about it are worth knowing before editing the values:
+
+- **The pod/container split is the API's, not a style choice.** Identity
+  (`runAsUser`, `runAsGroup`, `fsGroup`) and `seccompProfile` are pod-level;
+  `capabilities`, `readOnlyRootFilesystem` and `allowPrivilegeEscalation` are
+  container-level and do not exist in a `PodSecurityContext`. The schema closes
+  both objects, so a field in the wrong one fails to render rather than being
+  accepted and ignored.
+- **These are `const` in the schema, not defaults.** An environment file that
+  sets `privileged: true` or `readOnlyRootFilesystem: false` is not overriding a
+  value, it is opting out of the posture the rest of the chart assumes, and it
+  fails at `helm lint`. There is no `--set` that gets past it either.
+- **`readOnlyRootFilesystem` costs something, and it is paid in
+  `writableVolumes`.** Almost every runtime writes somewhere — Node's inspector
+  socket and `os.tmpdir()`, the JVM's `hsperfdata`, Go's `os.CreateTemp`, any
+  TLS library spooling a large body. The chart mounts one `emptyDir` at `/tmp`;
+  a service that needs another path adds an entry rather than turning the flag
+  off. `sizeLimit` is required, because an unbounded `emptyDir` draws on the
+  node's shared ephemeral storage and a service that leaks temporary files
+  evicts its neighbours before it evicts itself.
+- **The scratch volumes are disk-backed on purpose.** `medium: Memory` is not
+  offered: a tmpfs `emptyDir` counts against the container's memory limit, and
+  `requests.memory == limits.memory` here — so a full `/tmp` arrives as an
+  OOMKill with no stack, having quietly shrunk the heap available to the process
+  long before that.
+
+`10001` rather than `1000`: a low UID collides with the first real account in
+most base images, and inheriting that account's home directory and supplementary
+groups is not something the image meant to grant. The UID has to exist in the
+image, or `getpwuid()` fails — which most language runtimes call, for
+`os.homedir()` and friends, without saying so.
+
+[pss]: https://kubernetes.io/docs/concepts/security/pod-security-standards/
 
 The HPA and the Cluster Autoscaler in `EksStack` are two halves of one thing and
 are documented together in [docs/autoscaling.md](./autoscaling.md), including
@@ -205,6 +258,20 @@ JSON Schema cannot compare two properties, so these are in
 - `values-production.yaml` must declare `environment: production`. A file that
   leaves it to the default deploys production pods labelled `staging`, and the
   label is what an incident responder reads.
+- **No capability may be granted back after `drop: [ALL]`**, except the ones in
+  `ALLOWED_ADDED_CAPABILITIES` — today just `NET_BIND_SERVICE`. The list is in
+  code rather than in the schema so that adding to it is a reviewed change with
+  a reason attached, the same shape as `lib/checkov-suppressions.ts`.
+- **`containerPort` below 1024 requires `NET_BIND_SERVICE`**, and having it
+  without a privileged port is reported too. A non-root container that drops
+  every capability and declares `containerPort: 80` is admitted, rolls out
+  cleanly, and then fails with `EACCES` on `bind()` — a CrashLoopBackOff whose
+  cause is two values that are each individually fine. The fix is almost always
+  to listen above 1024 and let `service.port` map 80 to it.
+- **Two `writableVolumes` may not share a name or a mount path.** The API server
+  rejects the duplicate name at apply time, after CI was green, with an error
+  that names the pod rather than the values file; a duplicated mount path is
+  accepted and one of the two silently wins.
 
 ---
 
@@ -234,7 +301,7 @@ an `additionalProperties: false` is dropped to let one key through, and the
 schema goes on passing every valid file while catching nothing. A passing gate
 and a gate with nothing left to catch look identical.
 
-`k8s/charts/app/schema-fixtures/` is what tells them apart — seven values files
+`k8s/charts/app/schema-fixtures/` is what tells them apart — twelve values files
 that must each be **rejected**, checked against the specific keyword that should
 catch each one:
 
@@ -247,6 +314,18 @@ catch each one:
 | `nullified-required-key.yaml` | `required` |
 | `zero-min-replicas.yaml` | `minimum` |
 | `flapping-scale-down.yaml` | `minimum`, in the `allOf` branch over `hpaScalingRules` |
+| `privileged-container.yaml` | `const` |
+| `writable-root-filesystem.yaml` | `const` |
+| `capabilities-retained.yaml` | `contains` |
+| `root-user.yaml` | `minimum` |
+| `unconfined-seccomp.yaml` | `enum` |
+
+The five security fixtures are asserted against those keywords rather than
+against "some error", because each one has a near-miss that would pass. Dropping
+`NET_RAW` and `SYS_CHROOT` is a perfectly valid list of capabilities — what has
+to catch it is `contains: ALL`, not the item type. `runAsUser: 0` beside
+`runAsNonRoot: true` is two individually valid values, so what catches it is the
+`minimum` on the UID and not the `const` on the boolean.
 
 `aws/cdk/test/audit-helm-values.test.ts` asserts the ajv side; the shell script
 asserts Helm's. Checked against the failure it names: removing the root
