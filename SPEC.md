@@ -158,7 +158,7 @@ no better signal exists in the git object graph.
 - [x] EKS cluster via CDK with managed node groups and IRSA — private API endpoint, one managed node group, four EKS-managed add-ons, and an OIDC provider; the node role is thin because the CNI holds its ENI permissions through IRSA instead (PR #34)
 - [x] Helm chart with values per environment and a schema-validated `values.yaml` — `k8s/charts/app`, installed with `values-staging.yaml` or `values-production.yaml`; the schema closes every object, and two gates plus five must-fail fixtures keep it from quietly stopping to catch anything (PR #35)
 - [x] Horizontal Pod Autoscaler + Cluster Autoscaler with load-tested thresholds — an `autoscaling/v2` HPA in the chart and the upstream Cluster Autoscaler in `EksStack`, pinned to the cluster's Kubernetes version and discovering node groups by ASG tag; the thresholds are derived rather than measured, because there is no cluster to measure against (PR #36)
-- [ ] Pod security: non-root, read-only rootfs, dropped capabilities, seccomp
+- [x] Pod security: non-root, read-only rootfs, dropped capabilities, seccomp — the chart had no `securityContext` at all, which is not neutral: root, containerd's default 14 capabilities, a writable rootfs and seccomp Unconfined are what Kubernetes does when the fields are absent. Both contexts are now `const` in the schema rather than defaults, so an environment file cannot relax one (PR #37)
 - [ ] NetworkPolicy default-deny with explicit allowlists
 - [ ] GitOps with ArgoCD: app-of-apps, sync waves, and drift detection
 - [ ] Ingress with cert-manager, external-dns, and automatic TLS renewal
@@ -310,6 +310,61 @@ blocks on I/O), no VPA, no Karpenter, and no pod topology spread — four replic
 over three AZs is what the scheduler happens to do, not something the chart
 requires, and that belongs with item 4 since it is the next thing to touch the
 pod spec.
+
+Item 4 complete as of PR #37 (2026-08-26). The pod context fixes the identity
+(non-root, UID/GID/fsGroup 10001, seccomp `RuntimeDefault`) and the container
+context fixes the behaviour (`allowPrivilegeEscalation: false`,
+`privileged: false`, `readOnlyRootFilesystem: true`, `capabilities.drop: [ALL]`).
+Together they satisfy the restricted Pod Security Standard, so a namespace
+carrying the enforce label admits these pods — applying that label stays the
+cluster operator's call, but a chart that cannot pass the standard takes the
+option away from them.
+
+The split between the two blocks is the Kubernetes API's, not a style choice:
+`capabilities`, `readOnlyRootFilesystem` and `allowPrivilegeEscalation` do not
+exist in a `PodSecurityContext`, and `fsGroup`/`seccompProfile` do not exist in a
+container one. Both objects are closed in the schema, so a field written into the
+wrong block fails to render rather than being accepted and ignored.
+
+Every security field is a `const` rather than a default. That is the deliberate
+decision in this item: an environment file setting `privileged: true` or
+`readOnlyRootFilesystem: false` is not overriding a value, it is leaving the
+posture the rest of the chart assumes, and it now fails at `helm lint` with no
+`--set` past it. The cost of `readOnlyRootFilesystem` is real and is paid in
+`writableVolumes` rather than by turning the flag off: nearly every runtime
+writes to `/tmp` — Node's inspector socket, the JVM's `hsperfdata`, Go's
+`os.CreateTemp` — so the chart mounts one size-limited `emptyDir` there.
+`sizeLimit` is required, because an unbounded `emptyDir` draws on the node's
+shared ephemeral storage and a service that leaks temporary files evicts its
+neighbours before itself. The volumes are disk-backed rather than
+`medium: Memory`, which would count against a memory limit equal to the request
+and turn a full `/tmp` into an OOMKill with no stack.
+
+Four rules go to `audit:helm`, because each compares two values and each
+describes a pod Kubernetes accepts and then does something unhelpful with: a
+capability granted back after `drop: [ALL]` (allowed only from
+`ALLOWED_ADDED_CAPABILITIES`, today just `NET_BIND_SERVICE`); `NET_BIND_SERVICE`
+held by a container binding an unprivileged port; a `containerPort` below 1024 on
+a non-root container that dropped it, which is admitted, rolls out, and then
+fails with `EACCES` on `bind()`; and two scratch volumes sharing a name or a
+mount path. `schema-fixtures/` goes from seven files to twelve, each asserted
+against the keyword that must catch it — `contains` for the capability list,
+`minimum` on the UID for root — because each of the five new ones has a near-miss
+a bare "some error" assertion would let through.
+
+Known gaps carried into item 5: **there is still no NetworkPolicy**, so anything
+in the cluster can reach these pods — `docs/eks.md` now says that on its own
+rather than lumping it in with the pod-security gap this closes. No namespace
+enforces the `restricted` label, so nothing stops a *different* workload from
+running privileged; the chart being admissible is what makes applying that label
+a one-line change rather than a migration. `seccompProfile.type: Localhost` is
+schema-valid and untested against a real node — the schema catches the failure
+that matters at deploy time (`Localhost` with no `localhostProfile`), but whether
+a named profile exists on a node is a cluster fact this repository has no cluster
+to check. Checkov still does not scan the rendered manifests; that needs the
+Helm job to render into an artifact the Checkov job reads, which is its own
+change. Pod topology spread is still not required by the chart, and the
+metrics-server gap from item 3 is unchanged.
 
 ## Phase 9 — Supply-Chain Security
 - [ ] SBOM generation (CycloneDX) attached to every release artifact
