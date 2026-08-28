@@ -21,6 +21,7 @@ compromised container is whatever the noisiest workload on the cluster needed.
 | Launch template per node group | IMDSv2 required at hop limit 1, encrypted gp3 root volume |
 | Managed node group | On-demand AL2023 nodes in the private subnets |
 | `vpc-cni`, `kube-proxy`, `coredns`, `aws-ebs-csi-driver` | EKS-managed add-ons, versions tracking the cluster version |
+| `vpc-cni` with `enableNetworkPolicy` | The agent that enforces NetworkPolicy objects. Without it they are stored and ignored — see [docs/network-policies.md](./network-policies.md) §1 |
 | IAM OIDC provider | The identity half of IRSA |
 | IRSA roles for the CNI and the EBS CSI driver | The two add-ons that need AWS permissions |
 
@@ -238,9 +239,18 @@ the reasoning behind each one are in
 
 Later Phase 8 items, deliberately out of scope here:
 
-- No NetworkPolicy, no ArgoCD, no ingress controller. The cluster has capacity,
-  identity, node scaling and an application chart; it has no policy boundary and
-  no automated rollout path.
+- No ArgoCD, no ingress controller. The cluster has capacity, identity, node
+  scaling, an application chart and policy enforcement; it has no automated
+  rollout path and nothing in front of it.
+- **No cluster-wide network baseline.** The CNI enforces policy, and the `app`
+  chart closes its own pods (see
+  [docs/network-policies.md](./network-policies.md)), but every other pod in the
+  cluster is unrestricted and nothing stops a namespace from being created
+  without a policy.
+- **Policy decisions are not shipped anywhere.** The network policy agent logs
+  them on the node at `/var/log/aws-routed-eni/network-policy-agent.log`;
+  forwarding them to CloudWatch is a further add-on setting that needs `logs:*`
+  on the node role, and a per-connection log stream with a per-connection bill.
 - **No metrics-server**, which the chart's HPA reads and EKS does not ship as a
   managed add-on. Without it the HPA reports `<unknown>` and scales nothing.
 - No pod security defaults are enforced cluster-wide. The `app` chart's pods

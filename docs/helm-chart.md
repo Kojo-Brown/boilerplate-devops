@@ -2,9 +2,9 @@
 
 `k8s/charts/app` is the application delivery path the EKS cluster did not have.
 It installs a stateless HTTP service — Deployment, Service, ServiceAccount wired
-for IRSA, a configuration ConfigMap, a PodDisruptionBudget and a
-HorizontalPodAutoscaler — and every value it accepts is constrained by
-`values.schema.json`.
+for IRSA, a configuration ConfigMap, a PodDisruptionBudget, a
+HorizontalPodAutoscaler and a default-deny NetworkPolicy with an explicit
+allowlist — and every value it accepts is constrained by `values.schema.json`.
 
 ```
 k8s/charts/app/
@@ -14,6 +14,7 @@ k8s/charts/app/
 ├── values-staging.yaml         only what staging changes
 ├── values-production.yaml      only what production changes
 ├── schema-fixtures/            values files the schema must reject
+├── render-fixtures/            values files the templates must render
 └── templates/
 ```
 
@@ -60,15 +61,15 @@ VPC — a bastion, a VPN, or a CI job in a self-hosted runner — not from a lap
 | `ConfigMap` | `config` values as environment variables, hashed into the pod template |
 | `PodDisruptionBudget` | `minAvailable` as a count, checked against the fleet's floor |
 | `HorizontalPodAutoscaler` | `autoscaling/v2`, CPU against the request, with an explicit `behavior` |
+| `NetworkPolicy` ×2 | A default-deny for this release's pods, and the allowlist — see §2.2 |
 
-Not here, and each its own Phase 8 item: the default-deny NetworkPolicy, the
-ArgoCD app-of-apps, and the Ingress with cert-manager. The chart is the delivery
-path; automating its rollout and closing the pod network come next. **The pods
-have no NetworkPolicy, so anything in the cluster can reach them** — that is a
-real gap, not an omission from the docs.
+Not here, and each its own Phase 8 item: the ArgoCD app-of-apps and the Ingress
+with cert-manager. The chart is the delivery path; automating its rollout and
+putting something in front of it come next.
 
-The pod security context landed with §2.1 below: the rendered pods no longer run
-with the cluster's defaults.
+The pod security context landed with §2.1 below and the network policy with
+§2.2: the rendered pods no longer run with the cluster's defaults, and nothing
+in the cluster can reach them that is not named in a values file.
 
 ### 2.1 Pod security
 
@@ -120,6 +121,34 @@ image, or `getpwuid()` fails — which most language runtimes call, for
 `os.homedir()` and friends, without saying so.
 
 [pss]: https://kubernetes.io/docs/concepts/security/pod-security-standards/
+
+### 2.2 Network policy
+
+The chart renders `<release>-default-deny`, which selects this release's pods
+and denies both directions, and `<release>-allow`, which permits the peers named
+in `networkPolicy.ingress` and `networkPolicy.egress`. The defaults allow
+cluster DNS and HTTPS to AWS outbound, and nothing inbound.
+
+Four things matter before editing that block, and
+[docs/network-policies.md](./network-policies.md) has the rest:
+
+- **A NetworkPolicy has no status, and Kubernetes has no policy controller.** On
+  a CNI that does not implement policy the objects are stored and ignored —
+  accepted, visible in `kubectl get netpol`, enforcing nothing, with no field
+  that says so. `EksStack` turns on the VPC CNI's network policy agent, which is
+  what makes these objects load-bearing on the clusters this repository creates.
+- **One values entry is one peer, so its selectors are ANDed.** Two selectors in
+  one `from` element mean "pods matching B in namespaces matching A"; the same
+  two as separate elements mean "either". The chart only ever renders the first
+  form, so allowing two sources means writing two entries.
+- **Ports are the pod's, not the Service's.** kube-proxy rewrites the
+  destination to `containerPort` before policy is evaluated, so an ingress entry
+  naming `service.port` matches nothing and the connections it was written to
+  permit are dropped. `npm run audit:helm` fails on it.
+- **`ingress` is empty and that is the real state**, not a placeholder — there is
+  no ingress controller on this cluster yet. Because both environment files
+  leave it empty, `render-fixtures/` is what keeps the ingress half of the
+  template rendered by a gate; see §5.
 
 The HPA and the Cluster Autoscaler in `EksStack` are two halves of one thing and
 are documented together in [docs/autoscaling.md](./autoscaling.md), including
@@ -272,6 +301,24 @@ JSON Schema cannot compare two properties, so these are in
   rejects the duplicate name at apply time, after CI was green, with an error
   that names the pod rather than the values file; a duplicated mount path is
   accepted and one of the two silently wins.
+- **An ingress allowlist entry must name a port the pods listen on.** Writing
+  `service.port` there is the common form of this and it matches nothing, since
+  kube-proxy rewrites the destination first. Reported as
+  `ingress-port-mismatch`, which says when the number is `service.port`.
+- **`networkPolicy.enabled: false` is reported.** It exists for a cluster whose
+  CNI cannot enforce policy — not as a way to unblock a service, which is what
+  it would otherwise be reached for first.
+- **DNS must be reachable.** `dns.enabled: false` with no egress entry allowing
+  port 53 is a release whose every name lookup times out, and the symptom is
+  five-second latency rather than anything naming the network
+  (`dns-egress-blocked`).
+- **An egress `ipBlock` must except the instance metadata address** if it
+  contains it (`metadata-service-reachable`), and an ingress entry may not admit
+  `0.0.0.0/0` (`ingress-from-anywhere`). Neither is expressible in JSON Schema,
+  which cannot reason about what a CIDR contains.
+- **Two allowlist entries may not share a `name`.** The name never reaches the
+  cluster, so this breaks no deploy — it breaks every message about the rule,
+  including the ones above.
 
 ---
 
@@ -285,8 +332,9 @@ schema hygiene, environment coverage, the cross-field rules above, and the
 merged values for every environment.
 
 **`.github/scripts/lint-helm-chart.sh`** (in the `Helm chart` job) runs
-`helm lint --strict` and `helm template` per environment. The validator that
-decides whether a real `helm upgrade` succeeds is Helm's own
+`helm lint --strict` and `helm template` per environment, renders every
+`render-fixtures/` file, and requires every `schema-fixtures/` file to fail. The
+validator that decides whether a real `helm upgrade` succeeds is Helm's own
 (`xeipuuv/gojsonschema`), a different implementation of the same draft from
 ajv's — a schema checked only against ajv has not been checked against the tool
 that enforces it.
@@ -301,9 +349,9 @@ an `additionalProperties: false` is dropped to let one key through, and the
 schema goes on passing every valid file while catching nothing. A passing gate
 and a gate with nothing left to catch look identical.
 
-`k8s/charts/app/schema-fixtures/` is what tells them apart — twelve values files
-that must each be **rejected**, checked against the specific keyword that should
-catch each one:
+`k8s/charts/app/schema-fixtures/` is what tells them apart — sixteen values
+files that must each be **rejected**, checked against the specific keyword that
+should catch each one:
 
 | Fixture | Keyword |
 |---|---|
@@ -319,18 +367,39 @@ catch each one:
 | `capabilities-retained.yaml` | `contains` |
 | `root-user.yaml` | `minimum` |
 | `unconfined-seccomp.yaml` | `enum` |
+| `network-policy-open-namespace-selector.yaml` | `minProperties` |
+| `network-policy-rule-without-ports.yaml` | `required` |
+| `network-policy-named-egress-port.yaml` | `type`, in the `allOf` branch over `networkPolicyRule` |
+| `network-policy-peerless-rule.yaml` | `anyOf` |
 
 The five security fixtures are asserted against those keywords rather than
 against "some error", because each one has a near-miss that would pass. Dropping
 `NET_RAW` and `SYS_CHROOT` is a perfectly valid list of capabilities — what has
 to catch it is `contains: ALL`, not the item type. `runAsUser: 0` beside
 `runAsNonRoot: true` is two individually valid values, so what catches it is the
-`minimum` on the UID and not the `const` on the boolean.
+`minimum` on the UID and not the `const` on the boolean. `namespaceLabels: {}` is
+a valid selector that happens to match every namespace in the cluster, so what
+catches it is `minProperties` and not anything about the labels themselves.
 
 `aws/cdk/test/audit-helm-values.test.ts` asserts the ajv side; the shell script
 asserts Helm's. Checked against the failure it names: removing the root
 `additionalProperties: false` makes the script exit 1 on `unknown-key.yaml` and
 the audit exit 1 with `schema-open-object`.
+
+### The render fixtures
+
+The mirror image, and it covers the templates rather than the schema. A chart's
+gates only execute the template paths its own values files reach, so an
+`{{- if }}` around a whole object — or a `range` over a list both environments
+leave empty — is rendered by nothing and is therefore unchecked. Today that is
+the NetworkPolicy ingress allowlist, which is empty in `values.yaml` and in both
+environment files and correctly so.
+
+`k8s/charts/app/render-fixtures/` holds values files that must **render**. The
+shell script runs `helm template` over each; the jest suite asserts the schema
+still accepts them, and that they still exercise something the environment files
+do not — otherwise a fixture could be quietly reduced to a copy of the defaults
+and go on passing.
 
 ---
 
@@ -365,5 +434,9 @@ whoever finally uses it.
   writing a suppression list that then has to be unwound.
 - **No `helm test` hooks and no chart-testing (`ct`) install test**, for the
   same reason as the first point: both want a cluster.
+- **No policy has been observed to permit or deny a packet.** §2.2 and
+  [docs/network-policies.md](./network-policies.md) describe manifests and
+  documented CNI behaviour; nothing in CI runs a cluster that could enforce
+  them.
 
 [ajv]: https://ajv.js.org

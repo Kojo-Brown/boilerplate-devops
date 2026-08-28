@@ -1,0 +1,14 @@
+# A named port in a policy is resolved against the containers of the pod the
+# traffic is going *to*. On ingress that is this chart's own pod, so `http` is
+# exact; on egress it is somebody else's, where the name means whatever they
+# happen to call it — and matches nothing the day they rename it, with no error
+# anywhere. Egress ports are numbers.
+environment: staging
+networkPolicy:
+  egress:
+    - name: upstream-api
+      podLabels:
+        app.kubernetes.io/name: upstream-api
+      ports:
+        - port: http
+          protocol: TCP

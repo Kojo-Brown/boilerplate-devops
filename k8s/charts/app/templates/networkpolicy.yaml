@@ -1,0 +1,133 @@
+{{- if .Values.networkPolicy.enabled -}}
+{{- /*
+  Two objects, not one.
+
+  A NetworkPolicy is additive: a pod selected by any policy is denied everything
+  that policy's direction covers and not explicitly allowed by *some* policy
+  selecting it. So one object carrying both `policyTypes` and the allow rules
+  would be equivalent — right up to the moment someone edits or deletes it
+  during an incident, at which point the pods go from "allowlisted" to
+  "unrestricted" rather than to "denied". Splitting the floor from the
+  allowlist means the failure mode of losing the second object is a service
+  that stops talking, which is loud, instead of a boundary that stops existing,
+  which is silent.
+
+  It also reads correctly in `kubectl get networkpolicy`: the deny is a named
+  object an operator can see is in place, rather than an absence of rules
+  inside another one.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "app.fullname" . }}-default-deny
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+spec:
+  {{- /*
+    Scoped to this release's pods, never `podSelector: {}`.
+
+    A namespace-wide default-deny is the shape most examples show, and it is
+    wrong for a chart: it applies to every pod in the namespace, including ones
+    this release did not create and whose owners never agreed to it. Installing
+    a chart should not silently cut the network out from under a neighbour. If
+    the namespace should be closed by default, that belongs to whoever owns the
+    namespace — as one policy applied there, not as a side effect of a
+    `helm install`.
+  */}}
+  podSelector:
+    matchLabels:
+      {{- include "app.selectorLabels" . | nindent 6 }}
+  {{- /*
+    Both directions named, and no `ingress`/`egress` key at all. A policy that
+    lists a direction in `policyTypes` and supplies no rules for it denies that
+    direction outright — which is the entire object. `ingress: []` would mean
+    the same thing and is one keystroke from `ingress: [{}]`, which means the
+    opposite.
+  */}}
+  policyTypes:
+    - Ingress
+    - Egress
+{{- $ingress := .Values.networkPolicy.ingress | default list }}
+{{- $egress := .Values.networkPolicy.egress | default list }}
+{{- $dns := .Values.networkPolicy.dns }}
+{{- $hasEgress := or $dns.enabled (gt (len $egress) 0) }}
+{{- if or (gt (len $ingress) 0) $hasEgress }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "app.fullname" . }}-allow
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "app.selectorLabels" . | nindent 6 }}
+  {{- /*
+    Only the directions this object actually allows something in. Naming a
+    direction here with no rules under it would be a second default-deny
+    wearing the allow policy's name, which is exactly the confusion the split
+    above exists to avoid.
+  */}}
+  policyTypes:
+    {{- if gt (len $ingress) 0 }}
+    - Ingress
+    {{- end }}
+    {{- if $hasEgress }}
+    - Egress
+    {{- end }}
+  {{- if gt (len $ingress) 0 }}
+  ingress:
+    {{- range $ingress }}
+    {{- /*
+      `name` is not rendered — a NetworkPolicy rule has no name field. It
+      exists so that a rule can be talked about in review and named in an
+      `npm run audit:helm` failure, which otherwise has nothing to point at but
+      a list index.
+    */}}
+    - from:
+        {{- include "app.networkPolicyPeer" . | nindent 8 }}
+      ports:
+        {{- include "app.networkPolicyPorts" .ports | nindent 8 }}
+    {{- end }}
+  {{- end }}
+  {{- if $hasEgress }}
+  egress:
+    {{- if $dns.enabled }}
+    {{- /*
+      DNS first, and separate from the `egress` list, because it is the one
+      egress rule that is not a policy decision: without it every name lookup
+      from these pods is dropped. The symptom is not a connection refused — it
+      is the resolver's timeout, so every outbound call takes five seconds and
+      then fails with EAI_AGAIN, and the service looks slow rather than
+      blocked.
+
+      Both protocols. UDP carries the ordinary query; TCP carries the retry
+      when a response exceeds 512 bytes and any resolver configured with
+      `use-vc`. Allowing only UDP works until the first large answer.
+
+      One peer, so the namespace and pod selectors are ANDed: this is kube-dns
+      in kube-system, not "kube-dns anywhere" or "anything in kube-system".
+    */}}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml $dns.namespaceLabels | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml $dns.podLabels | nindent 14 }}
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    {{- end }}
+    {{- range $egress }}
+    - to:
+        {{- include "app.networkPolicyPeer" . | nindent 8 }}
+      ports:
+        {{- include "app.networkPolicyPorts" .ports | nindent 8 }}
+    {{- end }}
+  {{- end }}
+{{- end }}
+{{- end }}

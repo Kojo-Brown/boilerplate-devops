@@ -22,13 +22,24 @@ violation, checked against the specific keyword that should catch it:
 | `capabilities-retained.yaml` | named capabilities dropped instead of `ALL` | `contains` |
 | `root-user.yaml` | `podSecurityContext.runAsUser: 0` | `minimum` |
 | `unconfined-seccomp.yaml` | `seccompProfile.type: Unconfined` | `enum` |
+| `network-policy-open-namespace-selector.yaml` | `namespaceLabels: {}`, which matches every namespace | `minProperties` |
+| `network-policy-rule-without-ports.yaml` | an allowlist entry that limits no port | `required` |
+| `network-policy-named-egress-port.yaml` | a named port on egress, resolved in somebody else's pod | `type` (via `allOf`) |
+| `network-policy-peerless-rule.yaml` | an allowlist entry with no peer at all | `anyOf` |
 
-The last five each have a near-miss that would pass a looser assertion, which is
+Several of these have a near-miss that would pass a looser assertion, which is
 why the keyword matters and not just the failure. `drop: [NET_RAW, SYS_CHROOT]`
 is a valid list of capabilities that happens not to include the one that counts,
 so `contains` is what catches it. `runAsUser: 0` and `runAsNonRoot: true` are
 individually valid and only contradict each other, which JSON Schema cannot see
-— so root is excluded by the `minimum` on the UID instead.
+— so root is excluded by the `minimum` on the UID instead. `namespaceLabels: {}`
+is a valid label selector, and an empty selector matches *everything*, so what
+catches it is `minProperties` and nothing about the labels. A named egress port
+is legal on ingress and meaningless on egress, so `type: integer` is added in
+the `allOf` branch over `networkPolicyRule` rather than tightened for both.
+
+`render-fixtures/` next door is the mirror image: values files that must
+**render**, covering template paths no environment file reaches.
 
 `aws/cdk/test/audit-helm-values.test.ts` asserts each is rejected, and by the
 keyword named above rather than by any error at all. `.github/scripts/lint-helm-chart.sh`

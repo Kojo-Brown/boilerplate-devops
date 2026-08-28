@@ -1,0 +1,11 @@
+# An entry with ports and no peer at all. The API server rejects the empty
+# NetworkPolicyPeer this would render, but only at apply time — and to a reader
+# it looks like "port 443 is allowed", which is a rule about everybody. One of
+# `cidr`, `namespaceLabels` or `podLabels` has to be there.
+environment: staging
+networkPolicy:
+  egress:
+    - name: upstream-api
+      ports:
+        - port: 443
+          protocol: TCP

@@ -11,8 +11,10 @@ import {
   auditChart,
   auditChartMetadata,
   auditEnvironment,
+  auditNetworkPolicy,
   auditPodSecurity,
   auditSchemaHygiene,
+  cidrContains,
   coalesceValues,
   compileSchema,
   formatViolations,
@@ -546,6 +548,311 @@ describe('auditPodSecurity', () => {
   });
 });
 
+describe('cidrContains', () => {
+  it('matches an address inside the block', () => {
+    expect(cidrContains('10.0.0.0/16', '10.0.5.7')).toBe(true);
+  });
+
+  it('rejects an address outside it', () => {
+    expect(cidrContains('10.0.0.0/16', '10.1.0.1')).toBe(false);
+  });
+
+  // `-1 << 32` in JavaScript is `-1`, not `0`, because the shift count is taken
+  // modulo 32 — so the naive mask for a /0 is every bit set and the block that
+  // contains every address would report containing none. That is the one CIDR
+  // in this audit that most needs to be caught, so it gets its own test.
+  it('treats /0 as containing everything', () => {
+    expect(cidrContains('0.0.0.0/0', '169.254.169.254')).toBe(true);
+    expect(cidrContains('0.0.0.0/0', '8.8.8.8')).toBe(true);
+  });
+
+  it('treats /32 as a single address', () => {
+    expect(cidrContains('169.254.169.254/32', '169.254.169.254')).toBe(true);
+    expect(cidrContains('169.254.169.254/32', '169.254.169.253')).toBe(false);
+  });
+
+  it('handles a prefix that does not land on an octet boundary', () => {
+    expect(cidrContains('192.168.1.0/25', '192.168.1.127')).toBe(true);
+    expect(cidrContains('192.168.1.0/25', '192.168.1.128')).toBe(false);
+  });
+
+  it('reports false rather than throwing on input the schema would have rejected', () => {
+    expect(cidrContains('not-a-cidr', '10.0.0.1')).toBe(false);
+    expect(cidrContains('10.0.0.0/33', '10.0.0.1')).toBe(false);
+    expect(cidrContains('10.0.0.0/16', '999.0.0.1')).toBe(false);
+    expect(cidrContains('10.0.0/16', '10.0.0.1')).toBe(false);
+  });
+});
+
+describe('auditNetworkPolicy', () => {
+  /** A release whose policy is coherent. Each test breaks one thing. */
+  const CLOSED = {
+    containerPort: 8080,
+    service: { type: 'ClusterIP', port: 80 },
+    networkPolicy: {
+      enabled: true,
+      dns: {
+        enabled: true,
+        namespaceLabels: { 'kubernetes.io/metadata.name': 'kube-system' },
+        podLabels: { 'k8s-app': 'kube-dns' },
+      },
+      ingress: [],
+      egress: [
+        {
+          name: 'aws-apis',
+          cidr: '0.0.0.0/0',
+          except: ['169.254.169.254/32'],
+          ports: [{ port: 443, protocol: 'TCP' }],
+        },
+      ],
+    },
+  };
+
+  const policyWith = (overrides: Record<string, unknown>): Record<string, unknown> => ({
+    ...CLOSED,
+    networkPolicy: { ...CLOSED.networkPolicy, ...overrides },
+  });
+
+  const audit = (merged: Record<string, unknown>): ViolationRule[] =>
+    rules(auditNetworkPolicy(merged, 'k8s/charts/app/values-staging.yaml'));
+
+  it('accepts a default-deny release with a metadata-excepting egress allowlist', () => {
+    expect(audit(CLOSED)).toEqual([]);
+  });
+
+  it('reports nothing for a chart with no networkPolicy block at all', () => {
+    expect(audit({ containerPort: 8080 })).toEqual([]);
+  });
+
+  it('flags a release with the policy turned off', () => {
+    expect(audit(policyWith({ enabled: false }))).toEqual(['network-policy-disabled']);
+  });
+
+  it('stops at the disabled policy rather than auditing rules nothing enforces', () => {
+    // Every other rule below describes a policy that is subtly wrong. With
+    // enforcement off none of them is wrong in any way that matters, and
+    // reporting six findings for one cause buries the cause.
+    expect(
+      audit(
+        policyWith({
+          enabled: false,
+          dns: { enabled: false },
+          egress: [{ name: 'open', cidr: '0.0.0.0/0', ports: [{ port: 443 }] }],
+        }),
+      ),
+    ).toEqual(['network-policy-disabled']);
+  });
+
+  it('flags a default-deny egress policy with no route to DNS', () => {
+    expect(audit(policyWith({ dns: { enabled: false } }))).toEqual(['dns-egress-blocked']);
+  });
+
+  it('accepts DNS reached through an explicit egress entry instead', () => {
+    expect(
+      audit(
+        policyWith({
+          dns: { enabled: false },
+          egress: [
+            {
+              name: 'node-local-dns',
+              podLabels: { 'k8s-app': 'node-local-dns' },
+              ports: [
+                { port: 53, protocol: 'UDP' },
+                { port: 53, protocol: 'TCP' },
+              ],
+            },
+          ],
+        }),
+      ),
+    ).toEqual([]);
+  });
+
+  it('flags an egress block that leaves the metadata service reachable', () => {
+    expect(
+      audit(policyWith({ egress: [{ name: 'aws-apis', cidr: '0.0.0.0/0', ports: [{ port: 443 }] }] })),
+    ).toEqual(['metadata-service-reachable']);
+  });
+
+  it('accepts an except that covers the metadata address through a wider range', () => {
+    expect(
+      audit(
+        policyWith({
+          egress: [
+            {
+              name: 'aws-apis',
+              cidr: '0.0.0.0/0',
+              except: ['169.254.0.0/16'],
+              ports: [{ port: 443 }],
+            },
+          ],
+        }),
+      ),
+    ).toEqual([]);
+  });
+
+  it('leaves an egress block that does not reach the metadata address alone', () => {
+    expect(
+      audit(policyWith({ egress: [{ name: 'vpc', cidr: '10.0.0.0/16', ports: [{ port: 443 }] }] })),
+    ).toEqual([]);
+  });
+
+  it('flags an ingress entry that admits every address', () => {
+    expect(
+      audit(policyWith({ ingress: [{ name: 'world', cidr: '0.0.0.0/0', ports: [{ port: 8080 }] }] })),
+    ).toEqual(['ingress-from-anywhere']);
+  });
+
+  it('leaves a narrow ingress ipBlock alone, public address or not', () => {
+    // A `/0` is the whole internet; a named address is an allowlist entry doing
+    // its job, and flagging it because it happens to be routable would make the
+    // rule a rule against ipBlock rather than against openness.
+    expect(
+      audit(
+        policyWith({
+          ingress: [
+            { name: 'monitoring-probe', cidr: '203.0.113.7/32', ports: [{ port: 'http' }] },
+            { name: 'vpc', cidr: '10.0.0.0/16', ports: [{ port: 8080 }] },
+          ],
+        }),
+      ),
+    ).toEqual([]);
+  });
+
+  it('flags an ingress entry naming the Service port, and says why policy never sees it', () => {
+    const violations = auditNetworkPolicy(
+      policyWith({
+        ingress: [
+          {
+            name: 'ingress-controller',
+            namespaceLabels: { 'kubernetes.io/metadata.name': 'ingress-nginx' },
+            ports: [{ port: 80, protocol: 'TCP' }],
+          },
+        ],
+      }),
+      'k8s/charts/app/values-staging.yaml',
+    );
+
+    expect(rules(violations)).toEqual(['ingress-port-mismatch']);
+    expect(violations[0].message).toContain('service.port');
+    expect(violations[0].message).toContain('kube-proxy');
+  });
+
+  it('flags an ingress port that is neither the container port nor the Service port', () => {
+    const violations = auditNetworkPolicy(
+      policyWith({
+        ingress: [
+          {
+            name: 'ingress-controller',
+            namespaceLabels: { 'kubernetes.io/metadata.name': 'ingress-nginx' },
+            ports: [{ port: 9090 }],
+          },
+        ],
+      }),
+      'k8s/charts/app/values-staging.yaml',
+    );
+
+    expect(rules(violations)).toEqual(['ingress-port-mismatch']);
+    expect(violations[0].message).not.toContain('service.port');
+  });
+
+  it('accepts the container port by number and by name', () => {
+    expect(
+      audit(
+        policyWith({
+          ingress: [
+            {
+              name: 'by-number',
+              podLabels: { 'app.kubernetes.io/name': 'canary-analysis' },
+              ports: [{ port: 8080 }],
+            },
+            {
+              name: 'by-name',
+              podLabels: { 'app.kubernetes.io/name': 'ingress-nginx' },
+              ports: [{ port: 'http' }],
+            },
+          ],
+        }),
+      ),
+    ).toEqual([]);
+  });
+
+  it('flags a named ingress port the pod template does not declare', () => {
+    expect(
+      audit(
+        policyWith({
+          ingress: [
+            {
+              name: 'metrics',
+              podLabels: { 'app.kubernetes.io/name': 'prometheus' },
+              ports: [{ port: 'metrics' }],
+            },
+          ],
+        }),
+      ),
+    ).toEqual(['ingress-port-mismatch']);
+  });
+
+  it('does not check egress ports against the container port', () => {
+    // The destination of an egress rule is somebody else's pod, so its ports
+    // have nothing to do with what this one listens on.
+    expect(
+      audit(
+        policyWith({
+          egress: [
+            {
+              name: 'postgres',
+              podLabels: { 'app.kubernetes.io/name': 'postgres' },
+              ports: [{ port: 5432 }],
+            },
+          ],
+        }),
+      ),
+    ).toEqual([]);
+  });
+
+  it('flags two allowlist entries sharing a name, in either direction', () => {
+    expect(
+      audit(
+        policyWith({
+          ingress: [
+            { name: 'dup', podLabels: { a: 'b' }, ports: [{ port: 'http' }] },
+            { name: 'dup', podLabels: { c: 'd' }, ports: [{ port: 'http' }] },
+          ],
+          egress: [
+            { name: 'dup', cidr: '10.0.0.0/16', ports: [{ port: 443 }] },
+            { name: 'dup', cidr: '10.1.0.0/16', ports: [{ port: 443 }] },
+          ],
+        }),
+      ),
+    ).toEqual(['duplicate-network-policy-rule', 'duplicate-network-policy-rule']);
+  });
+
+  it('names the same rule twice only once per direction, not per pair', () => {
+    expect(
+      audit(
+        policyWith({
+          egress: [
+            { name: 'dup', cidr: '10.0.0.0/16', ports: [{ port: 443 }] },
+            { name: 'dup', cidr: '10.1.0.0/16', ports: [{ port: 443 }] },
+            { name: 'dup', cidr: '10.2.0.0/16', ports: [{ port: 443 }] },
+          ],
+        }),
+      ),
+    ).toEqual(['duplicate-network-policy-rule', 'duplicate-network-policy-rule']);
+  });
+
+  it('reports nothing rather than throwing on values the schema would have rejected', () => {
+    expect(
+      audit(
+        policyWith({
+          ingress: 'not a list',
+          egress: [null, { name: 42, ports: 'not a list' }],
+        }),
+      ),
+    ).toEqual([]);
+  });
+});
+
 describe('replicaFloor', () => {
   it('reads the HPA floor when autoscaling is on', () => {
     expect(replicaFloor({ replicaCount: 8, autoscaling: { enabled: true, minReplicas: 3 } })).toEqual(
@@ -687,6 +994,17 @@ describe('the schema fixtures', () => {
     // compare them — so root is excluded at the UID instead.
     ['root-user.yaml', 'minimum', '/podSecurityContext/runAsUser'],
     ['unconfined-seccomp.yaml', 'enum', '/podSecurityContext/seccompProfile/type'],
+    // `minProperties`, not anything about the labels themselves: an empty
+    // `matchLabels` is a perfectly valid selector that happens to match every
+    // object, so the entry that reads as the narrowest in the file is the
+    // widest one in it.
+    ['network-policy-open-namespace-selector.yaml', 'minProperties', '/networkPolicy/ingress/0/namespaceLabels'],
+    ['network-policy-rule-without-ports.yaml', 'required', '/networkPolicy/ingress/0'],
+    // The egress refinement, not the shared port definition — a named port is
+    // legal on ingress and meaningless on egress, so `type: integer` is added
+    // in the `allOf` branch rather than tightened for both directions.
+    ['network-policy-named-egress-port.yaml', 'type', '/networkPolicy/egress/0/ports/0/port'],
+    ['network-policy-peerless-rule.yaml', 'anyOf', '/networkPolicy/egress/0'],
   ];
 
   it.each(FIXTURES)('rejects %s with the %s keyword', (file, keyword, instancePath) => {
@@ -713,6 +1031,60 @@ describe('the schema fixtures', () => {
       const merged = coalesceValues(defaults, yaml(path.join(APP_CHART, `values-${environment}.yaml`)));
 
       expect(validate(merged)).toBe(true);
+    }
+  });
+});
+
+/**
+ * The other half of the pair. `schema-fixtures/` keeps the schema from quietly
+ * stopping to catch anything; these keep the templates from quietly stopping to
+ * render anything.
+ *
+ * A chart's gates only execute the template paths its own values files reach.
+ * `networkPolicy.ingress` is empty in `values.yaml` and in both environment
+ * files — correctly, since the cluster has no ingress controller yet — so the
+ * entire ingress half of `templates/networkpolicy.yaml` is rendered by nothing
+ * unless something turns it on. `.github/scripts/lint-helm-chart.sh` renders
+ * these; the assertions here are that the schema still accepts them, because a
+ * fixture that has drifted into being rejected turns into a render the script
+ * silently stops performing.
+ */
+describe('the render fixtures', () => {
+  const defaults = yaml(path.join(APP_CHART, 'values.yaml'));
+  const validate = compileSchema(json(path.join(APP_CHART, 'values.schema.json')));
+
+  const FIXTURES: readonly string[] = ['network-policy-allowlist.yaml'];
+
+  it.each(FIXTURES)('accepts %s', (file) => {
+    const merged = coalesceValues(defaults, yaml(path.join(APP_CHART, 'render-fixtures', file)));
+
+    expect(validate(merged)).toBe(true);
+  });
+
+  it('covers every fixture on disk', () => {
+    const onDisk = fs
+      .readdirSync(path.join(APP_CHART, 'render-fixtures'))
+      .filter((file) => file.endsWith('.yaml'))
+      .sort();
+
+    expect(onDisk).toEqual([...FIXTURES].sort());
+  });
+
+  it('exercises template paths the environment files leave off', () => {
+    // Without this the fixture could be quietly reduced to a copy of the
+    // defaults and go on passing every assertion above while covering nothing.
+    for (const file of FIXTURES) {
+      const merged = coalesceValues(defaults, yaml(path.join(APP_CHART, 'render-fixtures', file)));
+      const policy = merged.networkPolicy as { ingress?: unknown[] };
+
+      expect(policy.ingress?.length ?? 0).toBeGreaterThan(0);
+    }
+
+    for (const environment of ENVIRONMENTS) {
+      const merged = coalesceValues(defaults, yaml(path.join(APP_CHART, `values-${environment}.yaml`)));
+      const policy = merged.networkPolicy as { ingress?: unknown[] };
+
+      expect(policy.ingress).toEqual([]);
     }
   });
 });

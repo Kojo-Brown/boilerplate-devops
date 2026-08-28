@@ -143,3 +143,60 @@ policies:
     periodSeconds: {{ .periodSeconds }}
 {{- end }}
 {{- end }}
+
+{{/*
+One NetworkPolicy peer, rendered as a single-element list from one entry of
+`.Values.networkPolicy.ingress` or `.egress`. Called with that entry as its
+context.
+
+A single element, deliberately. `from`/`to` is a list, and the difference
+between one element carrying both selectors and two elements carrying one each
+is the difference between AND and OR — written almost identically, silently
+accepted either way, and the single most common way an allowlist ends up
+broader than its author read it. Because one values entry becomes one peer,
+`namespaceLabels` and `podLabels` in the same entry are always ANDed, and
+allowing two sources means writing two entries.
+
+`ipBlock` and the selectors are mutually exclusive within a peer — the API
+accepts a peer carrying both and the CNI's interpretation is not something to
+rely on — so `values.schema.json` rejects an entry that sets `cidr` alongside
+either selector, and this template need not choose between them.
+
+Built as a map and passed through `toYaml` rather than written out as literal
+YAML: the alternative is hand-managed indentation under a `- ` list marker for
+a structure that is two or three levels deep and conditionally present, which
+is where template-rendered manifests go wrong in ways `helm lint` cannot see.
+*/}}
+{{- define "app.networkPolicyPeer" -}}
+{{- $peer := dict -}}
+{{- if hasKey . "cidr" -}}
+  {{- $block := dict "cidr" .cidr -}}
+  {{- with .except }}{{- $_ := set $block "except" . -}}{{- end -}}
+  {{- $_ := set $peer "ipBlock" $block -}}
+{{- else -}}
+  {{- with .namespaceLabels }}{{- $_ := set $peer "namespaceSelector" (dict "matchLabels" .) -}}{{- end -}}
+  {{- with .podLabels }}{{- $_ := set $peer "podSelector" (dict "matchLabels" .) -}}{{- end -}}
+{{- end -}}
+{{- toYaml (list $peer) -}}
+{{- end }}
+
+{{/*
+The ports of one allowlist entry, rendered from its `ports` list.
+
+`protocol` defaults to TCP here rather than being left out. Kubernetes defaults
+it to TCP too, so the rendered manifest is the same either way — but a rule
+that omits it reads as "any protocol" to most people looking at
+`kubectl describe netpol`, and that reading is wrong. Writing it out costs a
+line and removes the question.
+
+The schema requires at least one port per entry: a `from`/`to` with no `ports`
+allows every port from that peer, which is an allowlist entry that names a
+source and then does not limit what it may do.
+*/}}
+{{- define "app.networkPolicyPorts" -}}
+{{- $ports := list -}}
+{{- range . -}}
+{{- $ports = append $ports (dict "port" .port "protocol" (.protocol | default "TCP")) -}}
+{{- end -}}
+{{- toYaml $ports -}}
+{{- end }}

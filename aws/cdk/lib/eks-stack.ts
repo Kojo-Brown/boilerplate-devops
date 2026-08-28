@@ -216,6 +216,10 @@ export interface EksStackProps extends cdk.StackProps {
  *   - The node role deliberately omits `AmazonEKS_CNI_Policy`: the VPC CNI
  *     gets those permissions through IRSA instead, so ENI manipulation is not
  *     granted to every pod that reaches the node role
+ *   - The VPC CNI runs with `enableNetworkPolicy`, so NetworkPolicy objects are
+ *     enforced rather than merely stored. Kubernetes has no built-in policy
+ *     controller: without this the `app` chart's default-deny policy is
+ *     accepted by the API server, visible in `kubectl get netpol`, and inert
  *   - Root volumes are gp3 and encrypted
  *
  * Node groups are created through {@link addManagedNodeGroup}, which attaches a
@@ -356,6 +360,29 @@ export class EksStack extends cdk.Stack {
       clusterName: this.cluster.clusterName,
       serviceAccountRoleArn: vpcCniRole.roleArn,
       resolveConflicts: 'OVERWRITE',
+      // NetworkPolicy enforcement, and it is off unless this says otherwise.
+      //
+      // Kubernetes ships no NetworkPolicy controller. The API server validates
+      // and stores the objects whatever the cluster does with them, so on a CNI
+      // that does not implement policy a default-deny policy is accepted,
+      // appears in `kubectl get networkpolicy`, describes correctly, and
+      // enforces nothing. There is no status field, no event, and no way to
+      // tell the two apart from the cluster — which makes this the one add-on
+      // setting whose absence looks exactly like a working security control.
+      //
+      // Turning it on starts the network policy agent in the aws-node
+      // DaemonSet, which compiles policies to eBPF programs on each node. It
+      // needs no additional IAM: the agent watches policy objects through the
+      // Kubernetes API, not through AWS. Policy decisions are logged on the
+      // node at /var/log/aws-routed-eni/network-policy-agent.log; shipping them
+      // to CloudWatch is a further `nodeAgent` setting and does need
+      // permissions on the node role, so it is left to the operator — see
+      // docs/network-policies.md §5.
+      //
+      // The value is the string "true", not a boolean: the add-on's
+      // configuration schema types it as a string, and a JSON boolean is
+      // rejected by the EKS API at deploy time.
+      configurationValues: JSON.stringify({ enableNetworkPolicy: 'true' }),
     });
 
     const kubeProxy = new eks.CfnAddon(this, 'KubeProxyAddon', {

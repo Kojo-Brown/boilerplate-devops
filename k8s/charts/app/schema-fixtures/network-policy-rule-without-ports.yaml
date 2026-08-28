@@ -1,0 +1,12 @@
+# An allowlist entry with a peer and no ports allows that peer *every* port.
+# The entry names a source, which is the part review reads, and then does not
+# limit what it may do, which is the part that matters — so `ports` is required
+# rather than defaulted to anything.
+environment: staging
+networkPolicy:
+  ingress:
+    - name: ingress-controller
+      namespaceLabels:
+        kubernetes.io/metadata.name: ingress-nginx
+      podLabels:
+        app.kubernetes.io/name: ingress-nginx

@@ -23,6 +23,7 @@ Reusable CI/CD workflows and AWS infrastructure templates.
 | DORA four keys — collection + dashboard | `aws/cdk/lib/dora-metrics-stack.ts`, `workflow-templates/emit-dora-deployment.yml` |
 | EKS cluster — managed node groups + IRSA | `aws/cdk/lib/eks-stack.ts` |
 | Helm chart — per-environment values, schema-validated | `k8s/charts/app/` |
+| Default-deny NetworkPolicy + allowlist, enforced by the CNI | `k8s/charts/app/templates/networkpolicy.yaml` |
 
 ## Usage
 
@@ -289,9 +290,9 @@ version/kubectl-layer pairing, the subnet tags the load-balancer controller
 needs, and what is deliberately left to later Phase 8 items.
 
 `k8s/charts/app` is what gets deployed onto it: a Deployment, Service,
-ServiceAccount annotated for IRSA, ConfigMap, PodDisruptionBudget and
-HorizontalPodAutoscaler, installed with `values-staging.yaml` or
-`values-production.yaml`.
+ServiceAccount annotated for IRSA, ConfigMap, PodDisruptionBudget,
+HorizontalPodAutoscaler and a pair of NetworkPolicies, installed with
+`values-staging.yaml` or `values-production.yaml`.
 
 Every value is constrained by `values.schema.json`, and the point of that is not
 documentation — it is that `replicas: 3`, which is the Deployment field and not
@@ -303,8 +304,10 @@ have drifted open, and checks the rules JSON Schema cannot express
 disagrees with its own filename); the `Helm chart` job runs `helm lint --strict`
 and `helm template` per environment, because the validator that decides whether
 a real upgrade succeeds is Helm's own and not ajv's. `schema-fixtures/` holds
-twelve values files that must each be rejected, so a schema that has stopped
-catching anything fails rather than passing quietly.
+sixteen values files that must each be rejected, so a schema that has stopped
+catching anything fails rather than passing quietly, and `render-fixtures/` is
+its mirror image — values that must render, covering the template paths no
+environment file reaches.
 
 The pods run non-root as UID 10001, under `RuntimeDefault` seccomp, with a
 read-only root filesystem, `allowPrivilegeEscalation: false` and every Linux
@@ -317,6 +320,20 @@ size-limited `emptyDir` at `/tmp`, since nearly every runtime writes there —
 rather than by turning the flag off.
 
 [pss]: https://kubernetes.io/docs/concepts/security/pod-security-standards/
+
+The pod network is closed the same way. The chart renders a default-deny
+NetworkPolicy over its own pods — never the whole namespace, which is not a
+chart's to close — plus an allowlist that today permits cluster DNS and HTTPS to
+AWS outbound and nothing inbound. What makes that more than a manifest is one
+line in `EksStack`: Kubernetes ships no NetworkPolicy controller, so on a CNI
+that does not implement policy the objects are stored, listed by `kubectl`,
+described correctly and enforced by nothing, with no status field anywhere that
+says so. The VPC CNI add-on is configured with `enableNetworkPolicy` for exactly
+that reason. `npm run audit:helm` covers the rules a schema cannot: an ingress
+entry naming `service.port` (which kube-proxy has already rewritten, so it
+matches nothing and the traffic is dropped), an egress block that leaves the
+instance metadata address reachable, and a default-deny with no route to DNS.
+See [docs/network-policies.md](./docs/network-policies.md).
 
 Scaling is two loops, and they only work together. The chart's HPA moves pods
 against CPU as a fraction of the request and reacts in about ninety seconds; the

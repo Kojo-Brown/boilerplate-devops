@@ -1,0 +1,58 @@
+# Values that must **render**, exercising template paths no environment file
+# reaches. See render-fixtures/README.md.
+#
+# `networkPolicy.ingress` is empty in `values.yaml`, `values-staging.yaml` and
+# `values-production.yaml`, and correctly so — the cluster has no ingress
+# controller yet, so nothing should be reaching these pods. That leaves the
+# entire ingress half of `templates/networkpolicy.yaml` unrendered by every
+# gate, which is how a template that produces invalid YAML gets discovered by
+# the first person to add a rule rather than by CI.
+#
+# The three entries below are the three peer shapes the helper builds, so
+# rendering this file covers all of them:
+#
+#   1. namespaceLabels + podLabels — ANDed, because one entry is one peer
+#   2. podLabels alone             — the release's own namespace, not every one
+#   3. cidr + except               — an ipBlock
+#
+# and both port forms: a named container port (ingress only) and a number.
+environment: staging
+
+networkPolicy:
+  ingress:
+    # Cross-namespace: pods labelled as the ingress controller, in the
+    # ingress-nginx namespace. Not "anything in ingress-nginx", and not
+    # "anything anywhere labelled ingress-nginx" — the two selectors are one
+    # peer and are therefore ANDed.
+    - name: ingress-controller
+      namespaceLabels:
+        kubernetes.io/metadata.name: ingress-nginx
+      podLabels:
+        app.kubernetes.io/name: ingress-nginx
+      ports:
+        # By name. On ingress the destination is this chart's own pod, so the
+        # name resolves against `containerPort` and stays correct when it moves.
+        - port: http
+          protocol: TCP
+
+    # Same namespace: no namespaceLabels, which restricts the peer to this
+    # release's own namespace rather than opening it to every namespace.
+    # `protocol` is omitted here to exercise the TCP default the helper writes
+    # out explicitly.
+    - name: canary-analysis
+      podLabels:
+        app.kubernetes.io/name: canary-analysis
+      ports:
+        - port: http
+
+  egress:
+    # An ipBlock with an except, and a numeric port. Egress ports may not be
+    # named: the name would resolve against the destination pod's containers,
+    # which belong to somebody else.
+    - name: aws-apis
+      cidr: 0.0.0.0/0
+      except:
+        - 169.254.169.254/32
+      ports:
+        - port: 443
+          protocol: TCP

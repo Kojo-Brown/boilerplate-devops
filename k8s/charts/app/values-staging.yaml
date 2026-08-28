@@ -57,3 +57,10 @@ config:
 podDisruptionBudget:
   enabled: true
   minAvailable: 1
+
+# `networkPolicy` is inherited whole from the chart defaults: the same
+# default-deny, the same DNS rule, the same HTTPS-to-AWS egress entry, and the
+# same empty ingress allowlist. Staging runs the identical policy on purpose —
+# a boundary only production has is one whose first real exercise is in
+# production. Narrowing egress per environment (VPC endpoint ranges instead of
+# 0.0.0.0/0) is the change that would go here; see docs/network-policies.md §4.
