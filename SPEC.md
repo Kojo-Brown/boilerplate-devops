@@ -159,7 +159,7 @@ no better signal exists in the git object graph.
 - [x] Helm chart with values per environment and a schema-validated `values.yaml` — `k8s/charts/app`, installed with `values-staging.yaml` or `values-production.yaml`; the schema closes every object, and two gates plus five must-fail fixtures keep it from quietly stopping to catch anything (PR #35)
 - [x] Horizontal Pod Autoscaler + Cluster Autoscaler with load-tested thresholds — an `autoscaling/v2` HPA in the chart and the upstream Cluster Autoscaler in `EksStack`, pinned to the cluster's Kubernetes version and discovering node groups by ASG tag; the thresholds are derived rather than measured, because there is no cluster to measure against (PR #36)
 - [x] Pod security: non-root, read-only rootfs, dropped capabilities, seccomp — the chart had no `securityContext` at all, which is not neutral: root, containerd's default 14 capabilities, a writable rootfs and seccomp Unconfined are what Kubernetes does when the fields are absent. Both contexts are now `const` in the schema rather than defaults, so an environment file cannot relax one (PR #37)
-- [ ] NetworkPolicy default-deny with explicit allowlists
+- [x] NetworkPolicy default-deny with explicit allowlists — two objects per release (the deny floor and the allowlist, split so that losing the second is a service that stops talking rather than a boundary that stops existing), plus the CNI setting that makes either of them mean anything: Kubernetes ships no policy controller, so without `enableNetworkPolicy` on the VPC CNI the objects are stored, listed and enforced by nothing, with no field anywhere that says so (PR #38)
 - [ ] GitOps with ArgoCD: app-of-apps, sync waves, and drift detection
 - [ ] Ingress with cert-manager, external-dns, and automatic TLS renewal
 
@@ -365,6 +365,83 @@ to check. Checkov still does not scan the rendered manifests; that needs the
 Helm job to render into an artifact the Checkov job reads, which is its own
 change. Pod topology spread is still not required by the chart, and the
 metrics-server gap from item 3 is unchanged.
+
+Item 5 complete as of PR #38 (2026-08-28). The chart renders
+`<release>-default-deny` and `<release>-allow`, both selecting this release's
+pods and never `podSelector: {}` — a namespace-wide default-deny is what the
+examples show and is not a chart's to apply, since it would cut the network out
+from under pods the release did not create.
+
+The half that is easy to skip is `EksStack`. Kubernetes ships no NetworkPolicy
+controller: the API server validates and stores a policy whatever the cluster
+does with it, so on a CNI that does not implement policy a default-deny is
+accepted, appears in `kubectl get netpol`, describes correctly, and enforces
+nothing — with no status field, condition or event that distinguishes it from
+one being enforced. It is the one control whose absence looks exactly like it
+working. The `vpc-cni` add-on now carries
+`configurationValues: {"enableNetworkPolicy":"true"}` — the string `"true"`,
+because the add-on's schema types it as a string and the EKS API rejects a JSON
+boolean — and needs no extra IAM, since the agent watches policy objects through
+the Kubernetes API rather than through AWS.
+
+Two objects rather than one is a deliberate redundancy. Policies are additive,
+so a single object carrying both `policyTypes` and the allow rules denies
+exactly the same traffic — until someone edits or deletes it during an incident,
+at which point the pods go from allowlisted to *unrestricted* rather than to
+denied. Splitting them makes that failure loud.
+
+The defaults allow cluster DNS (UDP and TCP 53; TCP carries the retry for
+responses over 512 bytes) and HTTPS to AWS excepting `169.254.169.254/32`. That
+except is the second control and not the first: IMDSv2 at hop limit 1 on the
+launch template is what actually puts metadata out of a container's reach. It
+earns its place because the first belongs to the node and can be lowered for an
+afternoon of debugging, and this one belongs to the release and cannot.
+
+Six audit rules cover what JSON Schema cannot, and every one of them describes a
+policy Kubernetes accepts and stores: a release with the policy off, a
+default-deny egress with no route to DNS (which surfaces as five-second latency
+and `EAI_AGAIN`, not as anything naming the network), an egress `ipBlock`
+containing the metadata address, an ingress entry admitting `0.0.0.0/0`, an
+ingress port the pods do not listen on — usually `service.port`, which kube-proxy
+has already rewritten to `containerPort` before policy is evaluated, so the entry
+matches nothing and the traffic is dropped by the deny — and two entries sharing
+a name. The schema takes the rest: `minProperties` on every selector, because an
+empty `matchLabels` matches every namespace and reads as the narrowest rule in
+the file; `ports` required and non-empty; egress ports numeric, because a named
+port resolves against the destination pod's containers, which belong to somebody
+else.
+
+`render-fixtures/` is new and is the mirror image of `schema-fixtures/`. A
+chart's gates only execute the template paths its own values files reach, so the
+ingress half of this template — empty in both environments, correctly, because
+there is no ingress controller yet — was rendered by nothing and would have been
+found broken by whoever first added a rule. `lint-helm-chart.sh` renders each
+fixture and the jest suite asserts they still exercise something the environment
+files do not, so a fixture cannot be quietly reduced to a copy of the defaults.
+
+`get.helm.sh` is still blocked by the scheduled agent's egress policy (403 on
+CONNECT) and the binary is not on GitHub releases either, so this run built Helm
+3.19.0 from source with `go install helm.sh/helm/v3/cmd/helm@v3.19.0` —
+`proxy.golang.org` is reachable — and ran the `Helm chart` job's script against
+the exact version CI installs, rather than against the 3.10.1 npm package item 2
+had to settle for.
+
+Known gaps carried into item 6: **nothing is deployed, so no policy here has
+been observed to permit or deny a packet** — the gates render manifests, and
+everything above is a property of those manifests plus documented CNI behaviour.
+The kubelet-probe exemption is the sharpest example: a default-deny ingress
+policy does not fail readiness probes because the VPC CNI's agent does not apply
+policy to node-to-pod traffic, which is documented behaviour of that CNI and not
+an API guarantee, so it is the first thing to check on a cluster running
+something else. Egress is IP-based; narrowing `0.0.0.0/0:443` to VPC endpoint
+ranges needs interface endpoints this repository does not provision. There is no
+cluster-wide baseline — the chart closes its own pods, every other pod in the
+cluster is unrestricted, and nothing stops a namespace being created without a
+policy. Policy decisions are logged only on the node; forwarding them to
+CloudWatch needs `logs:*` on the node role and is a per-connection log stream
+with a per-connection bill, so it is left to the operator. The metrics-server
+gap from item 3, the unenforced `restricted` namespace label from item 4, and
+Checkov not scanning the rendered manifests are all unchanged.
 
 ## Phase 9 — Supply-Chain Security
 - [ ] SBOM generation (CycloneDX) attached to every release artifact
