@@ -1,0 +1,16 @@
+# `namespaceSelector: {matchLabels: {}}` is not a narrower selector than one
+# with labels in it — an empty selector matches every object, so this entry
+# admits the named pods from every namespace in the cluster, including whatever
+# gets installed next. It is the widest rule in the file and the one that reads
+# as the most specific, which is why `minProperties` is on `matchLabels` rather
+# than left to review.
+environment: staging
+networkPolicy:
+  ingress:
+    - name: ingress-controller
+      namespaceLabels: {}
+      podLabels:
+        app.kubernetes.io/name: ingress-nginx
+      ports:
+        - port: http
+          protocol: TCP

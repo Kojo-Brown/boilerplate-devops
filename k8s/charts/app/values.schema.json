@@ -19,7 +19,8 @@
     "probes",
     "podDisruptionBudget",
     "strategy",
-    "terminationGracePeriodSeconds"
+    "terminationGracePeriodSeconds",
+    "networkPolicy"
   ],
   "properties": {
     "environment": {
@@ -383,6 +384,39 @@
       "minimum": 0,
       "maximum": 3600
     },
+    "networkPolicy": {
+      "description": "Default-deny NetworkPolicy plus an explicit allowlist. Kubernetes has no built-in policy controller, so these objects are stored and ignored on a CNI that does not implement policy — on EKS that is the VPC CNI's network policy agent, which EksStack enables through the add-on's configurationValues. See docs/network-policies.md.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "dns", "ingress", "egress"],
+      "properties": {
+        "enabled": {
+          "description": "Off is for a cluster whose CNI cannot enforce policy, not for unblocking a service. npm run audit:helm fails on a values file that disables it, so the quick fix is not also the silent one.",
+          "type": "boolean"
+        },
+        "dns": {
+          "description": "Egress to cluster DNS, held apart from the egress allowlist because it is not a policy decision: without it a default-deny egress policy drops every name lookup, and the symptom is a resolver timeout rather than anything that names the network.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "namespaceLabels", "podLabels"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "namespaceLabels": { "$ref": "#/definitions/matchLabels" },
+            "podLabels": { "$ref": "#/definitions/matchLabels" }
+          }
+        },
+        "ingress": {
+          "description": "Who may open a connection to these pods. Empty denies everything, which is the default. Ports here are matched against the pod's containerPort, not the Service port — kube-proxy rewrites the destination before policy is evaluated.",
+          "type": "array",
+          "items": { "$ref": "#/definitions/networkPolicyRule" }
+        },
+        "egress": {
+          "description": "Where these pods may open a connection to. Empty denies everything except cluster DNS, which is rendered from networkPolicy.dns.",
+          "type": "array",
+          "items": { "$ref": "#/definitions/networkPolicyEgressRule" }
+        }
+      }
+    },
     "nodeSelector": {
       "type": "object",
       "additionalProperties": { "type": "string" }
@@ -481,6 +515,110 @@
           "required": ["type", "localhostProfile"]
         }
       ]
+    },
+    "networkPolicyRule": {
+      "description": "One allowlist entry, which becomes exactly one element of a NetworkPolicy from/to list. One element, so namespaceLabels and podLabels are ANDed: the same two selectors split across two elements would mean 'either', and the two forms are one character apart in YAML. Allowing two sources means writing two entries.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "ports"],
+      "anyOf": [
+        {
+          "description": "A peer with neither an ipBlock nor a selector is rejected by the API server, and would read as 'everything' to anyone who got it past that.",
+          "required": ["cidr"]
+        },
+        { "required": ["namespaceLabels"] },
+        { "required": ["podLabels"] }
+      ],
+      "not": {
+        "description": "ipBlock and the selectors are mutually exclusive within one peer. The API server accepts an entry carrying both and what a CNI then does with it is not defined by anything worth relying on, so it is refused here.",
+        "anyOf": [
+          { "required": ["cidr", "namespaceLabels"] },
+          { "required": ["cidr", "podLabels"] }
+        ]
+      },
+      "dependencies": {
+        "except": {
+          "description": "An except list without a cidr has nothing to subtract from.",
+          "required": ["cidr"]
+        }
+      },
+      "properties": {
+        "name": {
+          "description": "Not rendered — a NetworkPolicy rule has no name field. It is what review and an audit failure can refer to, instead of a list index.",
+          "type": "string",
+          "maxLength": 63,
+          "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+        },
+        "namespaceLabels": { "$ref": "#/definitions/matchLabels" },
+        "podLabels": {
+          "description": "Without namespaceLabels alongside it, this matches those pods in the release's own namespace — not in every namespace, which is how it reads.",
+          "$ref": "#/definitions/matchLabels"
+        },
+        "cidr": { "$ref": "#/definitions/cidr" },
+        "except": {
+          "description": "Ranges subtracted from cidr. Each must fall inside it, which the API server checks and this schema cannot.",
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/definitions/cidr" }
+        },
+        "ports": {
+          "description": "Required, and non-empty. A from/to with no ports allows every port from that peer — an allowlist entry that names a source and then does not limit what it may do.",
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/definitions/networkPolicyPort" }
+        }
+      }
+    },
+    "networkPolicyEgressRule": {
+      "description": "An allowlist entry in the egress direction. Identical to an ingress entry except that its ports must be numbers, refined here the way scaleDown refines hpaScalingRules above.",
+      "allOf": [
+        { "$ref": "#/definitions/networkPolicyRule" },
+        {
+          "description": "A named port is resolved against the containers of the pod the traffic is going to. On ingress that is this chart's pod, so `port: http` is exact. On egress it is somebody else's pod, where the name means whatever they called it — so it matches nothing the moment they call it something else, and there is no error anywhere when it stops matching.",
+          "properties": {
+            "ports": {
+              "items": {
+                "properties": { "port": { "type": "integer" } }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "networkPolicyPort": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["port"],
+      "properties": {
+        "port": {
+          "description": "A number, or the name of a container port on the destination pod. Ingress ports are matched against containerPort and not against service.port: the destination is rewritten by kube-proxy before policy is evaluated, so an entry naming the Service's port matches nothing and the connection is dropped.",
+          "oneOf": [
+            { "type": "integer", "minimum": 1, "maximum": 65535 },
+            { "type": "string", "maxLength": 15, "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" }
+          ]
+        },
+        "protocol": {
+          "description": "Defaults to TCP in Kubernetes as well; the chart renders it explicitly, because an omitted protocol reads as 'any' and is not.",
+          "type": "string",
+          "enum": ["TCP", "UDP", "SCTP"]
+        }
+      }
+    },
+    "matchLabels": {
+      "description": "Labels a peer selector matches on. At least one: an empty matchLabels is a selector that matches everything, so `namespaceSelector: {matchLabels: {}}` is every namespace in the cluster — an allowlist entry that reads as narrow and is the widest one there is.",
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "type": "string" },
+      "propertyNames": {
+        "pattern": "^([a-z0-9]([-a-z0-9.]*[a-z0-9])?/)?[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$"
+      }
+    },
+    "cidr": {
+      "description": "An IPv4 CIDR block. IPv6 is not accepted because nothing this repository provisions is dual-stack, and a v6 range in an allowlist on a v4-only cluster is a rule that silently matches nothing.",
+      "type": "string",
+      "pattern": "^((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])/(3[0-2]|[12]?[0-9])$"
     },
     "cpuQuantity": {
       "description": "Kubernetes CPU quantity: cores (1, 1.5) or millicores (500m).",

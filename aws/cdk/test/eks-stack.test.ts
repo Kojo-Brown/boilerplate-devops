@@ -496,6 +496,27 @@ describe('EksStack', () => {
       expect(addonByName(template, 'coredns').ServiceAccountRoleArn).toBeUndefined();
     });
 
+    it('turns NetworkPolicy enforcement on in the CNI', () => {
+      const { template } = makeStack();
+
+      // Without this the app chart's default-deny policy is stored by the API
+      // server and enforced by nothing — and there is no status field, event or
+      // cluster-side signal that distinguishes the two. The assertion is on the
+      // exact string because the add-on's configuration schema types the value
+      // as a string and the EKS API rejects a JSON boolean.
+      expect(
+        JSON.parse(addonByName(template, 'vpc-cni').ConfigurationValues as string),
+      ).toEqual({ enableNetworkPolicy: 'true' });
+    });
+
+    it('leaves the other add-ons unconfigured', () => {
+      const { template } = makeStack();
+
+      for (const name of ['kube-proxy', 'coredns', 'aws-ebs-csi-driver']) {
+        expect(addonByName(template, name).ConfigurationValues).toBeUndefined();
+      }
+    });
+
     it('scopes the EBS CSI role to the driver service account', () => {
       const { template } = makeStack();
       const conditions = resourceProps(template, 'Custom::AWSCDKCfnJson').map((json) =>

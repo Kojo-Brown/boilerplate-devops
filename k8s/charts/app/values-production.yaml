@@ -88,3 +88,9 @@ podDisruptionBudget:
 # Longer than staging: production connections are real, and anything shorter
 # than the longest in-flight request truncates responses on every deploy.
 terminationGracePeriodSeconds: 60
+
+# `networkPolicy` is inherited whole from the chart defaults — see the note at
+# the end of values-staging.yaml. Production adds nothing to the allowlist
+# because nothing reaches these pods yet: the ingress controller is the last
+# Phase 8 item, so `ingress: []` is the state of the cluster rather than an
+# omission. docs/network-policies.md §4 has the entry that opens it.

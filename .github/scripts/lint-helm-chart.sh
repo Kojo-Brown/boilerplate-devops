@@ -10,7 +10,7 @@
 # implementations of the same draft. A schema that only ever passes through ajv
 # is a schema nobody has checked against the tool that enforces it.
 #
-# Three things happen per chart:
+# Four things happen per chart:
 #
 #   1. `helm lint --strict` on the chart's own defaults. Warnings are errors:
 #      the ones Helm emits are things like an unparseable template or an
@@ -18,7 +18,12 @@
 #   2. `helm lint --strict` and `helm template` per environment values file, so
 #      a values file that renders invalid YAML fails here rather than at apply
 #      time.
-#   3. Every file in `schema-fixtures/` must be *rejected*. A gate that has
+#   3. Every file in `render-fixtures/` must *render*. A chart's gates only
+#      execute the template paths its own values files reach, so an optional
+#      block that both environments leave off — the NetworkPolicy ingress
+#      allowlist, today — is unchecked until someone turns it on. These turn
+#      those paths on.
+#   4. Every file in `schema-fixtures/` must be *rejected*. A gate that has
 #      stopped catching anything looks exactly like a gate with nothing to
 #      catch, and these are what tell the two apart.
 #
@@ -76,6 +81,17 @@ for chart in "${charts[@]}"; do
     helm template "$name-$environment" "$chart" \
       --namespace "$environment" \
       --values "$values" \
+      --kube-version "$kube_version" \
+      >/dev/null
+  done
+
+  for fixture in "$chart"/render-fixtures/*.yaml; do
+    echo "==> $chart: template ($(basename "$fixture"))"
+    # No release name per fixture: these are not deployments, and rendering
+    # them under one name keeps the diff between two fixtures about the values
+    # rather than about the object names.
+    helm template "$name-fixture" "$chart" \
+      --values "$fixture" \
       --kube-version "$kube_version" \
       >/dev/null
   done

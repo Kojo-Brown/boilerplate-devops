@@ -65,6 +65,20 @@
  *                             pod that starts and then cannot bind
  *   duplicate-writable-mount  two scratch volumes sharing a name or a mount
  *                             path, which the API server rejects at apply time
+ *   network-policy-disabled   a release with no policy boundary at all
+ *   dns-egress-blocked        a default-deny egress policy with no route to
+ *                             cluster DNS, so every name lookup times out
+ *   metadata-service-reachable
+ *                             an egress allowlist that leaves the instance
+ *                             metadata address inside an ipBlock
+ *   ingress-from-anywhere     an ingress allowlist entry admitting 0.0.0.0/0,
+ *                             which is the default-deny undone
+ *   ingress-port-mismatch     an ingress rule naming a port the pod does not
+ *                             listen on — usually `service.port`, which policy
+ *                             never sees
+ *   duplicate-network-policy-rule
+ *                             two allowlist entries sharing a name, so a
+ *                             failure message cannot say which one it means
  *
  * Usage:
  *   npm run audit:helm                       # audits the repository root
@@ -110,6 +124,21 @@ export const ALLOWED_ADDED_CAPABILITIES: readonly string[] = ['NET_BIND_SERVICE'
  */
 export const PRIVILEGED_PORT_CEILING = 1024;
 
+/**
+ * The EC2 instance metadata service.
+ *
+ * A pod that reaches it gets the *node's* IAM role, which is the union of every
+ * permission any pod on that node needs — the exact thing IRSA exists to avoid.
+ * The node launch template already requires IMDSv2 at a hop limit of 1, which is
+ * what actually puts this address out of a container's reach; the egress
+ * `except` is the second control, and the one that survives someone lowering the
+ * hop limit for an afternoon.
+ */
+export const METADATA_SERVICE_ADDRESS = '169.254.169.254';
+
+/** The port cluster DNS listens on. Both UDP and TCP; see auditNetworkPolicy. */
+export const DNS_PORT = 53;
+
 export type ViolationRule =
   | 'schema-unreadable'
   | 'schema-invalid'
@@ -130,7 +159,13 @@ export type ViolationRule =
   | 'capability-added-back'
   | 'unnecessary-capability'
   | 'privileged-port-unbindable'
-  | 'duplicate-writable-mount';
+  | 'duplicate-writable-mount'
+  | 'network-policy-disabled'
+  | 'dns-egress-blocked'
+  | 'metadata-service-reachable'
+  | 'ingress-from-anywhere'
+  | 'ingress-port-mismatch'
+  | 'duplicate-network-policy-rule';
 
 export interface Violation {
   readonly rule: ViolationRule;
@@ -432,6 +467,7 @@ export const auditEnvironment = (
 
   violations.push(...auditAvailability(merged, environment, file));
   violations.push(...auditPodSecurity(merged, file));
+  violations.push(...auditNetworkPolicy(merged, file));
 
   return violations;
 };
@@ -660,6 +696,280 @@ export const auditPodSecurity = (merged: Record<string, unknown>, file: string):
   }
 
   return violations;
+};
+
+/**
+ * Whether an IPv4 address falls inside a CIDR block.
+ *
+ * Written out rather than pulled in, because the whole of it is four lines and
+ * the alternative is a dependency in the CI path of a repository people copy.
+ *
+ * The `prefix === 0` branch is not a special case for tidiness: `-1 << 32` in
+ * JavaScript is `-1`, not `0`, because the shift count is taken modulo 32. So
+ * the naive mask for `0.0.0.0/0` is every bit set, and `cidrContains` would
+ * report that the block containing every address contains none of them —
+ * silently turning the one rule that most needs flagging into the one that
+ * passes.
+ */
+export const cidrContains = (cidr: string, address: string): boolean => {
+  const toUint32 = (dotted: string): number | undefined => {
+    const octets = dotted.split('.');
+    if (octets.length !== 4) return undefined;
+
+    let value = 0;
+    for (const octet of octets) {
+      if (!/^\d{1,3}$/.test(octet)) return undefined;
+      const parsed = Number(octet);
+      if (parsed > 255) return undefined;
+      value = (value << 8) | parsed;
+    }
+    return value >>> 0;
+  };
+
+  const [network, length] = cidr.split('/');
+  const prefix = Number(length);
+  const base = toUint32(network);
+  const target = toUint32(address);
+
+  if (base === undefined || target === undefined || !Number.isInteger(prefix)) return false;
+  if (prefix < 0 || prefix > 32) return false;
+  if (prefix === 0) return true;
+
+  const mask = (-1 << (32 - prefix)) >>> 0;
+  return (base & mask) >>> 0 === (target & mask) >>> 0;
+};
+
+/** One entry of `networkPolicy.ingress` or `networkPolicy.egress`. */
+interface AllowlistRule {
+  readonly name: string;
+  readonly cidr?: string;
+  readonly except: readonly string[];
+  readonly ports: ReadonlyArray<{ readonly port: unknown }>;
+}
+
+const readAllowlist = (value: unknown): AllowlistRule[] =>
+  (Array.isArray(value) ? value : []).flatMap((entry, index) => {
+    const rule = asRecord(entry);
+    if (rule === undefined) return [];
+
+    return [
+      {
+        // Falling back to the index keeps every message able to name the rule
+        // it means, even for a rule the schema would have rejected for having
+        // no name at all.
+        name: asString(rule.name) ?? `#${index}`,
+        cidr: asString(rule.cidr),
+        except: asStringArray(rule.except),
+        ports: (Array.isArray(rule.ports) ? rule.ports : []).flatMap((port) => {
+          const record = asRecord(port);
+          return record === undefined ? [] : [{ port: record.port }];
+        }),
+      },
+    ];
+  });
+
+/**
+ * The network-policy rules the schema cannot express, because each compares one
+ * value to another or reasons about what a CIDR contains.
+ *
+ * Everything here describes a policy Kubernetes accepts and stores. That is the
+ * shape of every mistake in this area: a NetworkPolicy has no status, nothing
+ * reports that a rule matched nothing, and the failure arrives as traffic that
+ * hangs — or, worse, as traffic that flows when the manifest reads as though it
+ * should not.
+ */
+export const auditNetworkPolicy = (
+  merged: Record<string, unknown>,
+  file: string,
+): Violation[] => {
+  const policy = asRecord(merged.networkPolicy);
+  if (policy === undefined) return [];
+
+  const violations: Violation[] = [];
+
+  if (policy.enabled !== true) {
+    return [
+      {
+        rule: 'network-policy-disabled',
+        file,
+        message:
+          'networkPolicy.enabled is false, so this release has no policy boundary: any pod in ' +
+          'the cluster can open a connection to these pods, and these pods can open one to ' +
+          'anything. The setting exists for a cluster whose CNI does not implement policy — the ' +
+          'clusters EksStack creates do, through the VPC CNI network policy agent — so turning ' +
+          'it off here is removing the boundary rather than describing a cluster that has none. ' +
+          'A release that cannot reach something it needs needs an entry in networkPolicy.egress.',
+      },
+    ];
+  }
+
+  const dns = asRecord(policy.dns);
+  const ingress = readAllowlist(policy.ingress);
+  const egress = readAllowlist(policy.egress);
+
+  // A default-deny egress policy with no route to DNS is the single most common
+  // way this feature is switched on and immediately backed out again.
+  const dnsAllowedByHand = egress.some((rule) =>
+    rule.ports.some((port) => port.port === DNS_PORT),
+  );
+
+  if (dns?.enabled !== true && !dnsAllowedByHand) {
+    violations.push({
+      rule: 'dns-egress-blocked',
+      file,
+      message:
+        'networkPolicy.dns.enabled is false and no egress entry allows port 53, so the ' +
+        'default-deny egress policy drops every name lookup these pods make. Nothing reports ' +
+        'it: the resolver waits out its timeout and the caller sees a five-second delay ' +
+        'followed by EAI_AGAIN, which reads as a slow service rather than a blocked one. Turn ' +
+        'DNS back on, or add the entry that reaches whatever resolver this cluster runs.',
+    });
+  }
+
+  for (const rule of egress) {
+    if (rule.cidr === undefined) continue;
+    if (!cidrContains(rule.cidr, METADATA_SERVICE_ADDRESS)) continue;
+    if (rule.except.some((range) => cidrContains(range, METADATA_SERVICE_ADDRESS))) continue;
+
+    violations.push({
+      rule: 'metadata-service-reachable',
+      file,
+      message:
+        `networkPolicy.egress entry ${JSON.stringify(rule.name)} allows ${rule.cidr}, which ` +
+        `contains ${METADATA_SERVICE_ADDRESS}, and excepts nothing that covers it. A pod that ` +
+        'reaches the instance metadata service is signed with the node role, which holds the ' +
+        'union of what every pod on that node needs — the thing IRSA exists to stop. IMDSv2 at ' +
+        'a hop limit of 1 is the control that actually blocks it and it is set on the launch ' +
+        'template, so this is the second one; it is worth having because the first belongs to ' +
+        'the node and can be lowered for an afternoon, and this one belongs to the release and ' +
+        `cannot. Add \`except: [${METADATA_SERVICE_ADDRESS}/32]\` to the entry.`,
+    });
+  }
+
+  for (const rule of ingress) {
+    // The `/0` itself, not "a block that happens to contain a public address":
+    // an ingress entry naming one address, public or not, is an allowlist entry
+    // doing its job, and only a zero-length prefix is the whole internet.
+    if (rule.cidr === undefined || Number(rule.cidr.split('/')[1]) !== 0) continue;
+
+    violations.push({
+      rule: 'ingress-from-anywhere',
+      file,
+      message:
+        `networkPolicy.ingress entry ${JSON.stringify(rule.name)} admits ${rule.cidr}, which is ` +
+        'every address there is. The default-deny policy is still rendered and still reads as a ' +
+        'boundary in `kubectl get netpol`, but nothing is outside this entry, so there is no ' +
+        'boundary left. Name the peer instead — a namespace and a pod selector for the ' +
+        'controller that fronts this service.',
+    });
+  }
+
+  violations.push(...auditIngressPorts(merged, ingress, file));
+  violations.push(...auditDuplicateRuleNames(ingress, 'ingress', file));
+  violations.push(...auditDuplicateRuleNames(egress, 'egress', file));
+
+  return violations;
+};
+
+/**
+ * Ingress ports are matched against the destination *pod's* port.
+ *
+ * This is the rule that catches the mistake nearly everybody makes once:
+ * writing `port: 80` — the Service's port — in an ingress rule for a pod that
+ * listens on 8080. kube-proxy rewrites the destination to the container port
+ * before policy is evaluated, so the rule matches nothing, every connection is
+ * dropped by the default-deny, and the manifest reads exactly right.
+ */
+const auditIngressPorts = (
+  merged: Record<string, unknown>,
+  ingress: readonly AllowlistRule[],
+  file: string,
+): Violation[] => {
+  const containerPort = asNumber(merged.containerPort);
+  const servicePort = asNumber(asRecord(merged.service)?.port);
+  const violations: Violation[] = [];
+
+  for (const rule of ingress) {
+    for (const { port } of rule.ports) {
+      // `http` is the name the pod template gives `containerPort`, so it is the
+      // one named port that resolves. Any other name matches nothing.
+      if (port === 'http') continue;
+
+      if (typeof port === 'string') {
+        violations.push({
+          rule: 'ingress-port-mismatch',
+          file,
+          message:
+            `networkPolicy.ingress entry ${JSON.stringify(rule.name)} names the port ` +
+            `${JSON.stringify(port)}, which is not a port these pods declare. A named port in a ` +
+            "policy is resolved against the destination pod's containers, and the only name the " +
+            'pod template uses is `http`. A name that resolves to nothing matches nothing, and ' +
+            'the traffic is then dropped by the default-deny with no error anywhere.',
+        });
+        continue;
+      }
+
+      // Not a number and not a string: the schema rejects it, and this audit
+      // reports what it can rather than throwing on values it was not given.
+      if (typeof port !== 'number' || containerPort === undefined) continue;
+      if (port === containerPort) continue;
+
+      const serviceNote =
+        port === servicePort
+          ? ' That is `service.port`, and policy never sees it: kube-proxy rewrites the ' +
+            'destination to the container port first, so this entry matches no packet that ' +
+            'ever arrives.'
+          : '';
+
+      violations.push({
+        rule: 'ingress-port-mismatch',
+        file,
+        message:
+          `networkPolicy.ingress entry ${JSON.stringify(rule.name)} allows port ${port}, but ` +
+          `the pods listen on ${containerPort}.${serviceNote} The entry is accepted, matches ` +
+          'nothing, and the connections it was written to permit are dropped by the ' +
+          'default-deny — which looks like an application that is not responding. Use ' +
+          '`port: http`, which is the container port by name and moves with it.',
+      });
+    }
+  }
+
+  return violations;
+};
+
+/**
+ * Two allowlist entries with one name.
+ *
+ * The name never reaches the cluster — a NetworkPolicy rule has no name field —
+ * so this cannot break a deploy. It breaks every message about the rule,
+ * including the ones above: an audit failure naming `"aws-apis"` when there are
+ * two of them sends the reader to the wrong entry, and a review comment about
+ * one silently applies to the other.
+ */
+const auditDuplicateRuleNames = (
+  rules: readonly AllowlistRule[],
+  direction: 'ingress' | 'egress',
+  file: string,
+): Violation[] => {
+  const seen = new Set<string>();
+
+  return rules.flatMap((rule) => {
+    if (seen.has(rule.name)) {
+      return [
+        {
+          rule: 'duplicate-network-policy-rule' as const,
+          file,
+          message:
+            `networkPolicy.${direction} declares ${JSON.stringify(rule.name)} twice. The name is ` +
+            'not rendered, so both entries take effect and nothing fails — but it is what every ' +
+            'message about the rule has to point at, and two of them point at both.',
+        },
+      ];
+    }
+
+    seen.add(rule.name);
+    return [];
+  });
 };
 
 /** Audit one loaded chart. Pure — the unit tests drive this with no filesystem. */

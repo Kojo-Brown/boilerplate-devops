@@ -247,6 +247,111 @@ service:
   port: 80
   annotations: {}
 
+# Network policy: deny everything, then allow what is named here.
+#
+# Two objects are rendered — `<release>-default-deny`, which selects this
+# release's pods and denies both directions, and `<release>-allow`, which is
+# the allowlist. `templates/networkpolicy.yaml` says why they are separate.
+#
+# Three things about this block are not obvious, and each is a way an allowlist
+# ends up meaning something other than what it reads as:
+#
+#   • **One entry is one peer, so its selectors are ANDed.** In the Kubernetes
+#     API, two selectors in one `from` element mean "pods matching B in
+#     namespaces matching A"; the same two as separate elements mean "either".
+#     The two are one character apart in YAML. Here an entry always becomes one
+#     element, so allowing two sources means writing two entries.
+#   • **An omitted `namespaceLabels` does not mean "any namespace".** A peer
+#     with only a `podSelector` matches those pods *in this release's own
+#     namespace*. That is usually what is wanted and never what it looks like.
+#   • **Ports are matched against the destination pod's port, not the
+#     Service's.** kube-proxy rewrites the destination to `containerPort`
+#     before policy is evaluated, so an ingress entry naming `service.port`
+#     matches nothing and the traffic is denied. `npm run audit:helm` fails on
+#     that specifically, because the symptom — connections that hang and then
+#     time out — points at the application.
+#
+# Enforcement is not automatic. Kubernetes has no built-in NetworkPolicy
+# controller: the API server stores these objects whatever the cluster does
+# with them, so on a CNI that does not implement policy they are accepted,
+# visible in `kubectl get netpol`, and enforce nothing. On EKS that means the
+# VPC CNI's network policy agent, which `EksStack` turns on through the add-on's
+# `enableNetworkPolicy` configuration — see docs/network-policies.md §1.
+networkPolicy:
+  # Off is for a cluster whose CNI cannot enforce policy. It is not a way to
+  # unblock a service: a release that needs a peer it is not allowed needs the
+  # peer added below, and `npm run audit:helm` fails on a values file that
+  # turns this off precisely so that the quick fix is not the silent one.
+  enabled: true
+
+  # Egress to cluster DNS. Separate from the `egress` list because it is not a
+  # policy decision — a default-deny egress policy without it drops every name
+  # lookup these pods make, and the failure surfaces as five-second timeouts
+  # rather than as anything that names the network.
+  #
+  # Both labels are ones the cluster maintains rather than ones this chart
+  # asserts: `kubernetes.io/metadata.name` is set on every namespace by the API
+  # server, and `k8s-app: kube-dns` is what the EKS CoreDNS add-on labels its
+  # pods (the name is a holdover from kube-dns; the pods are CoreDNS).
+  dns:
+    enabled: true
+    namespaceLabels:
+      kubernetes.io/metadata.name: kube-system
+    podLabels:
+      k8s-app: kube-dns
+
+  # Who may open a connection to these pods.
+  #
+  # Empty, and that is the current state of this cluster rather than a
+  # placeholder: there is no ingress controller yet — it is the last Phase 8
+  # item — so nothing exists that should be reaching them. The Service still
+  # resolves and still has endpoints; a connection to it is dropped.
+  #
+  # When the Ingress lands, the entry that opens it is:
+  #
+  #   ingress:
+  #     - name: ingress-controller
+  #       namespaceLabels:
+  #         kubernetes.io/metadata.name: ingress-nginx
+  #       podLabels:
+  #         app.kubernetes.io/name: ingress-nginx
+  #       ports:
+  #         - port: http          # the container port by name, not service.port
+  #           protocol: TCP
+  #
+  # Kubelet health probes are not covered by this list. They originate on the
+  # node rather than from a pod, and the VPC CNI's policy agent does not apply
+  # policy to node-to-pod traffic — which is what keeps a default-deny ingress
+  # policy from failing every readiness probe on the cluster. It is also
+  # CNI-specific behaviour, so a cluster running something else is the case to
+  # check before assuming it holds.
+  ingress: []
+
+  # Where these pods may open a connection to.
+  #
+  # One entry, and it is the one every workload here actually needs: HTTPS to
+  # AWS. IRSA exchanges the projected service account token at STS, and any SDK
+  # call — Secrets Manager, S3, DynamoDB — is HTTPS to a public endpoint
+  # reached through the NAT gateway. Narrowing this to VPC endpoint addresses is
+  # a real improvement and needs those endpoints to exist first; docs/network-
+  # policies.md §4 has the shape.
+  #
+  # The `except` is the instance metadata service. Note what it is and is not:
+  # the node launch template already requires IMDSv2 at a hop limit of 1, which
+  # is the control that actually puts IMDS out of a container's reach, and this
+  # is the second one. It matters because the first is a property of the node
+  # that someone can lower for an afternoon of debugging, and this one is a
+  # property of the release that they cannot lower without editing a file in
+  # git.
+  egress:
+    - name: aws-apis
+      cidr: 0.0.0.0/0
+      except:
+        - 169.254.169.254/32
+      ports:
+        - port: 443
+          protocol: TCP
+
 # Requests and limits are required by the schema, not optional. A container with
 # no requests is scheduled as BestEffort and is the first thing evicted under
 # node pressure; a container with no memory limit can take the node's other pods
