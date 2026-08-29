@@ -1,0 +1,61 @@
+# Cluster add-ons for the staging cluster.
+#
+# This project is privileged and the `app` project next door is not, which is
+# the whole reason there are two. metrics-server needs an APIService, a
+# ClusterRole and a ClusterRoleBinding — an add-on that extends the Kubernetes
+# API cannot be confined to one namespace. The application releases need none of
+# that, so they get a project that permits none of it.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: platform
+  namespace: argocd
+  annotations:
+    # Applied by the root Application before the Applications that name it. An
+    # Application whose project does not exist is not rejected — it is admitted
+    # and then sits with a `Comparison error: application referencing project
+    # platform which does not exist`, which reads like a broken app rather than
+    # a race that resolves itself.
+    argocd.argoproj.io/sync-wave: "-10"
+spec:
+  description: Cluster add-ons that the workload releases depend on.
+
+  sourceRepos:
+    - https://github.com/Kojo-Brown/boilerplate-devops.git
+    # metrics-server is installed from its own chart repository rather than
+    # vendored here. The chart version in `applications/metrics-server.yaml` is
+    # exact, so what this permits is one upstream repository, not a moving target.
+    - https://kubernetes-sigs.github.io/metrics-server/
+
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: kube-system
+
+  # Exactly what metrics-server needs and nothing else. `APIService` is the
+  # aggregation layer registration for `v1beta1.metrics.k8s.io`; the two RBAC
+  # kinds are the `system:aggregated-metrics-reader` role and the binding to
+  # `system:auth-delegator` that lets the API server delegate authn to it.
+  #
+  # Adding a kind here is a real decision: a project that may create
+  # ClusterRoleBindings may bind any subject to cluster-admin, so this list is
+  # the ceiling on what a compromised add-on chart can do.
+  clusterResourceWhitelist:
+    - group: apiregistration.k8s.io
+      kind: APIService
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRole
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRoleBinding
+
+  # Namespaced resources are unrestricted, bounded by the single destination
+  # namespace above. An add-on chart legitimately ships whatever its author
+  # chose — a Deployment, a Service, a ServiceAccount, a PodDisruptionBudget,
+  # sometimes a ServiceMonitor — and enumerating those here would turn every
+  # upstream chart bump into a permission failure at sync time.
+  namespaceResourceBlacklist: []
+
+  # Orphaned-resource tracking is deliberately *not* enabled on this project.
+  # kube-system is full of resources Argo CD did not create and should not
+  # report, and Argo CD's own documentation warns that watching a namespace like
+  # it has real performance cost. The `app` project, whose namespace holds one
+  # release and nothing else, is where the setting earns its place.

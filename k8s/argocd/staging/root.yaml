@@ -1,0 +1,120 @@
+# Bootstrap for the staging cluster. Two documents, applied by hand, once:
+#
+#   aws eks update-kubeconfig --name staging-eks --region us-east-1
+#   kubectl apply -f k8s/argocd/staging/root.yaml
+#
+# Everything else in `k8s/argocd/staging/` is applied by the Application below,
+# and nothing in this file is applied by anything but a human. That asymmetry is
+# deliberate — see docs/gitops-argocd.md §2. The short version: this file is the
+# trust root. An `AppProject` that decides what the root Application may deploy,
+# managed *by* that root Application, is a boundary that whatever gets through it
+# can widen. Recovering from drift here is one `kubectl apply` of this file; git
+# is still the source of truth for it, just not an automated one.
+#
+# Nothing here carries a `sync-wave` annotation. Waves order resources *within*
+# an Application's own resource set, and these two objects are in no such set —
+# `kubectl apply` applies them in file order, which is why the project is first.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: bootstrap
+  namespace: argocd
+spec:
+  description: >-
+    The root Application only. Permits nothing but Argo CD's own Application and
+    AppProject objects, from this repository, into the argocd namespace.
+
+  # One repository, written exactly as every Application writes it. Argo CD
+  # compares this against `spec.source.repoURL` as a glob after normalising the
+  # case and a `.git` suffix — but not a trailing slash, which is the form that
+  # bites with chart repositories. `npm run audit:argocd` runs the same
+  # comparison, so a mismatch fails a pull request rather than a sync.
+  sourceRepos:
+    - https://github.com/Kojo-Brown/boilerplate-devops.git
+
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: argocd
+
+  # Empty means *no* cluster-scoped resource may be deployed. Cluster-scoped
+  # resources are restricted by allow-list and namespaced ones by deny-list, so
+  # this empty list is a closed door while an empty `namespaceResourceBlacklist`
+  # would be an open one — which is why the namespaced side below is written as a
+  # whitelist instead.
+  clusterResourceWhitelist: []
+
+  # The root Application deploys child Applications and the two AppProjects they
+  # belong to. It has no business deploying anything else into the argocd
+  # namespace: a Deployment or a Secret here would run beside Argo CD's own
+  # components with Argo CD's own service account tokens mounted nearby.
+  namespaceResourceWhitelist:
+    - group: argoproj.io
+      kind: AppProject
+    - group: argoproj.io
+      kind: Application
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: root-staging
+  namespace: argocd
+  # Without this finalizer, deleting the Application deletes the Application and
+  # leaves every resource it created running, owned by nothing and reconciled by
+  # nothing. With it, deletion cascades: the child Applications go, and because
+  # they carry the same finalizer, so do the releases underneath them.
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: bootstrap
+
+  source:
+    repoURL: https://github.com/Kojo-Brown/boilerplate-devops.git
+    # An explicit branch rather than `HEAD`. `HEAD` resolves to whatever the
+    # repository's default branch is at the time, so renaming the default branch
+    # silently repoints the cluster, and reading the manifest tells you nothing
+    # about which branch this cluster follows.
+    targetRevision: main
+    path: k8s/argocd/staging
+    directory:
+      recurse: true
+      # Default-deny, the same shape as the projects above: only these two
+      # directories are applied. A YAML file added anywhere else under
+      # `k8s/argocd/staging/` — a note, a values file, this very manifest — is
+      # not applied, rather than being applied because nobody thought about it.
+      #
+      # The pattern is matched with gobwas/glob against the path *relative to
+      # `path`*, compiled with no separator runes, so `*` also matches `/`. That
+      # is why the two patterns are anchored on directory names: a bare
+      # `*.yaml` here would match `projects/app.yaml` too, and would keep
+      # matching anything anyone nests below.
+      include: "{projects/*.yaml,applications/*.yaml}"
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+
+  syncPolicy:
+    automated:
+      # Deleting a file under `applications/` deletes that release. That is the
+      # point of prune and also its hazard, and it is the reason `allowEmpty`
+      # stays false: with it true, a bad refactor that renders *nothing* would
+      # prune every child Application, and each cascade-deletes its release.
+      prune: true
+      # Drift correction. Without it, an `Application` edited with `kubectl` on
+      # the cluster stays edited: Argo CD reports OutOfSync and does nothing,
+      # because an automated sync only fires on a change in git.
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+      # Prune after everything else has applied and become healthy, so a rename
+      # (delete + create) never leaves the window where the old object is gone
+      # and the new one has not landed.
+      - PruneLast=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+
+  revisionHistoryLimit: 10

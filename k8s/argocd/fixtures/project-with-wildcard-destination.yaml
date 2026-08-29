@@ -1,0 +1,28 @@
+# A destination wildcard makes every Application in the project able to write
+# into any namespace on the cluster — kube-system included — which is the
+# `default` project with a name on it. Rule: open-project-scope.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: app
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+spec:
+  description: The application release in the staging namespace.
+  sourceRepos:
+    - https://github.com/Kojo-Brown/boilerplate-devops.git
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: "*"
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+      name: staging
+  namespaceResourceBlacklist:
+    - group: rbac.authorization.k8s.io
+      kind: Role
+    - group: rbac.authorization.k8s.io
+      kind: RoleBinding
+  orphanedResources:
+    warn: true

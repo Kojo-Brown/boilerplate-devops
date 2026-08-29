@@ -1,0 +1,68 @@
+# The application release for the staging cluster.
+#
+# Everything this project permits is scoped to one namespace. The chart it
+# deploys (`k8s/charts/app`) creates a Deployment, a Service, a ServiceAccount, a
+# ConfigMap, a PodDisruptionBudget, an HPA and two NetworkPolicies — all
+# namespaced — so a release has no legitimate reason to touch anything above its
+# own namespace, and this project makes that structural rather than customary.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: app
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+spec:
+  description: The application release in the staging namespace.
+
+  sourceRepos:
+    - https://github.com/Kojo-Brown/boilerplate-devops.git
+
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: staging
+
+  # One cluster-scoped resource, restricted by name: the namespace this release
+  # lives in. `CreateNamespace=true` on the Application creates it as part of the
+  # sync, which means it is a resource the project has to permit; naming it here
+  # keeps that permission from being "any namespace".
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+      name: staging
+
+  # Namespaced resources are permitted by default, so the ones a release must
+  # not create are named here:
+  #
+  #   Role / RoleBinding   in-namespace privilege changes. The release's identity
+  #                        comes from IRSA, granted in `EksStack.addIrsaRole` and
+  #                        reviewed as IAM; a chart that can also mint Kubernetes
+  #                        RBAC has a second, unreviewed path to permissions.
+  #   ResourceQuota        the ceiling the namespace is held to. A workload that
+  #                        can raise its own quota does not have one.
+  #   LimitRange           the defaults applied to pods that omit resources.
+  namespaceResourceBlacklist:
+    - group: rbac.authorization.k8s.io
+      kind: Role
+    - group: rbac.authorization.k8s.io
+      kind: RoleBinding
+    - group: ""
+      kind: ResourceQuota
+    - group: ""
+      kind: LimitRange
+
+  # Drift, in the direction self-heal cannot see.
+  #
+  # Self-heal reverts changes to resources Argo CD manages. A resource somebody
+  # created *beside* the release — a debugging Deployment, a Secret applied by
+  # hand during an incident, a Job left behind by a migration — belongs to no
+  # Application, so nothing reconciles it, nothing prunes it, and nothing
+  # mentions it. This reports it.
+  #
+  # It is safe to enable here for the reason it is not safe on `platform`: this
+  # namespace holds exactly one release. Kubernetes' own additions are already
+  # exempt — the `default` ServiceAccount and the `kube-root-ca.crt` ConfigMap
+  # are never counted as orphaned — so a warning here means a human put
+  # something in this namespace and did not commit it.
+  orphanedResources:
+    warn: true

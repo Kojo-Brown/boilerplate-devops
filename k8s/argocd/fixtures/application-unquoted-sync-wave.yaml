@@ -1,0 +1,32 @@
+# An unquoted wave is a YAML integer, and annotation values are strings: the
+# API server rejects the whole document. Rule: annotation-not-a-string.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: app-staging
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: 10
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: app
+  source:
+    repoURL: https://github.com/Kojo-Brown/boilerplate-devops.git
+    targetRevision: main
+    path: k8s/charts/app
+    helm:
+      releaseName: app-staging
+      valueFiles:
+        - values-staging.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: staging
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+      - PruneLast=true
+      - CreateNamespace=true

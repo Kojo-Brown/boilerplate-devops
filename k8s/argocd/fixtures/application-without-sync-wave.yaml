@@ -1,0 +1,30 @@
+# No wave annotation, so Argo CD uses wave 0 — the same wave as the AppProject
+# that has to exist first. Rule: missing-sync-wave.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: app-staging
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: app
+  source:
+    repoURL: https://github.com/Kojo-Brown/boilerplate-devops.git
+    targetRevision: main
+    path: k8s/charts/app
+    helm:
+      releaseName: app-staging
+      valueFiles:
+        - values-staging.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: staging
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+      - PruneLast=true
+      - CreateNamespace=true

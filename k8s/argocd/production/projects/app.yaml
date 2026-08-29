@@ -1,0 +1,50 @@
+# The application release for the production cluster.
+#
+# The staging project with `staging` replaced by `production` in the two places
+# it appears. Everything this project permits is scoped to one namespace: the
+# chart it deploys creates only namespaced objects, so a release has no
+# legitimate reason to reach above its own namespace.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: app
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+spec:
+  description: The application release in the production namespace.
+
+  sourceRepos:
+    - https://github.com/Kojo-Brown/boilerplate-devops.git
+
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: production
+
+  # One cluster-scoped resource, restricted by name: the namespace this release
+  # lives in, which `CreateNamespace=true` creates as part of the sync.
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+      name: production
+
+  # Role and RoleBinding because the release's identity is IRSA, granted in IAM
+  # and reviewed there; ResourceQuota and LimitRange because a workload that can
+  # raise its own ceiling does not have one.
+  namespaceResourceBlacklist:
+    - group: rbac.authorization.k8s.io
+      kind: Role
+    - group: rbac.authorization.k8s.io
+      kind: RoleBinding
+    - group: ""
+      kind: ResourceQuota
+    - group: ""
+      kind: LimitRange
+
+  # Reports resources in this namespace that belong to no Application — the
+  # drift self-heal cannot see, because self-heal only reconciles what an
+  # Application already manages. In production that is the more interesting
+  # direction: the Secret applied by hand at 3am is the one nobody remembers by
+  # morning, and it survives every subsequent sync.
+  orphanedResources:
+    warn: true

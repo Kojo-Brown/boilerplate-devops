@@ -1,0 +1,80 @@
+# metrics-server on the production cluster.
+#
+# The add-on every HPA reads. `EksStack` installs vpc-cni, kube-proxy, coredns
+# and the EBS CSI driver and nothing else, so until this file there was nothing
+# to read: an HPA with no metrics reports `<unknown>` and scales nothing, which
+# is not an error condition anywhere.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: metrics-server
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: platform
+
+  source:
+    repoURL: https://kubernetes-sigs.github.io/metrics-server/
+    chart: metrics-server
+    # Exact, and the same version staging runs. A range would be re-resolved on
+    # every reconciliation, so an upstream release would reach production
+    # through self-heal with no commit and no review.
+    targetRevision: 3.14.0
+    helm:
+      releaseName: metrics-server
+      values: |
+        # Two replicas, because a single metrics-server is a single point of
+        # blindness for every HPA in the cluster: while it is restarting — a
+        # node drain, a chart bump, an eviction — no autoscaler can read a
+        # metric, and each one holds its current replica count until it can.
+        replicas: 2
+
+        # With two replicas the pods must not share a node, or the second
+        # replica buys nothing on the failure that matters. The selector is the
+        # chart's own: `app.kubernetes.io/name` is the chart name and
+        # `app.kubernetes.io/instance` is the release name pinned above.
+        topologySpreadConstraints:
+          - maxSkew: 1
+            topologyKey: kubernetes.io/hostname
+            whenUnsatisfiable: DoNotSchedule
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: metrics-server
+                app.kubernetes.io/instance: metrics-server
+
+        # A drain that evicts both replicas at once is the same outage as
+        # running one, so the budget is what makes the second replica mean
+        # something during a cluster upgrade.
+        podDisruptionBudget:
+          enabled: true
+          maxUnavailable: 1
+
+        # `resources` stays at the chart's default: 100m CPU / 200Mi memory
+        # requested, no limits. metrics-server's memory tracks the number of
+        # nodes and pods it scrapes, so a fixed limit turns cluster growth into
+        # an OOMKill loop — and that is every HPA in the cluster going blind at
+        # the moment the cluster is largest. The chart's `addonResizer` is the
+        # upstream answer if bounded memory is required.
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kube-system
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+      - PruneLast=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+
+  revisionHistoryLimit: 10
