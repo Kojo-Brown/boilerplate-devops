@@ -160,7 +160,7 @@ no better signal exists in the git object graph.
 - [x] Horizontal Pod Autoscaler + Cluster Autoscaler with load-tested thresholds — an `autoscaling/v2` HPA in the chart and the upstream Cluster Autoscaler in `EksStack`, pinned to the cluster's Kubernetes version and discovering node groups by ASG tag; the thresholds are derived rather than measured, because there is no cluster to measure against (PR #36)
 - [x] Pod security: non-root, read-only rootfs, dropped capabilities, seccomp — the chart had no `securityContext` at all, which is not neutral: root, containerd's default 14 capabilities, a writable rootfs and seccomp Unconfined are what Kubernetes does when the fields are absent. Both contexts are now `const` in the schema rather than defaults, so an environment file cannot relax one (PR #37)
 - [x] NetworkPolicy default-deny with explicit allowlists — two objects per release (the deny floor and the allowlist, split so that losing the second is a service that stops talking rather than a boundary that stops existing), plus the CNI setting that makes either of them mean anything: Kubernetes ships no policy controller, so without `enableNetworkPolicy` on the VPC CNI the objects are stored, listed and enforced by nothing, with no field anywhere that says so (PR #38)
-- [ ] GitOps with ArgoCD: app-of-apps, sync waves, and drift detection
+- [x] GitOps with ArgoCD: app-of-apps, sync waves, and drift detection — one Argo CD per cluster reading `k8s/argocd/<environment>/`, bootstrapped by a single `root.yaml` nothing manages; two projects because an add-on that extends the Kubernetes API cannot be confined to a namespace and a release should be; drift in three layers, since self-heal covers neither a sync that keeps failing nor a resource created beside the release (PR #39)
 - [ ] Ingress with cert-manager, external-dns, and automatic TLS renewal
 
 Item 1 complete as of PR #34 (2026-08-21). What made this one item rather than
@@ -442,6 +442,80 @@ CloudWatch needs `logs:*` on the node role and is a per-connection log stream
 with a per-connection bill, so it is left to the operator. The metrics-server
 gap from item 3, the unenforced `restricted` namespace label from item 4, and
 Checkov not scanning the rendered manifests are all unchanged.
+
+Item 6 complete as of PR #39 (2026-08-29). `k8s/argocd/staging/` and
+`k8s/argocd/production/` are the delivery path the cluster did not have: a root
+Application applied by hand once per cluster, and under it two AppProjects, the
+metrics-server add-on the HPA has needed since item 3, and the release itself.
+Nothing else holds cluster credentials, and what promotes a change to production
+is the image tag committed to `values-production.yaml`.
+
+The root is deliberately not self-managed. Its `include` covers
+`projects/*.yaml` and `applications/*.yaml` and nothing else, so it does not
+manage the file that declares it or the `bootstrap` AppProject that bounds it —
+self-management makes the boundary something whatever gets through it can widen,
+and a pull request that deleted the project would be applied by the thing it
+deletes. The cost, stated in the file, is that drift on those two objects is not
+corrected; the recovery is the `kubectl apply` that created them.
+
+**The wave ordering that reads correctly is not one, and that is the finding of
+this item.** Projects sit at -10, add-ons at 0 and workloads at 10, and only the
+first of those two orderings is enforced. Argo CD removed the health assessment
+of its own `Application` kind in 1.8, so a child Application has no health for
+the parent's wave gate to wait on — the controller's own comment is that a
+"Missing or Unknown health status of child Argo CD app should not affect
+parent". Wave 0 therefore completes when the metrics-server *object* is created,
+not when metrics-server is running, and wave 10 follows two seconds later. On a
+fresh cluster the consequence is mild — the HPA reports `<unknown>` for a minute
+— which is exactly why it survives: nothing about it looks like a failure.
+`docs/gitops-argocd.md` §1 ships the `argocd-cm` customization that restores the
+health check and §4 says plainly which half of the ordering is real without it.
+
+Drift needed three layers because `selfHeal` covers less than it appears to. It
+reverts a managed resource edited on the cluster, and it is on in production
+too, since self-heal lives inside `automated` and a manually-synced production
+application is the one place drift is detected and then kept — at the cost that
+Argo CD refuses to roll back an application with automated sync enabled, so the
+way back from a bad release is a revert commit. `orphanedResources: { warn: true }`
+on the workload project covers the direction self-heal cannot see, a resource
+created *beside* the release belonging to no Application; it is off on
+`platform`, whose namespace is kube-system, which Argo CD's own documentation
+warns about. `workflow-templates/argocd-drift-report.yml` covers what self-heal
+cannot fix at all: a sync that keeps failing and stays OutOfSync forever, an
+application switched to manual sync during an incident, an orphan warning nobody
+is reading.
+
+`npm run audit:argocd` is 32 rules for things the API server and Argo CD both
+accept — a project that does not exist, a destination or repository the project
+does not permit, a chart version that is a range, a staging Application
+rendering `values-production.yaml`, a release name left to default (which makes
+an Application rename a delete-and-recreate of the ServiceAccount the IRSA trust
+policy names), an unquoted wave annotation, which is a YAML integer the API
+server rejects for the whole document. Two rules needed more than a field check:
+`unmanaged-manifest`, which requires reimplementing Argo CD's `include` matching
+— gobwas/glob compiled with **no separator runes**, so `*` matches `/` too — and
+refuses any pattern outside that subset rather than approximating it; and
+`trees-not-parallel`, which gives the two environment trees the guarantee
+`audit:helm` gives the two values files. Twenty fixtures in
+`k8s/argocd/fixtures/` are manifests the audit must reject, each asserted
+against the rule that must catch it, and they sit outside both trees so that no
+root Application can reach them.
+
+Known gaps carried into item 7: **Argo CD itself is not installed by this
+repository** — `docs/gitops-argocd.md` §1 installs it with `kubectl apply` from
+an upstream manifest, unpinned by digest, with no SSO and no ingress, and the
+`argocd-cm` health customization is a bootstrap step rather than a manifest
+here. **Nothing has been applied to a cluster**: there is no cluster in CI and
+none was created, so every gate parses, cross-checks and rejects, and none of
+them observes a sync. The two trees are parallel copies kept honest by an audit
+rule rather than generated from one source — no `ApplicationSet`, no cluster
+secrets, no management cluster. There are no notifications (the drift report is
+the coarser, poll-based substitute) and no progressive delivery, since the
+Kubernetes equivalent of the ECS blue/green and canary stacks is Argo Rollouts,
+which is a controller and a kind rather than a setting. And the release is still
+the only workload: no ingress controller — which is why the chart's NetworkPolicy
+ingress allowlist is still empty — no cert-manager and no external-dns, which is
+item 7 and is one file per environment in `applications/`.
 
 ## Phase 9 — Supply-Chain Security
 - [ ] SBOM generation (CycloneDX) attached to every release artifact
