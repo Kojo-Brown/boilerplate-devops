@@ -1,0 +1,74 @@
+# The application release on the staging cluster.
+#
+# This is `helm upgrade --install app-staging k8s/charts/app --values
+# values-staging.yaml` expressed as desired state. What changes is who runs it:
+# no pipeline holds cluster credentials, and the cluster converges on this file
+# rather than on whatever the last successful pipeline run happened to apply.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: app-staging
+  namespace: argocd
+  annotations:
+    # Wave 10: after metrics-server (0), which the HPA in this chart reads.
+    argocd.argoproj.io/sync-wave: "10"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: app
+
+  source:
+    repoURL: https://github.com/Kojo-Brown/boilerplate-devops.git
+    targetRevision: main
+    path: k8s/charts/app
+    helm:
+      # The release name is load-bearing here, which is why it is pinned rather
+      # than left to default to `metadata.name`. Every object in the chart is
+      # named from it, including the ServiceAccount — and the IRSA trust policy
+      # in `EksStack.addIrsaRole` names the subject `staging/app-staging`
+      # exactly. Renaming the Application without this line would rename the
+      # ServiceAccount, and `AssumeRoleWithWebIdentity` would start failing at
+      # the first AWS call rather than at deploy time.
+      releaseName: app-staging
+      # Relative to `path` above. Argo CD renders with `helm template`, so
+      # `values.schema.json` is enforced exactly as it is on the command line:
+      # a values file the schema rejects fails the render, and the Application
+      # goes to `ComparisonError` with Helm's own message.
+      valueFiles:
+        - values-staging.yaml
+
+  destination:
+    server: https://kubernetes.default.svc
+    # Matches the IRSA subject and the `environment` in the values file. All
+    # three are checked against each other by `npm run audit:argocd`.
+    namespace: staging
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+      - PruneLast=true
+      # The namespace is part of the release rather than a prerequisite for it,
+      # so a first install on a fresh cluster does not need a human to run
+      # `kubectl create namespace` first. The `app` AppProject permits exactly
+      # this one namespace by name.
+      - CreateNamespace=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+
+  # There is deliberately no `ignoreDifferences` for `/spec/replicas`, which is
+  # the entry almost every HPA-plus-Argo-CD setup needs. This chart renders the
+  # Deployment *without* a `replicas` field whenever autoscaling is enabled
+  # (k8s/charts/app/values.yaml), so there is no desired value to differ from
+  # the live one. If that ever changes, the failure is not subtle: self-heal
+  # would rewrite `replicas` back to the chart's number within seconds of every
+  # scale-up, the HPA would scale up again, and the two would take turns
+  # indefinitely.
+
+  revisionHistoryLimit: 10

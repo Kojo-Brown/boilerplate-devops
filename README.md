@@ -24,6 +24,7 @@ Reusable CI/CD workflows and AWS infrastructure templates.
 | EKS cluster — managed node groups + IRSA | `aws/cdk/lib/eks-stack.ts` |
 | Helm chart — per-environment values, schema-validated | `k8s/charts/app/` |
 | Default-deny NetworkPolicy + allowlist, enforced by the CNI | `k8s/charts/app/templates/networkpolicy.yaml` |
+| GitOps delivery — app-of-apps, sync waves, drift detection | `k8s/argocd/` |
 
 ## Usage
 
@@ -348,6 +349,32 @@ See [docs/helm-chart.md](./docs/helm-chart.md) for the deploy commands, the
 per-environment differences, the `null`-deletes-the-default trap, and how to add
 an environment.
 
+`k8s/argocd/` is how it gets there. One Argo CD per cluster and one root
+Application per Argo CD, applied by hand once; from then on the cluster follows
+`main`, and no pipeline holds cluster credentials. The root applies two
+AppProjects and two Applications per environment — metrics-server, which the HPA
+above reads and which none of the four add-ons `EksStack` installs provides, and
+the release itself — ordered by sync waves and kept converged by `selfHeal`.
+
+Three things about that are easy to get wrong and hard to notice. Sync waves
+between child Applications do **not** wait for the wave underneath them unless
+the health assessment Argo CD removed in 1.8 is restored in `argocd-cm`, so an
+ordering that reads correctly is not one. Self-heal only reconciles resources an
+Application already manages, so the Deployment somebody created beside the
+release during an incident is reverted by nothing — that is what
+`orphanedResources` on the project reports. And self-heal lives inside
+`automated`, so a production application on manual sync is the one place drift is
+detected and then kept; the price of automated sync in production is that Argo CD
+refuses to roll back, and a revert commit becomes the way back.
+
+`npm run audit:argocd` checks the manifests on every pull request — a project
+that does not exist, a destination the project does not permit, a chart version
+that is a range, a staging Application rendering `values-production.yaml`, a
+manifest in the tree that the root's `include` glob does not match — and
+`workflow-templates/argocd-drift-report.yml` is the scheduled read of a running
+Argo CD that catches what self-heal cannot fix. See
+[docs/gitops-argocd.md](./docs/gitops-argocd.md).
+
 ## OIDC Setup (no long-lived AWS keys)
 See `aws/cloudformation/github-oidc-role.yml` for the IAM role template.
 
@@ -363,6 +390,7 @@ the two mistakes that survive a copy:
 | `npm run audit:migrations` | Migrations that cannot survive a deployment window: renames, in-place type changes, scans and rewrites under `ACCESS EXCLUSIVE`, unbounded backfills, expand and contract in one file | `aws/cdk/tools/audit-migrations.ts` |
 | `npm run audit:flags` | Feature flags with no owner, ticket, or removal date; deadlines beyond 90 days or before the creation date; a field nothing reads; a percentage on a flag that is off, or a flag on at 0% | `aws/cdk/tools/audit-feature-flags.ts` |
 | `npm run audit:helm` | Chart values that fail the schema once merged; a schema object that accepts unknown keys and so catches nothing; an environment with no values file, or a values file for one that does not exist; `key: null`, which deletes a chart default rather than overriding it; a PodDisruptionBudget that permits no drain | `aws/cdk/tools/audit-helm-values.ts` |
+| `npm run audit:argocd` | Argo CD manifests the API server accepts and Argo CD then misreads: a project that does not exist, a destination or repository the project does not permit, an Application without `selfHeal` or the cascade-delete finalizer, a chart version range, one environment rendering another's values file, a manifest in the GitOps tree that the root Application's glob does not apply | `aws/cdk/tools/audit-argocd.ts` |
 
 Placeholders must use one of the AWS documentation account IDs
 (`123456789012`, `111122223333`, …) — the scan permits those and nothing else.

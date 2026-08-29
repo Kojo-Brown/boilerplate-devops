@@ -1,0 +1,41 @@
+# Cluster add-ons for the production cluster.
+#
+# Identical to the staging project by design — the privileges an add-on needs do
+# not change between environments, and a production project that differs from
+# the one staging exercised is one whose permissions are first tested in
+# production. `npm run audit:argocd` fails when the two trees stop matching.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: platform
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+spec:
+  description: Cluster add-ons that the workload releases depend on.
+
+  sourceRepos:
+    - https://github.com/Kojo-Brown/boilerplate-devops.git
+    - https://kubernetes-sigs.github.io/metrics-server/
+
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: kube-system
+
+  # The aggregation-layer registration and the two RBAC objects metrics-server
+  # needs; nothing else. A project that may create ClusterRoleBindings may bind
+  # any subject to cluster-admin, so this list is the ceiling on what a
+  # compromised add-on chart can do.
+  clusterResourceWhitelist:
+    - group: apiregistration.k8s.io
+      kind: APIService
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRole
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRoleBinding
+
+  namespaceResourceBlacklist: []
+
+  # Orphaned-resource tracking stays off here: kube-system holds hundreds of
+  # resources Argo CD did not create, and Argo CD's documentation warns about
+  # the cost of watching a namespace like it. The `app` project is where it runs.

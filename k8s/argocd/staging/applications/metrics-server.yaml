@@ -1,0 +1,83 @@
+# metrics-server on the staging cluster.
+#
+# This is the add-on the HPA in `k8s/charts/app` reads. Without it the HPA
+# reports `<unknown>` for every metric and scales nothing — it does not fail, it
+# just quietly stops being an autoscaler. Nothing installed it until now:
+# `EksStack` enables four EKS-managed add-ons (vpc-cni, kube-proxy, coredns and
+# the EBS CSI driver) and metrics-server is not among them, which is the gap
+# docs/autoscaling.md has carried since the day the HPA landed.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: metrics-server
+  namespace: argocd
+  annotations:
+    # Wave 0: after the AppProjects (-10), before the workload releases (10).
+    # What that ordering does and does not guarantee is worth knowing before
+    # relying on it — see docs/gitops-argocd.md §4. In short, it orders the
+    # *creation* of these Application objects, not the readiness of what they
+    # deploy.
+    argocd.argoproj.io/sync-wave: "0"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: platform
+
+  source:
+    repoURL: https://kubernetes-sigs.github.io/metrics-server/
+    chart: metrics-server
+    # For a Helm repository source, `targetRevision` is the chart version, and an
+    # exact version is the difference between a cluster that changes when someone
+    # commits and a cluster that changes when an upstream maintainer releases.
+    # A range here would be re-resolved on every reconciliation, so a new chart
+    # would land through self-heal with no commit, no pull request and no diff.
+    targetRevision: 3.14.0
+    helm:
+      # Pinned rather than inherited from `metadata.name`. Every resource this
+      # chart creates is named from the release, so an Application rename would
+      # otherwise be a delete-and-recreate of the API service the HPA depends on.
+      releaseName: metrics-server
+      values: |
+        # One replica in staging. Losing it means the HPA holds its current
+        # replica count until the pod is back, which is the correct failure and
+        # an acceptable one here; production runs two.
+        replicas: 1
+
+        # `resources` is left at the chart's default of 100m CPU / 200Mi memory
+        # requested with **no limits**, which is deliberate and is the opposite
+        # of what `k8s/charts/app` does. metrics-server's memory tracks the
+        # number of nodes and pods it scrapes, so a fixed memory limit turns
+        # cluster growth into an OOMKill loop — and a metrics-server that is
+        # OOMKilling is an HPA that has stopped scaling, on every workload at
+        # once. The upstream answer to bounded memory is the chart's
+        # `addonResizer`, not a limit.
+
+        # Kubelet TLS is left verified. If the pod logs
+        # `x509: cannot validate certificate for <node ip>`, the node's kubelet
+        # serving certificate is not signed by the cluster CA; the fix is to
+        # enable kubelet serving-certificate bootstrap on the node group, not
+        # `--kubelet-insecure-tls`, which turns off verification for every
+        # kubelet connection permanently.
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kube-system
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+      - PruneLast=true
+      # No `CreateNamespace=true`: kube-system is created by Kubernetes itself,
+      # and an Application that would create it is one that could also delete it
+      # on a prune.
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+
+  revisionHistoryLimit: 10

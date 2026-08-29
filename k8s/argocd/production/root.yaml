@@ -1,0 +1,83 @@
+# Bootstrap for the production cluster. Two documents, applied by hand, once:
+#
+#   aws eks update-kubeconfig --name production-eks --region us-east-1
+#   kubectl apply -f k8s/argocd/production/root.yaml
+#
+# This is the staging file with one word changed, and that is intentional: the
+# two clusters run the same control plane so that a GitOps change is exercised
+# in staging before it reaches production. `npm run audit:argocd` fails when the
+# two trees stop being parallel — the same guarantee `values-staging.yaml` and
+# `values-production.yaml` get from `npm run audit:helm`.
+#
+# Everything else in `k8s/argocd/production/` is applied by the Application
+# below; nothing in this file is applied by anything but a human. See
+# docs/gitops-argocd.md §2 for why the trust root is not self-managed.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: bootstrap
+  namespace: argocd
+spec:
+  description: >-
+    The root Application only. Permits nothing but Argo CD's own Application and
+    AppProject objects, from this repository, into the argocd namespace.
+
+  sourceRepos:
+    - https://github.com/Kojo-Brown/boilerplate-devops.git
+
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: argocd
+
+  # Empty allow-list: no cluster-scoped resource may be deployed at all.
+  clusterResourceWhitelist: []
+
+  namespaceResourceWhitelist:
+    - group: argoproj.io
+      kind: AppProject
+    - group: argoproj.io
+      kind: Application
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: root-production
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: bootstrap
+
+  source:
+    repoURL: https://github.com/Kojo-Brown/boilerplate-devops.git
+    # Production tracks the same branch staging does. The promotion boundary in
+    # this repository is the image tag committed to `values-production.yaml`,
+    # not the git revision the cluster follows — see docs/gitops-argocd.md §5.
+    # A production cluster pinned to a release tag while staging follows `main`
+    # is the other defensible arrangement, and it moves the promotion into this
+    # field instead.
+    targetRevision: main
+    path: k8s/argocd/production
+    directory:
+      recurse: true
+      include: "{projects/*.yaml,applications/*.yaml}"
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+      - PruneLast=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+
+  revisionHistoryLimit: 10

@@ -1,0 +1,31 @@
+# A workload project that may create ClusterRoleBindings may bind any subject to
+# cluster-admin, so every namespace boundary above it is decorative. The one
+# cluster-scoped resource this project is allowed is its own Namespace,
+# restricted by name. Rule: cluster-scope-escalation.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: app
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+spec:
+  description: The application release in the staging namespace.
+  sourceRepos:
+    - https://github.com/Kojo-Brown/boilerplate-devops.git
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: staging
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+      name: staging
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRoleBinding
+  namespaceResourceBlacklist:
+    - group: rbac.authorization.k8s.io
+      kind: Role
+    - group: rbac.authorization.k8s.io
+      kind: RoleBinding
+  orphanedResources:
+    warn: true

@@ -1,0 +1,184 @@
+name: Argo CD drift report
+
+# Reports the drift Argo CD's own self-healing cannot fix.
+#
+# `syncPolicy.automated.selfHeal` reverts a change made on the cluster within
+# seconds, which covers the common case so well that it is easy to assume it
+# covers everything. It does not:
+#
+#   • A sync that keeps *failing* leaves the application OutOfSync indefinitely.
+#     Self-heal retries and retries, and nothing outside Argo CD says so — the
+#     git history looks like the change landed.
+#   • Self-heal only reconciles resources an Application already manages. A
+#     Deployment created beside the release during an incident belongs to no
+#     Application, so nothing reverts it, nothing prunes it, and nothing
+#     mentions it. `orphanedResources` in the AppProject is what notices; this
+#     is what tells somebody.
+#   • Self-heal lives inside `automated`. An application switched to manual sync
+#     — from the UI, in the middle of an incident, by someone who meant to
+#     switch it back — stops correcting drift entirely and still reports a
+#     healthy-looking OutOfSync.
+#
+# So this is a scheduled read, not a gate on a pull request: it answers "is
+# every cluster still running what git says" at a moment when nobody is looking.
+# `npm run audit:argocd` covers the other half — that the manifests in git say
+# what they should — and runs on every pull request instead.
+#
+# ── Usage ─────────────────────────────────────────────────────────────────────
+#
+#   name: Argo CD drift
+#   on:
+#     schedule:
+#       - cron: "17 * * * *"
+#     workflow_dispatch:
+#
+#   jobs:
+#     production:
+#       uses: YOUR_ORG/YOUR_REPO/.github/workflows/argocd-drift-report.yml@main
+#       with:
+#         argocd-server: argocd.production.example.com
+#         project: app
+#       secrets:
+#         ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_PRODUCTION_READ_TOKEN }}
+#
+# ── The token ─────────────────────────────────────────────────────────────────
+# Create a project role with read-only access and issue a token for it, rather
+# than reusing an admin account:
+#
+#   argocd proj role create app reporter
+#   argocd proj role add-policy app reporter --action get --permission allow \
+#     --object 'app/*'
+#   argocd proj role create-token app reporter --expires-in 8760h
+#
+# Store it in the GitHub secret store. It is a bearer token for the Argo CD API,
+# so anything that can read it can read every application spec the role covers.
+
+on:
+  workflow_call:
+    inputs:
+      argocd-server:
+        description: >-
+          Host of the Argo CD API server, without a scheme, e.g.
+          argocd.production.example.com. Must be reachable from the runner —
+          for a cluster with a private API endpoint that means a self-hosted
+          runner inside the VPC.
+        required: true
+        type: string
+      project:
+        description: >-
+          Report on one AppProject only. Empty reports on every application the
+          token can see, which is usually what a platform-wide report wants.
+        type: string
+        default: ""
+      fail-on-drift:
+        description: >-
+          Fail the workflow when anything is reported. Leave it true: a report
+          that only ever writes to a job summary is a report nobody reads.
+        type: boolean
+        default: true
+
+    secrets:
+      ARGOCD_AUTH_TOKEN:
+        description: Argo CD API token with read access to the applications.
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  report:
+    name: Argo CD drift report
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # No checkout: this job reads a running Argo CD, not this repository.
+      - name: Read application state from the Argo CD API
+        env:
+          ARGOCD_SERVER: ${{ inputs.argocd-server }}
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+          ARGOCD_PROJECT: ${{ inputs.project }}
+        run: |
+          set -euo pipefail
+
+          query=""
+          if [ -n "${ARGOCD_PROJECT}" ]; then
+            query="?projects=${ARGOCD_PROJECT}"
+          fi
+
+          # --fail-with-body so an authentication failure is an error with the
+          # server's explanation, rather than an HTML page parsed as JSON three
+          # steps later.
+          curl --fail-with-body --silent --show-error --max-time 60 \
+            --header "Authorization: Bearer ${ARGOCD_AUTH_TOKEN}" \
+            --header "Accept: application/json" \
+            "https://${ARGOCD_SERVER}/api/v1/applications${query}" \
+            --output applications.json
+
+          echo "Read $(jq '.items | length' applications.json) application(s)."
+
+      - name: Report drift
+        env:
+          FAIL_ON_DRIFT: ${{ inputs.fail-on-drift }}
+        run: |
+          set -euo pipefail
+
+          # Four questions, in the order they matter. The first two describe a
+          # cluster that has stopped matching git; the last two describe a
+          # cluster that has stopped trying to.
+          cat > filter.jq <<'JQ'
+          .items[]
+          | {
+              name: .metadata.name,
+              sync: (.status.sync.status // "Unknown"),
+              health: (.status.health.status // "Unknown"),
+              automated: (.spec.syncPolicy.automated != null
+                          and .spec.syncPolicy.automated.enabled != false),
+              selfHeal: (.spec.syncPolicy.automated.selfHeal == true),
+              orphaned: ([.status.conditions // []
+                          | .[]
+                          | select(.type == "OrphanedResourceWarning")] | length > 0)
+            }
+          | [ (if .sync != "Synced" then
+                 "\(.name): \(.sync) — the cluster does not match git, and self-heal has not closed the gap"
+               else empty end),
+              (if .health != "Healthy" and .health != "Suspended" then
+                 "\(.name): health is \(.health)"
+               else empty end),
+              (if .automated | not then
+                 "\(.name): automated sync is off, so nothing corrects drift at all"
+               elif .selfHeal | not then
+                 "\(.name): self-heal is off, so drift on the cluster is reported and kept"
+               else empty end),
+              (if .orphaned then
+                 "\(.name): resources in its namespace belong to no Application"
+               else empty end)
+            ]
+          | .[]
+          JQ
+
+          jq -r -f filter.jq applications.json > findings.txt
+
+          {
+            echo "## Argo CD drift"
+            echo
+            if [ -s findings.txt ]; then
+              echo "| Finding |"
+              echo "| --- |"
+              sed 's/^/| /; s/$/ |/' findings.txt
+            else
+              echo "Every application is Synced, Healthy, and self-healing."
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          if [ ! -s findings.txt ]; then
+            echo "No drift."
+            exit 0
+          fi
+
+          while IFS= read -r finding; do
+            echo "::error title=Argo CD drift::${finding}"
+          done < findings.txt
+
+          if [ "${FAIL_ON_DRIFT}" = "true" ]; then
+            exit 1
+          fi

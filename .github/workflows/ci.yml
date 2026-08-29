@@ -88,6 +88,16 @@ jobs:
       - name: Audit Helm chart values
         run: npm run audit:helm
 
+      # The GitOps tree is the only thing in this repository that a cluster
+      # applies without anyone running a command, and it is the least checked:
+      # the API server validates an Application against a CRD whose `spec.source`
+      # is an object, so a project that does not exist, a production Application
+      # rendering staging's values, or a `selfHeal` nobody turned on are all
+      # valid manifests. Every one of them surfaces on the cluster, after merge,
+      # or not at all. See docs/gitops-argocd.md.
+      - name: Audit Argo CD manifests
+        run: npm run audit:argocd
+
       # Synth runs before the suite deliberately. It is the build step and takes
       # seconds, while the suite takes minutes; ordering it first means a test
       # failure never hides whether the app still synthesises.

@@ -1,0 +1,63 @@
+# The application release on the production cluster.
+#
+# What promotes a change to production is a commit to `values-production.yaml`
+# — in practice the image tag — and nothing else. There is no pipeline holding
+# production cluster credentials, and no deploy step that can be run from a
+# laptop: the cluster converges on this file.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: app-production
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: app
+
+  source:
+    repoURL: https://github.com/Kojo-Brown/boilerplate-devops.git
+    targetRevision: main
+    path: k8s/charts/app
+    helm:
+      # The IRSA trust policy names the subject `production/app-production`
+      # exactly. The ServiceAccount is named from the release, so this line is
+      # what keeps an Application rename from becoming an authentication failure
+      # at the first AWS call.
+      releaseName: app-production
+      valueFiles:
+        - values-production.yaml
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: production
+
+  syncPolicy:
+    # Automated, including in production, and that is a decision rather than a
+    # default. Self-heal lives *inside* `automated`, so a manually-synced
+    # production application is one where drift is detected and then left in
+    # place — the environment where drift matters most would be the one with no
+    # correction. What it costs is documented in docs/gitops-argocd.md §6: Argo
+    # CD refuses to roll back an application with automated sync enabled, so the
+    # way back from a bad release is a revert commit, not a button.
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+      - PruneLast=true
+      - CreateNamespace=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+
+  # No `ignoreDifferences` for `/spec/replicas`: the chart omits the field
+  # entirely while the HPA is enabled, so there is nothing for self-heal to
+  # fight over. A chart that did template it would have self-heal resetting the
+  # replica count seconds after every scale-up, against an HPA scaling it back.
+
+  revisionHistoryLimit: 10
