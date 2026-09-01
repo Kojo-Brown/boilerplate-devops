@@ -15,6 +15,7 @@
     "securityContext",
     "containerPort",
     "service",
+    "ingress",
     "resources",
     "probes",
     "podDisruptionBudget",
@@ -249,11 +250,79 @@
       "required": ["type", "port"],
       "properties": {
         "type": {
-          "description": "ClusterIP unless something outside the cluster reaches this Service directly. Ingress is a later Phase 8 item and terminates at a ClusterIP Service.",
+          "description": "ClusterIP unless something outside the cluster reaches this Service directly. The Ingress terminates at this Service and reaches it from inside the cluster, so it needs nothing wider.",
           "type": "string",
           "enum": ["ClusterIP", "NodePort", "LoadBalancer"]
         },
         "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "annotations": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    },
+    "ingress": {
+      "description": "The public entry point: one Ingress, always TLS, with the certificate issued and renewed by cert-manager and the DNS record published by external-dns. See docs/ingress.md.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "className", "hosts", "path", "pathType", "tls"],
+      "if": {
+        "properties": { "enabled": { "const": true } },
+        "required": ["enabled"]
+      },
+      "then": {
+        "description": "An enabled Ingress with no host serves nothing and issues no certificate: the rule list is empty, spec.tls carries no SAN, and cert-manager's ingress-shim has nothing to create a Certificate for. The object is still valid Kubernetes, so only this catches it.",
+        "properties": { "hosts": { "minItems": 1 } }
+      },
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "className": {
+          "description": "The IngressClass the controller registers. Not the deprecated kubernetes.io/ingress.class annotation, which ingress-nginx 1.0 stopped honouring: an Ingress naming no class is admitted, listed, and served by nothing.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 253
+        },
+        "hosts": {
+          "description": "Every hostname served, and every SAN on the issued certificate — spec.tls carries the same list, so one certificate covers all of them.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/definitions/hostname" }
+        },
+        "path": {
+          "description": "Must start with a slash. Kubernetes rejects a path that does not, but only at apply time — which for a GitOps release is after the merge.",
+          "type": "string",
+          "pattern": "^/"
+        },
+        "pathType": {
+          "description": "Prefix unless there is a reason. ImplementationSpecific hands matching to the controller, and ingress-nginx reads those paths as regular expressions when use-regex is on, so a dot silently becomes a wildcard.",
+          "type": "string",
+          "enum": ["Prefix", "Exact", "ImplementationSpecific"]
+        },
+        "tls": {
+          "description": "Not optional, and there is no tls.enabled. An Ingress without spec.tls makes the cert-manager annotation a no-op — ingress-shim reads the TLS hosts, not the rule hosts — and reports nothing at all.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["clusterIssuer", "renewBefore"],
+          "properties": {
+            "clusterIssuer": {
+              "description": "The ClusterIssuer name. It differs per environment because the staging cluster issues from Let's Encrypt's staging ACME endpoint; npm run audit:helm checks the two agree.",
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 253
+            },
+            "renewBefore": {
+              "description": "A Go duration ending in h, m or s. cert-manager rejects a bare number, and rejects the d suffix that everybody writes first.",
+              "type": "string",
+              "pattern": "^(\\d+h)?(\\d+m)?(\\d+s)?$",
+              "minLength": 2
+            },
+            "secretName": {
+              "description": "Defaults to <fullname>-tls. Two releases naming one Secret produce two Certificates that overwrite each other's key pair at renewal.",
+              "type": "string",
+              "maxLength": 253
+            }
+          }
+        },
         "annotations": {
           "type": "object",
           "additionalProperties": { "type": "string" }
@@ -614,6 +683,13 @@
       "propertyNames": {
         "pattern": "^([a-z0-9]([-a-z0-9.]*[a-z0-9])?/)?[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$"
       }
+    },
+    "hostname": {
+      "description": "A DNS name, lower-case, at least two labels, and no scheme, port or path — `https://app.example.com` is the value everybody writes first, and the API server accepts it as a host that then matches no request. A leading `*.` is refused as well: a wildcard SAN can only be issued through a DNS-01 challenge on the apex, so it is a decision about the issuer rather than a longer hostname, and docs/ingress.md §6 has it.",
+      "type": "string",
+      "minLength": 4,
+      "maxLength": 253,
+      "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)+$"
     },
     "cidr": {
       "description": "An IPv4 CIDR block. IPv6 is not accepted because nothing this repository provisions is dual-stack, and a v6 range in an allowlist on a v4-only cluster is a rule that silently matches nothing.",

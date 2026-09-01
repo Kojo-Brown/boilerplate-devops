@@ -2,9 +2,11 @@
 #
 # This project is privileged and the `app` project next door is not, which is
 # the whole reason there are two. metrics-server needs an APIService, a
-# ClusterRole and a ClusterRoleBinding — an add-on that extends the Kubernetes
-# API cannot be confined to one namespace. The application releases need none of
-# that, so they get a project that permits none of it.
+# ClusterRole and a ClusterRoleBinding; cert-manager needs CustomResourceDefinitions
+# and two webhook configurations; ingress-nginx needs an IngressClass — an add-on
+# that extends the Kubernetes API cannot be confined to one namespace. The
+# application releases need none of that, so they get a project that permits
+# none of it.
 apiVersion: argoproj.io/v1alpha1
 kind: AppProject
 metadata:
@@ -21,24 +23,62 @@ spec:
   description: Cluster add-ons that the workload releases depend on.
 
   sourceRepos:
+    # This repository, for the ClusterIssuer under `k8s/cert-manager/staging`.
     - https://github.com/Kojo-Brown/boilerplate-devops.git
-    # metrics-server is installed from its own chart repository rather than
-    # vendored here. The chart version in `applications/metrics-server.yaml` is
-    # exact, so what this permits is one upstream repository, not a moving target.
+    # Four upstream chart repositories, each pinned to an exact chart version in
+    # the Application that reads it — so what this permits is four repositories,
+    # not a moving target. Argo CD matches these against `spec.source.repoURL`
+    # as globs after normalising the case and a `.git` suffix, but **not** a
+    # trailing slash: two of these are conventionally written with one and two
+    # without, and each must match its Application character for character.
     - https://kubernetes-sigs.github.io/metrics-server/
+    - https://kubernetes-sigs.github.io/external-dns/
+    - https://kubernetes.github.io/ingress-nginx
+    - https://charts.jetstack.io
 
+  # One namespace per add-on, named. A wildcard here would let any of these
+  # charts deploy into `staging` beside the workload release, or into `argocd`
+  # beside Argo CD's own service account.
   destinations:
     - server: https://kubernetes.default.svc
       namespace: kube-system
+    - server: https://kubernetes.default.svc
+      namespace: cert-manager
+    - server: https://kubernetes.default.svc
+      namespace: ingress-nginx
+    - server: https://kubernetes.default.svc
+      namespace: external-dns
 
-  # Exactly what metrics-server needs and nothing else. `APIService` is the
-  # aggregation layer registration for `v1beta1.metrics.k8s.io`; the two RBAC
-  # kinds are the `system:aggregated-metrics-reader` role and the binding to
-  # `system:auth-delegator` that lets the API server delegate authn to it.
+  # Exactly what these four add-ons need and nothing else, with the reason each
+  # one is here:
+  #
+  #   APIService                     metrics-server's aggregation-layer
+  #                                  registration for `v1beta1.metrics.k8s.io`
+  #   ClusterRole/ClusterRoleBinding  every one of them; for metrics-server also
+  #                                  the binding to `system:auth-delegator` that
+  #                                  lets the API server delegate authn to it
+  #   CustomResourceDefinition       cert-manager's six CRDs. This is the widest
+  #                                  entry in the list: a CRD is a new API, and
+  #                                  a chart that can define one can define any
+  #                                  of them
+  #   Validating/MutatingWebhookConfiguration
+  #                                  cert-manager's admission webhooks and
+  #                                  ingress-nginx's. A mutating webhook sees
+  #                                  and can rewrite every object it matches, so
+  #                                  its `rules` are worth reading on any chart
+  #                                  bump that changes them
+  #   IngressClass                   ingress-nginx's `nginx` class
+  #   ClusterIssuer                  the ACME issuer in `k8s/cert-manager/`
+  #   Namespace                      restricted by name, three of them, because
+  #                                  `CreateNamespace=true` makes the namespace
+  #                                  a resource the sync creates
   #
   # Adding a kind here is a real decision: a project that may create
   # ClusterRoleBindings may bind any subject to cluster-admin, so this list is
-  # the ceiling on what a compromised add-on chart can do.
+  # the ceiling on what a compromised add-on chart can do. `npm run audit:argocd`
+  # fails on an entry that is not in `PLATFORM_CLUSTER_KINDS` in
+  # `tools/audit-argocd.ts`, so widening it is a diff in two places with a
+  # reason attached rather than a line in a chart bump.
   clusterResourceWhitelist:
     - group: apiregistration.k8s.io
       kind: APIService
@@ -46,12 +86,31 @@ spec:
       kind: ClusterRole
     - group: rbac.authorization.k8s.io
       kind: ClusterRoleBinding
+    - group: apiextensions.k8s.io
+      kind: CustomResourceDefinition
+    - group: admissionregistration.k8s.io
+      kind: ValidatingWebhookConfiguration
+    - group: admissionregistration.k8s.io
+      kind: MutatingWebhookConfiguration
+    - group: networking.k8s.io
+      kind: IngressClass
+    - group: cert-manager.io
+      kind: ClusterIssuer
+    - group: ""
+      kind: Namespace
+      name: cert-manager
+    - group: ""
+      kind: Namespace
+      name: ingress-nginx
+    - group: ""
+      kind: Namespace
+      name: external-dns
 
-  # Namespaced resources are unrestricted, bounded by the single destination
-  # namespace above. An add-on chart legitimately ships whatever its author
-  # chose — a Deployment, a Service, a ServiceAccount, a PodDisruptionBudget,
-  # sometimes a ServiceMonitor — and enumerating those here would turn every
-  # upstream chart bump into a permission failure at sync time.
+  # Namespaced resources are unrestricted, bounded by the destination namespaces
+  # above. An add-on chart legitimately ships whatever its author chose — a
+  # Deployment, a Service, a ServiceAccount, a PodDisruptionBudget, sometimes a
+  # ServiceMonitor — and enumerating those here would turn every upstream chart
+  # bump into a permission failure at sync time.
   namespaceResourceBlacklist: []
 
   # Orphaned-resource tracking is deliberately *not* enabled on this project.

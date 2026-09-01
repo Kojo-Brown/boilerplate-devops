@@ -106,6 +106,26 @@ successThreshold: {{ .successThreshold }}
 {{- end }}
 
 {{/*
+The Secret cert-manager writes the issued certificate and key into.
+
+Derived from the fullname rather than taken from the hostname, so that two
+releases in one namespace cannot collide: a Certificate owns its Secret, and two
+Certificates naming the same one take turns overwriting each other's key pair.
+The symptom arrives at the first renewal after the second release lands, which
+is up to sixty days after the change that caused it.
+
+`ingress.tls.secretName` overrides it, which is what an existing certificate
+already in the cluster needs.
+*/}}
+{{- define "app.tlsSecretName" -}}
+{{- if .Values.ingress.tls.secretName }}
+{{- .Values.ingress.tls.secretName | trunc 63 | trimSuffix "-" }}
+{{- else }}
+{{- printf "%s-tls" (include "app.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+{{- end }}
+
+{{/*
 One direction of an HPA's `behavior`, rendered from one entry of
 `.Values.autoscaling.behavior`. Called with that entry as its context.
 

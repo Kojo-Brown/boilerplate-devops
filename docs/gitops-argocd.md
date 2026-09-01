@@ -316,7 +316,9 @@ does a rolling update. The blue/green and canary paths in this repository
 EKS; the Kubernetes equivalent is Argo Rollouts, which is a controller and a
 `Rollout` kind, not a setting.
 
-**The application release is the only workload.** There is no ingress controller
-(the chart's NetworkPolicy ingress allowlist is still empty for that reason), no
-cert-manager, no external-dns and no observability stack — those are the next
-`platform` applications, and each is one file in `applications/` per environment.
+**The application release is the only workload.** The other five Applications
+per environment are `platform`: metrics-server, cert-manager, its ClusterIssuer,
+ingress-nginx and external-dns — the last four being the Ingress path documented
+in [docs/ingress.md](./ingress.md). There is no observability stack and no
+progressive-delivery controller; each would be one more file in `applications/`
+per environment.

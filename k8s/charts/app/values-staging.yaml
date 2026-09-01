@@ -58,9 +58,50 @@ podDisruptionBudget:
   enabled: true
   minAvailable: 1
 
-# `networkPolicy` is inherited whole from the chart defaults: the same
-# default-deny, the same DNS rule, the same HTTPS-to-AWS egress entry, and the
-# same empty ingress allowlist. Staging runs the identical policy on purpose —
-# a boundary only production has is one whose first real exercise is in
-# production. Narrowing egress per environment (VPC endpoint ranges instead of
-# 0.0.0.0/0) is the change that would go here; see docs/network-policies.md §4.
+# The public entry point. `example.com` is reserved for documentation (RFC 2606)
+# and resolves nowhere, so a copy of this file that nobody edited fails at
+# external-dns — which cannot find a hosted zone for it — rather than publishing
+# a record into somebody else's domain.
+ingress:
+  enabled: true
+  hosts:
+    - app.staging.example.com
+  tls:
+    # Let's Encrypt's *staging* ACME endpoint, and the reason is a rate limit
+    # rather than a preference. The production endpoint allows 50 certificates
+    # per week counted on the *registered* domain — `example.com`, not
+    # `app.staging.example.com` — so a staging cluster that redeploys on every
+    # merge does not merely exhaust its own quota, it blocks issuance in
+    # production. The cost is a certificate browsers do not trust, which is the
+    # correct cost for a hostname no browser should be visiting.
+    clusterIssuer: letsencrypt-staging
+
+# `networkPolicy` is otherwise inherited whole from the chart defaults: the same
+# default-deny, the same DNS rule, the same HTTPS-to-AWS egress entry. Staging
+# runs the identical policy on purpose — a boundary only production has is one
+# whose first real exercise is in production. Narrowing egress per environment
+# (VPC endpoint ranges instead of 0.0.0.0/0) is the change that would go here;
+# see docs/network-policies.md §4.
+#
+# The ingress allowlist is the one part that cannot be inherited. Helm replaces
+# lists wholesale rather than merging them, so this entry is restated in
+# `values-production.yaml` too; leaving it out of either file is an Ingress that
+# terminates TLS and then returns 503 from a controller that cannot open a
+# connection to pods the Service reports as ready.
+networkPolicy:
+  ingress:
+    - name: ingress-controller
+      # Two selectors in one entry, so they are ANDed: the ingress-nginx
+      # controller pods in the ingress-nginx namespace. Not every pod in that
+      # namespace, and not every pod anywhere carrying that label.
+      namespaceLabels:
+        kubernetes.io/metadata.name: ingress-nginx
+      podLabels:
+        app.kubernetes.io/name: ingress-nginx
+      ports:
+        # The container port by name, never `service.port`. kube-proxy rewrites
+        # the destination to the container port before policy is evaluated, so
+        # a rule naming 80 here matches nothing and the connection is dropped —
+        # as a timeout, which reads as a slow application.
+        - port: http
+          protocol: TCP

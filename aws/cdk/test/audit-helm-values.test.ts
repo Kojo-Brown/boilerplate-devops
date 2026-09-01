@@ -11,6 +11,7 @@ import {
   auditChart,
   auditChartMetadata,
   auditEnvironment,
+  auditIngress,
   auditNetworkPolicy,
   auditPodSecurity,
   auditSchemaHygiene,
@@ -853,6 +854,151 @@ describe('auditNetworkPolicy', () => {
   });
 });
 
+describe('auditIngress', () => {
+  /** A release whose Ingress is coherent for staging. Each test breaks one thing. */
+  const SERVED = {
+    ingress: {
+      enabled: true,
+      className: 'nginx',
+      hosts: ['app.staging.example.com'],
+      path: '/',
+      pathType: 'Prefix',
+      tls: { clusterIssuer: 'letsencrypt-staging', renewBefore: '720h', secretName: '' },
+      annotations: {},
+    },
+    networkPolicy: {
+      enabled: true,
+      ingress: [
+        {
+          name: 'ingress-controller',
+          namespaceLabels: { 'kubernetes.io/metadata.name': 'ingress-nginx' },
+          podLabels: { 'app.kubernetes.io/name': 'ingress-nginx' },
+          ports: [{ port: 'http', protocol: 'TCP' }],
+        },
+      ],
+      egress: [],
+    },
+  };
+
+  const STAGING: EnvironmentValues = {
+    environment: 'staging',
+    path: 'k8s/charts/app/values-staging.yaml',
+    document: {},
+  };
+
+  const audit = (
+    merged: Record<string, unknown>,
+    environment: EnvironmentValues = STAGING,
+  ): ViolationRule[] => rules(auditIngress(merged, environment, environment.path));
+
+  const ingressWith = (overrides: Record<string, unknown>): Record<string, unknown> => ({
+    ...SERVED,
+    ingress: { ...SERVED.ingress, ...overrides },
+  });
+
+  it('accepts a served release whose issuer, annotations and allowlist agree', () => {
+    expect(audit(SERVED)).toEqual([]);
+  });
+
+  it('accepts the production issuer in the production file', () => {
+    const production: EnvironmentValues = {
+      environment: 'production',
+      path: 'k8s/charts/app/values-production.yaml',
+      document: {},
+    };
+
+    expect(
+      audit(
+        ingressWith({
+          hosts: ['app.example.com'],
+          tls: { ...SERVED.ingress.tls, clusterIssuer: 'letsencrypt-production' },
+        }),
+        production,
+      ),
+    ).toEqual([]);
+  });
+
+  it('reports nothing at all while the Ingress is disabled', () => {
+    // A disabled Ingress with a mismatched issuer and no allowlist entry is not
+    // a latent bug — none of it is rendered — and reporting it would make
+    // turning the feature off require also unwinding its configuration.
+    expect(
+      audit({
+        ingress: { ...SERVED.ingress, enabled: false, tls: { clusterIssuer: 'nonesuch' } },
+        networkPolicy: { enabled: true, ingress: [], egress: [] },
+      }),
+    ).toEqual([]);
+  });
+
+  it('reports an issuer no cluster in this environment installs', () => {
+    expect(audit(ingressWith({ tls: { ...SERVED.ingress.tls, clusterIssuer: 'letsencrypt' } }))).toEqual(
+      ['cluster-issuer-mismatch'],
+    );
+  });
+
+  it('reports the other environment’s issuer, which resolves and spends its rate limit', () => {
+    expect(
+      audit(ingressWith({ tls: { ...SERVED.ingress.tls, clusterIssuer: 'letsencrypt-production' } })),
+    ).toEqual(['cluster-issuer-mismatch']);
+  });
+
+  it('reports a missing issuer rather than treating the block as absent', () => {
+    expect(audit(ingressWith({ tls: { renewBefore: '720h' } }))).toEqual(['cluster-issuer-mismatch']);
+  });
+
+  it('reports an annotation the template writes itself', () => {
+    expect(
+      audit(
+        ingressWith({
+          annotations: { 'cert-manager.io/cluster-issuer': 'letsencrypt-production' },
+        }),
+      ),
+    ).toEqual(['managed-ingress-annotation']);
+  });
+
+  it('reports every managed annotation, not just the first', () => {
+    expect(
+      audit(
+        ingressWith({
+          annotations: {
+            'cert-manager.io/cluster-issuer': 'letsencrypt-staging',
+            'cert-manager.io/renew-before': '48h',
+          },
+        }),
+      ),
+    ).toEqual(['managed-ingress-annotation', 'managed-ingress-annotation']);
+  });
+
+  it('leaves controller annotations alone', () => {
+    expect(
+      audit(
+        ingressWith({
+          annotations: { 'nginx.ingress.kubernetes.io/proxy-body-size': '8m' },
+        }),
+      ),
+    ).toEqual([]);
+  });
+
+  it('reports an enabled Ingress with nothing allowed through the policy', () => {
+    expect(audit({ ...SERVED, networkPolicy: { enabled: true, ingress: [], egress: [] } })).toEqual([
+      'ingress-peer-not-allowed',
+    ]);
+  });
+
+  it('does not report the allowlist when there is no policy to allow through', () => {
+    // `network-policy-disabled` already reports this release, and adding a
+    // second violation about the hole in a boundary that is not there would
+    // point at the wrong fix.
+    expect(audit({ ...SERVED, networkPolicy: { enabled: false, ingress: [], egress: [] } })).toEqual(
+      [],
+    );
+  });
+
+  it('reports nothing for a chart with no ingress block at all', () => {
+    expect(audit({ networkPolicy: { enabled: true, ingress: [], egress: [] } })).toEqual([]);
+  });
+});
+
 describe('replicaFloor', () => {
   it('reads the HPA floor when autoscaling is on', () => {
     expect(replicaFloor({ replicaCount: 8, autoscaling: { enabled: true, minReplicas: 3 } })).toEqual(
@@ -1005,6 +1151,13 @@ describe('the schema fixtures', () => {
     // in the `allOf` branch rather than tightened for both directions.
     ['network-policy-named-egress-port.yaml', 'type', '/networkPolicy/egress/0/ports/0/port'],
     ['network-policy-peerless-rule.yaml', 'anyOf', '/networkPolicy/egress/0'],
+    // `minItems` reached through the `if`/`then` on `ingress`, not a bare one on
+    // `hosts`: an empty list is correct while the Ingress is off and useless
+    // once it is on, and only the conditional branch can tell the two apart.
+    ['ingress-enabled-without-host.yaml', 'minItems', '/ingress/hosts'],
+    ['ingress-host-with-scheme.yaml', 'pattern', '/ingress/hosts/0'],
+    ['ingress-without-tls.yaml', 'required', '/ingress'],
+    ['ingress-renew-before-in-days.yaml', 'pattern', '/ingress/tls/renewBefore'],
   ];
 
   it.each(FIXTURES)('rejects %s with the %s keyword', (file, keyword, instancePath) => {
@@ -1041,19 +1194,48 @@ describe('the schema fixtures', () => {
  * render anything.
  *
  * A chart's gates only execute the template paths its own values files reach.
- * `networkPolicy.ingress` is empty in `values.yaml` and in both environment
- * files — correctly, since the cluster has no ingress controller yet — so the
- * entire ingress half of `templates/networkpolicy.yaml` is rendered by nothing
- * unless something turns it on. `.github/scripts/lint-helm-chart.sh` renders
- * these; the assertions here are that the schema still accepts them, because a
- * fixture that has drifted into being rejected turns into a render the script
- * silently stops performing.
+ * Every optional block — an `{{- if }}` around a whole object, a `range` over a
+ * list that is empty in both environments, the second arm of a `default` — is
+ * rendered by nothing unless something turns it on.
+ * `.github/scripts/lint-helm-chart.sh` renders these; the assertions here are
+ * that the schema still accepts them, because a fixture that has drifted into
+ * being rejected turns into a render the script silently stops performing.
  */
 describe('the render fixtures', () => {
   const defaults = yaml(path.join(APP_CHART, 'values.yaml'));
   const validate = compileSchema(json(path.join(APP_CHART, 'values.schema.json')));
 
-  const FIXTURES: readonly string[] = ['network-policy-allowlist.yaml'];
+  /**
+   * Each fixture with the thing it must still be doing that no environment file
+   * does. Without these a fixture could be quietly reduced to a copy of the
+   * defaults and go on passing every other assertion here while covering
+   * nothing — which is the same failure the fixtures exist to prevent, one
+   * level up.
+   */
+  const FIXTURES: ReadonlyArray<[file: string, covers: (merged: Record<string, any>) => void]> = [
+    [
+      'network-policy-allowlist.yaml',
+      (merged) => {
+        // Both environment files carry exactly one ingress entry, of one shape.
+        // This is what reaches the other two peer shapes and the named-versus-
+        // numeric port forms.
+        expect(merged.networkPolicy.ingress.length).toBeGreaterThan(1);
+        expect(merged.networkPolicy.egress[0].except.length).toBeGreaterThan(0);
+      },
+    ],
+    [
+      'ingress-overrides.yaml',
+      (merged) => {
+        // Several hosts, so both `range` loops in templates/ingress.yaml run
+        // more than once; an adopted secret name, so `app.tlsSecretName` takes
+        // its override arm; pass-through annotations, so the `merge` runs
+        // against a non-empty map.
+        expect(merged.ingress.hosts.length).toBeGreaterThan(1);
+        expect(merged.ingress.tls.secretName).not.toBe('');
+        expect(Object.keys(merged.ingress.annotations).length).toBeGreaterThan(0);
+      },
+    ],
+  ];
 
   it.each(FIXTURES)('accepts %s', (file) => {
     const merged = coalesceValues(defaults, yaml(path.join(APP_CHART, 'render-fixtures', file)));
@@ -1067,24 +1249,25 @@ describe('the render fixtures', () => {
       .filter((file) => file.endsWith('.yaml'))
       .sort();
 
-    expect(onDisk).toEqual([...FIXTURES].sort());
+    expect(onDisk).toEqual(FIXTURES.map(([file]) => file).sort());
   });
 
-  it('exercises template paths the environment files leave off', () => {
-    // Without this the fixture could be quietly reduced to a copy of the
-    // defaults and go on passing every assertion above while covering nothing.
-    for (const file of FIXTURES) {
-      const merged = coalesceValues(defaults, yaml(path.join(APP_CHART, 'render-fixtures', file)));
-      const policy = merged.networkPolicy as { ingress?: unknown[] };
+  it.each(FIXTURES)('%s exercises a path the environment files leave off', (file, covers) => {
+    covers(coalesceValues(defaults, yaml(path.join(APP_CHART, 'render-fixtures', file))));
+  });
 
-      expect(policy.ingress?.length ?? 0).toBeGreaterThan(0);
-    }
-
+  it('leaves those paths unreached by the environment files themselves', () => {
     for (const environment of ENVIRONMENTS) {
       const merged = coalesceValues(defaults, yaml(path.join(APP_CHART, `values-${environment}.yaml`)));
       const policy = merged.networkPolicy as { ingress?: unknown[] };
+      const ingress = merged.ingress as { hosts: unknown[]; tls: { secretName?: string } };
 
-      expect(policy.ingress).toEqual([]);
+      // One peer, of one shape: the ingress controller. That is the whole
+      // allowlist in both environments, which is what leaves the other shapes
+      // to the fixture above.
+      expect(policy.ingress).toHaveLength(1);
+      expect(ingress.hosts).toHaveLength(1);
+      expect(ingress.tls.secretName ?? '').toBe('');
     }
   });
 });

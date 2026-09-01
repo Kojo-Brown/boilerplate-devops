@@ -1,0 +1,50 @@
+# Values that must **render**, exercising template paths no environment file
+# reaches. See render-fixtures/README.md.
+#
+# Both environment files enable the Ingress, so the object itself is rendered by
+# the ordinary gates. What they do not reach is every optional branch inside it:
+#
+#   1. more than one host        — `range` over `hosts` in both `spec.tls` and
+#                                  `spec.rules`, which are two separate loops
+#                                  and one of them is inside a `range` already,
+#                                  so `$.Values` rather than `.Values`
+#   2. `tls.secretName` set      — the override arm of `app.tlsSecretName`
+#   3. `ingress.annotations`     — the `merge` that puts controller annotations
+#                                  and chart-managed ones in one mapping without
+#                                  emitting a duplicate key
+#   4. a non-default `pathType`  — `Exact`, which is not what either environment
+#                                  uses
+environment: staging
+
+ingress:
+  enabled: true
+  hosts:
+    - app.example.com
+    - www.example.com
+  path: /api
+  pathType: Exact
+  tls:
+    clusterIssuer: letsencrypt-staging
+    renewBefore: 360h
+    # Adopting a Secret that already holds a certificate, which is the only
+    # reason to set this — see the comment on `app.tlsSecretName`.
+    secretName: legacy-app-tls
+  annotations:
+    # Controller settings, which this chart does not model and passes through.
+    nginx.ingress.kubernetes.io/proxy-body-size: 8m
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+
+# The Ingress needs the allowlist entry that lets the controller reach these
+# pods; without it the render is still valid and the release still returns 503.
+# `npm run audit:helm` fails on that combination, and a fixture that tripped it
+# would be a fixture nobody could keep green.
+networkPolicy:
+  ingress:
+    - name: ingress-controller
+      namespaceLabels:
+        kubernetes.io/metadata.name: ingress-nginx
+      podLabels:
+        app.kubernetes.io/name: ingress-nginx
+      ports:
+        - port: http
+          protocol: TCP

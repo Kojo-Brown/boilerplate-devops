@@ -1,0 +1,142 @@
+# cert-manager on the production cluster.
+#
+# It issues and renews the certificate the Ingress in `k8s/charts/app` serves.
+# The renewal half is the part worth stating: cert-manager reconciles every
+# Certificate continuously and re-issues at `renewBefore` before expiry, so
+# "automatic renewal" is not a cron job that can be missing — it is the same
+# controller loop that issued the certificate in the first place. What it *is*
+# missing is an alarm, because a renewal that fails keeps failing silently until
+# the certificate expires; docs/ingress.md §7 says what to watch and why nothing
+# in this repository watches it yet.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cert-manager
+  namespace: argocd
+  annotations:
+    # Wave 1: after the AppProjects (-10) and metrics-server (0), before the
+    # ClusterIssuer in wave 2 that needs its CRDs. As with every wave here, this
+    # orders the creation of the Application objects and not the readiness of
+    # what they install — see docs/gitops-argocd.md §4.
+    argocd.argoproj.io/sync-wave: "1"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: platform
+
+  source:
+    repoURL: https://charts.jetstack.io
+    chart: cert-manager
+    # cert-manager publishes its chart version with the `v` prefix its releases
+    # carry — `v1.21.1`, not `1.21.1`. That is still an exact version and is
+    # accepted by `npm run audit:argocd`; a range is not.
+    targetRevision: v1.21.1
+    helm:
+      releaseName: cert-manager
+      values: |
+        # The CRDs ship with the chart rather than being applied separately.
+        #
+        # `keep: true` is the default and stays: uninstalling the chart with it
+        # false deletes the CRDs, and deleting a CRD deletes every Certificate,
+        # Issuer and Order in the cluster — including the Secrets they own,
+        # because the Certificate is their owner reference. That turns an
+        # `argocd app delete` into an outage on every ingress at once.
+        #
+        # These CRDs also make server-side apply non-optional for this
+        # Application: the cert-manager CRD schemas are far past the 262144-byte
+        # ceiling on the `last-applied-configuration` annotation that a
+        # client-side apply writes, so a client-side sync fails with
+        # `metadata.annotations: Too long`. `ServerSideApply=true` is in
+        # syncOptions below for that reason and no other.
+        crds:
+          enabled: true
+          keep: true
+
+        serviceAccount:
+          annotations:
+            # IRSA. `EksStack` creates this role when it is given a `dns` block;
+            # the account is the consumer's, and 123456789012 is the AWS
+            # documentation placeholder every example ARN in this repository
+            # uses.
+            eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/production-cert-manager
+
+        # The one non-obvious requirement of cert-manager under IRSA.
+        #
+        # The projected service-account token is mounted 0600 root:root. The
+        # cert-manager container runs as a non-root user, so without an fsGroup
+        # it cannot read the file the AWS SDK needs, and every DNS-01 challenge
+        # fails with a credentials error that names no file and no permission.
+        # 1001 is the UID the cert-manager image runs as.
+        securityContext:
+          runAsNonRoot: true
+          fsGroup: 1001
+          seccompProfile:
+            type: RuntimeDefault
+
+        # DNS-01 challenges are resolved against a public resolver rather than
+        # the cluster's. CoreDNS answers from the VPC resolver, which for a
+        # private hosted zone returns the *private* view — so cert-manager sees
+        # its own TXT record as absent, waits, and eventually fails the order
+        # against a zone in which the record plainly exists.
+        dns01RecursiveNameservers: "1.1.1.1:53,8.8.8.8:53"
+        dns01RecursiveNameserversOnly: true
+
+        # Two of each here, where staging runs one.
+        #
+        # The controller and the cainjector lead-elect, so the second replica is
+        # a standby and buys a faster failover on a 30-day-wide renewal window —
+        # which is not much. The **webhook** is the replica that matters: it is
+        # a validating and mutating admission webhook with `failurePolicy: Fail`
+        # on cert-manager's own API group, so while no webhook pod is ready,
+        # every write to a Certificate, Issuer, Order or Challenge in the cluster
+        # is rejected. One replica makes an ordinary node drain a window in which
+        # nothing can be issued or renewed.
+        replicaCount: 2
+
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            memory: 256Mi
+
+        webhook:
+          replicaCount: 2
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 128Mi
+
+        cainjector:
+          replicaCount: 2
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: cert-manager
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+      - PruneLast=true
+      - CreateNamespace=true
+      # Required by the CRDs above, not a preference. See the `crds` comment.
+      - ServerSideApply=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+
+  revisionHistoryLimit: 10

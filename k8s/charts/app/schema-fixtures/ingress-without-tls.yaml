@@ -1,0 +1,12 @@
+# `tls: null`, which in Helm deletes the chart default rather than overriding
+# it. The Ingress then renders with `spec.tls` absent and the
+# `cert-manager.io/cluster-issuer` annotation still on it — an annotation that
+# reads as "TLS is handled" and does nothing at all, because ingress-shim builds
+# its Certificate from the TLS hosts and there are none. No event, no
+# Certificate, no error: the site is served over plaintext HTTP.
+environment: staging
+ingress:
+  enabled: true
+  hosts:
+    - app.example.com
+  tls: null

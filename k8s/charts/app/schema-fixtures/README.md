@@ -26,6 +26,10 @@ violation, checked against the specific keyword that should catch it:
 | `network-policy-rule-without-ports.yaml` | an allowlist entry that limits no port | `required` |
 | `network-policy-named-egress-port.yaml` | a named port on egress, resolved in somebody else's pod | `type` (via `allOf`) |
 | `network-policy-peerless-rule.yaml` | an allowlist entry with no peer at all | `anyOf` |
+| `ingress-enabled-without-host.yaml` | an Ingress turned on with `hosts: []` | `minItems` (via `if`/`then`) |
+| `ingress-host-with-scheme.yaml` | `https://app.example.com` as a host | `pattern` |
+| `ingress-without-tls.yaml` | `ingress.tls: null`, which deletes the block | `required` |
+| `ingress-renew-before-in-days.yaml` | `renewBefore: 30d`, a unit Go has no parser for | `pattern` |
 
 Several of these have a near-miss that would pass a looser assertion, which is
 why the keyword matters and not just the failure. `drop: [NET_RAW, SYS_CHROOT]`
@@ -37,6 +41,9 @@ is a valid label selector, and an empty selector matches *everything*, so what
 catches it is `minProperties` and nothing about the labels. A named egress port
 is legal on ingress and meaningless on egress, so `type: integer` is added in
 the `allOf` branch over `networkPolicyRule` rather than tightened for both.
+`hosts: []` is legal for a disabled Ingress and useless for an enabled one — the
+object renders, the API server admits it, and it serves nothing — so the
+`minItems` that catches it applies only under `if: {enabled: true}`.
 
 `render-fixtures/` next door is the mirror image: values files that must
 **render**, covering template paths no environment file reaches.

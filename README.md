@@ -292,7 +292,8 @@ needs, and what is deliberately left to later Phase 8 items.
 
 `k8s/charts/app` is what gets deployed onto it: a Deployment, Service,
 ServiceAccount annotated for IRSA, ConfigMap, PodDisruptionBudget,
-HorizontalPodAutoscaler and a pair of NetworkPolicies, installed with
+HorizontalPodAutoscaler, a pair of NetworkPolicies and a TLS-only Ingress,
+installed with
 `values-staging.yaml` or `values-production.yaml`.
 
 Every value is constrained by `values.schema.json`, and the point of that is not
@@ -324,8 +325,9 @@ rather than by turning the flag off.
 
 The pod network is closed the same way. The chart renders a default-deny
 NetworkPolicy over its own pods — never the whole namespace, which is not a
-chart's to close — plus an allowlist that today permits cluster DNS and HTTPS to
-AWS outbound and nothing inbound. What makes that more than a manifest is one
+chart's to close — plus an allowlist that permits cluster DNS, HTTPS to
+AWS outbound, and the ingress controller inbound. What makes that more than a
+manifest is one
 line in `EksStack`: Kubernetes ships no NetworkPolicy controller, so on a CNI
 that does not implement policy the objects are stored, listed by `kubectl`,
 described correctly and enforced by nothing, with no status field anywhere that
@@ -349,12 +351,36 @@ See [docs/helm-chart.md](./docs/helm-chart.md) for the deploy commands, the
 per-environment differences, the `null`-deletes-the-default trap, and how to add
 an environment.
 
+The chart's Ingress is TLS-only, and the four controllers behind it are the
+reason. ingress-nginx gives the object an address, external-dns publishes the
+record from that address, cert-manager issues the certificate through a DNS-01
+challenge against Route 53, and a `ClusterIssuer` per cluster decides which ACME
+endpoint — staging deliberately uses Let's Encrypt's *staging* directory,
+because Let's Encrypt counts its 50-certificates-per-week limit on the
+registered domain rather than the subdomain, so a staging cluster that reissues
+on every merge spends production's quota. `EksStack` creates the two IRSA roles those controllers need,
+scoped by hosted zone *and* by record type: neither of them ever writes an `NS`
+or `SOA` record, and a role that can rewrite the delegation can take the domain
+off the internet.
+
+What makes this worth a document rather than a paragraph is that an Ingress has
+one status field and it says nothing about DNS, nothing about TLS, and nothing
+about whether any controller claimed the object. An Ingress that names no class
+is admitted and served by nothing; one annotated for cert-manager with no
+`spec.tls` produces no certificate and no error; and an enabled Ingress with an
+empty NetworkPolicy allowlist returns 503 while DNS, TLS, the Service, the
+endpoints and the pods all report healthy. `npm run audit:helm` fails the last
+two, and `values.schema.json` refuses the shapes that make the first possible.
+See [docs/ingress.md](./docs/ingress.md).
+
 `k8s/argocd/` is how it gets there. One Argo CD per cluster and one root
 Application per Argo CD, applied by hand once; from then on the cluster follows
 `main`, and no pipeline holds cluster credentials. The root applies two
-AppProjects and two Applications per environment — metrics-server, which the HPA
-above reads and which none of the four add-ons `EksStack` installs provides, and
-the release itself — ordered by sync waves and kept converged by `selfHeal`.
+AppProjects and six Applications per environment — metrics-server, which the HPA
+above reads and which none of the four add-ons `EksStack` installs provides;
+cert-manager, its ClusterIssuer, ingress-nginx and external-dns, which are the
+Ingress story below; and the release itself — ordered by sync waves and kept
+converged by `selfHeal`.
 
 Three things about that are easy to get wrong and hard to notice. Sync waves
 between child Applications do **not** wait for the wave underneath them unless

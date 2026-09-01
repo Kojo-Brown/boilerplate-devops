@@ -79,6 +79,17 @@
  *   duplicate-network-policy-rule
  *                             two allowlist entries sharing a name, so a
  *                             failure message cannot say which one it means
+ *   cluster-issuer-mismatch   an Ingress naming a ClusterIssuer its own cluster
+ *                             does not install — or the other environment's,
+ *                             which resolves and spends production's ACME rate
+ *                             limit from staging
+ *   managed-ingress-annotation
+ *                             an `ingress.annotations` key the template writes
+ *                             itself, so the value in the file is discarded
+ *                             rather than overridden
+ *   ingress-peer-not-allowed  an Ingress enabled with an empty NetworkPolicy
+ *                             allowlist: every layer reports healthy and the
+ *                             controller returns 503
  *
  * Usage:
  *   npm run audit:helm                       # audits the repository root
@@ -139,6 +150,38 @@ export const METADATA_SERVICE_ADDRESS = '169.254.169.254';
 /** The port cluster DNS listens on. Both UDP and TCP; see auditNetworkPolicy. */
 export const DNS_PORT = 53;
 
+/**
+ * The `ClusterIssuer` each environment's cluster actually installs, from
+ * `k8s/cert-manager/<environment>/cluster-issuer.yaml`.
+ *
+ * They differ because the ACME endpoints differ: staging issues from Let's
+ * Encrypt's staging directory, whose certificates chain to an untrusted root and
+ * whose rate limits are effectively unbounded. The production directory counts
+ * its 50-certificates-per-week limit on the *registered* domain rather than the
+ * subdomain, so a staging cluster pointed at the production issuer does not
+ * merely get a trusted certificate: it consumes the quota production needs.
+ *
+ * cert-manager resolves an issuer by name and reports a missing one on the
+ * CertificateRequest, not on the Ingress, which is why this is checked here.
+ */
+export const ENVIRONMENT_CLUSTER_ISSUERS: Readonly<Record<string, string>> = {
+  staging: 'letsencrypt-staging',
+  production: 'letsencrypt-production',
+};
+
+/**
+ * Annotations `templates/ingress.yaml` writes itself, and applies over anything
+ * `ingress.annotations` carries.
+ *
+ * The override is what makes this worth a rule: a values file that sets one of
+ * these is not overridden loudly, it is discarded, and the rendered Ingress
+ * carries the chart's value while the diff reads as though the file's took.
+ */
+export const CHART_MANAGED_INGRESS_ANNOTATIONS: readonly string[] = [
+  'cert-manager.io/cluster-issuer',
+  'cert-manager.io/renew-before',
+];
+
 export type ViolationRule =
   | 'schema-unreadable'
   | 'schema-invalid'
@@ -165,7 +208,10 @@ export type ViolationRule =
   | 'metadata-service-reachable'
   | 'ingress-from-anywhere'
   | 'ingress-port-mismatch'
-  | 'duplicate-network-policy-rule';
+  | 'duplicate-network-policy-rule'
+  | 'cluster-issuer-mismatch'
+  | 'managed-ingress-annotation'
+  | 'ingress-peer-not-allowed';
 
 export interface Violation {
   readonly rule: ViolationRule;
@@ -468,6 +514,79 @@ export const auditEnvironment = (
   violations.push(...auditAvailability(merged, environment, file));
   violations.push(...auditPodSecurity(merged, file));
   violations.push(...auditNetworkPolicy(merged, file));
+  violations.push(...auditIngress(merged, environment, file));
+
+  return violations;
+};
+
+/**
+ * The ingress rules the schema cannot express.
+ *
+ * All three compare one value to another, or a value to the filename, and all
+ * three describe an Ingress Kubernetes admits and serves. That is what they have
+ * in common with everything else in this file: nothing here is invalid, and
+ * every one of them fails somewhere other than where it is written.
+ */
+export const auditIngress = (
+  merged: Record<string, unknown>,
+  environment: EnvironmentValues,
+  file: string,
+): Violation[] => {
+  const ingress = asRecord(merged.ingress);
+  if (ingress === undefined || ingress.enabled !== true) return [];
+
+  const violations: Violation[] = [];
+
+  const expectedIssuer = ENVIRONMENT_CLUSTER_ISSUERS[environment.environment];
+  const issuer = asString(asRecord(ingress.tls)?.clusterIssuer);
+
+  if (expectedIssuer !== undefined && issuer !== expectedIssuer) {
+    violations.push({
+      rule: 'cluster-issuer-mismatch',
+      file,
+      message:
+        `ingress.tls.clusterIssuer is ${JSON.stringify(issuer ?? null)}, but the ` +
+        `${environment.environment} cluster installs \`${expectedIssuer}\` ` +
+        `(k8s/cert-manager/${environment.environment}/cluster-issuer.yaml). cert-manager ` +
+        'resolves the issuer by name and finds nothing, so the Certificate stays ' +
+        '`Ready: False` with `issuer not found` on a *CertificateRequest* — not on the ' +
+        'Ingress, which reports healthy throughout while serving the controller’s own ' +
+        'self-signed certificate. Naming the other environment’s issuer is worse: it resolves, ' +
+        'and staging then burns production’s Let’s Encrypt rate limit.',
+    });
+  }
+
+  const annotations = asRecord(ingress.annotations) ?? {};
+
+  for (const key of CHART_MANAGED_INGRESS_ANNOTATIONS) {
+    if (key in annotations) {
+      violations.push({
+        rule: 'managed-ingress-annotation',
+        file,
+        message:
+          `ingress.annotations sets \`${key}\`, which templates/ingress.yaml writes itself and ` +
+          'applies over whatever is here. The value in this file is therefore discarded ' +
+          'silently — the rendered Ingress carries the chart’s, and the diff that set it looks ' +
+          `like it took effect. Set it through \`ingress.tls\` instead.`,
+      });
+    }
+  }
+
+  const policy = asRecord(merged.networkPolicy);
+
+  if (policy?.enabled === true && readAllowlist(policy.ingress).length === 0) {
+    violations.push({
+      rule: 'ingress-peer-not-allowed',
+      file,
+      message:
+        'the Ingress is enabled and networkPolicy.ingress is empty, so the default-deny policy ' +
+        'drops the connection from the ingress controller to these pods. Every layer above it ' +
+        'reports success: DNS resolves, the certificate is issued and renewed, the Ingress has ' +
+        'an address, the Service has endpoints and the pods are Ready — and the controller ' +
+        'returns 503 because it cannot reach any of them. Add the `ingress-controller` entry ' +
+        'from the comment in values.yaml.',
+    });
+  }
 
   return violations;
 };

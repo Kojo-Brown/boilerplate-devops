@@ -199,17 +199,36 @@ belongs to the release and cannot be lowered without a commit.
 `npm run audit:helm` fails (`metadata-service-reachable`) on an egress `ipBlock`
 that contains the metadata address and excepts nothing covering it.
 
-**Ingress is empty, and that is the current state rather than a placeholder.**
-There is no ingress controller on this cluster — it is the last Phase 8 item —
-so nothing exists that should be reaching these pods. The Service still resolves
-and still has endpoints; a connection to it is dropped. The entry that opens it
-is in `values.yaml` above `ingress: []`, commented out and ready.
+**Ingress is one entry: the ingress controller.** The chart defaults leave it
+empty — with `ingress.enabled: false` there is nothing that should be reaching
+these pods — and both environment files add the peer that opens it, because both
+serve an Ingress:
 
-Because both environment files leave it empty, the ingress half of
-`templates/networkpolicy.yaml` is rendered by no gate — which is how a template
-that produces invalid YAML gets found by the first person to add a rule instead
-of by CI. `render-fixtures/network-policy-allowlist.yaml` is what turns that
-path on; see `k8s/charts/app/render-fixtures/README.md`.
+```yaml
+networkPolicy:
+  ingress:
+    - name: ingress-controller
+      namespaceLabels:
+        kubernetes.io/metadata.name: ingress-nginx
+      podLabels:
+        app.kubernetes.io/name: ingress-nginx
+      ports:
+        - port: http          # the container port by name, not service.port
+          protocol: TCP
+```
+
+Enabling the Ingress *without* it is the failure `npm run audit:helm` reports as
+`ingress-peer-not-allowed`, and it is the worst-behaved one in this document:
+DNS resolves, the certificate is issued, the Ingress has an address, the Service
+has endpoints, the pods are Ready — and the controller returns 503 because it
+cannot open a connection to any of them. Nothing in the Ingress, the Service or
+the Deployment is wrong. See [docs/ingress.md](./ingress.md) §8.
+
+One entry of one shape is also the whole allowlist in both environments, which
+leaves the other peer shapes — a `podSelector` alone, an `ipBlock` with an
+`except` — rendered by no gate. `render-fixtures/network-policy-allowlist.yaml`
+is what turns those paths on; see
+`k8s/charts/app/render-fixtures/README.md`.
 
 ### Health probes
 

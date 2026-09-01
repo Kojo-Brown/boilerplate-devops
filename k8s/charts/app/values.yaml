@@ -247,6 +247,77 @@ service:
   port: 80
   annotations: {}
 
+# The public entry point.
+#
+# Off by default, because an Ingress is only meaningful on a cluster that has
+# the three controllers behind it — ingress-nginx to serve the address,
+# cert-manager to issue the certificate, external-dns to publish the record.
+# Both environment files turn it on; `k8s/argocd/<environment>/applications/`
+# installs the controllers, and docs/ingress.md is the map.
+#
+# There is no `tls.enabled`. An Ingress without `spec.tls` makes the
+# `cert-manager.io/cluster-issuer` annotation a no-op — ingress-shim reads the
+# TLS hosts, not the rule hosts — and nothing reports that: no event, no
+# Certificate, no error, and an annotation that reads as if TLS were handled.
+# This chart does not ship that shape.
+ingress:
+  enabled: false
+
+  # The IngressClass the controller registers, and the field that decides
+  # whether any controller picks this object up at all. The deprecated
+  # `kubernetes.io/ingress.class` annotation is not a substitute:
+  # ingress-nginx 1.0 stopped honouring it, and an Ingress that names no class
+  # is admitted, listed, and served by nothing.
+  className: nginx
+
+  # Every hostname served, and — because `spec.tls` carries the same list — every
+  # SAN on the issued certificate. One certificate covers all of them, so adding
+  # a host here is a re-issue rather than a second Certificate.
+  #
+  # Empty is only valid while `enabled` is false; the schema requires at least
+  # one host once it is true.
+  hosts: []
+
+  # `Prefix`, not `ImplementationSpecific`. The latter hands path matching to
+  # the controller, and ingress-nginx treats those paths as regular expressions
+  # when `use-regex` is on — so a path containing a `.` silently becomes a
+  # wildcard. `Exact` is the third option and matches the path and nothing
+  # below it.
+  path: /
+  pathType: Prefix
+
+  tls:
+    # The ClusterIssuer cert-manager resolves the certificate through. The name
+    # differs per environment on purpose: the staging cluster issues from Let's
+    # Encrypt's *staging* ACME endpoint, whose certificates are untrusted by
+    # browsers and whose rate limits are effectively unbounded. See
+    # docs/ingress.md §4 for why that is not a downgrade — the production
+    # endpoint counts 50 certificates per week against the *registered* domain
+    # rather than the subdomain, so a staging cluster that redeploys on every
+    # merge does not merely exhaust its own quota, it stops issuance in
+    # production.
+    clusterIssuer: letsencrypt-staging
+
+    # How long before expiry cert-manager starts renewing. cert-manager's own
+    # default is two thirds of the certificate's lifetime, which for Let's
+    # Encrypt's 90 days is exactly this — so writing it out changes nothing
+    # today and keeps the renewal window fixed if the issuer shortens the
+    # lifetime, which Let's Encrypt has said it intends to.
+    renewBefore: 720h
+
+    # Defaults to `<fullname>-tls`. Set it only to adopt a certificate that is
+    # already in the cluster: two releases naming one Secret produce two
+    # Certificates that overwrite each other's key pair at renewal, which
+    # surfaces as an outage up to `renewBefore` after the change that caused it.
+    secretName: ""
+
+  # Controller-specific settings — `nginx.ingress.kubernetes.io/*` and
+  # anything else the class understands. The two annotations this chart manages
+  # itself (`cert-manager.io/cluster-issuer` and `cert-manager.io/renew-before`)
+  # are applied *over* whatever is here, and `npm run audit:helm` fails a values
+  # file that sets one of them, so the override is never silent.
+  annotations: {}
+
 # Network policy: deny everything, then allow what is named here.
 #
 # Two objects are rendered — `<release>-default-deny`, which selects this
@@ -302,12 +373,11 @@ networkPolicy:
 
   # Who may open a connection to these pods.
   #
-  # Empty, and that is the current state of this cluster rather than a
-  # placeholder: there is no ingress controller yet — it is the last Phase 8
-  # item — so nothing exists that should be reaching them. The Service still
-  # resolves and still has endpoints; a connection to it is dropped.
-  #
-  # When the Ingress lands, the entry that opens it is:
+  # Empty here because the chart defaults leave `ingress.enabled` false: with no
+  # Ingress there is no controller that should be reaching these pods, and the
+  # Service still resolves and still has endpoints while every connection to it
+  # is dropped. Both environment files enable the Ingress and therefore carry
+  # the entry that opens it:
   #
   #   ingress:
   #     - name: ingress-controller
@@ -318,6 +388,11 @@ networkPolicy:
   #       ports:
   #         - port: http          # the container port by name, not service.port
   #           protocol: TCP
+  #
+  # Enabling the Ingress without that entry is the failure `npm run audit:helm`
+  # exists to catch here: DNS resolves, TLS terminates, the controller accepts
+  # the request and then reports 503 with healthy pods behind a Service that has
+  # endpoints. Nothing in the Ingress, the Service or the Deployment is wrong.
   #
   # Kubelet health probes are not covered by this list. They originate on the
   # node rather than from a pod, and the VPC CNI's policy agent does not apply

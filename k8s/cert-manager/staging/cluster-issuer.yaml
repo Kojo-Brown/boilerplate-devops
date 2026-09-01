@@ -1,0 +1,82 @@
+# The ACME issuer for the staging cluster.
+#
+# A ClusterIssuer rather than an Issuer: an Issuer is namespaced and would have
+# to be duplicated into every namespace that wants a certificate, each with its
+# own ACME account and its own registration. One account per cluster is also
+# what keeps Let's Encrypt's per-account rate limits legible.
+#
+# Applied by `k8s/argocd/staging/applications/cluster-issuer.yaml`, in the wave
+# after cert-manager — this manifest's `apiVersion` does not exist until that
+# chart's CRDs are installed.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+spec:
+  acme:
+    # Let's Encrypt's **staging** endpoint. Its certificates chain to a root no
+    # browser trusts, which is exactly right for a cluster no browser should be
+    # visiting, and its rate limits are effectively unbounded.
+    #
+    # The production endpoint's limits are the reason this is not just "the same
+    # as production with a different name". Two of them bite, and the second is
+    # the one that matters: 5 duplicate certificates per week for an identical
+    # set of names, which a cluster reissuing on every merge reaches first and
+    # which blocks only that hostname; and 50 certificates per week counted on
+    # the *registered* domain — `example.com`, not `app.staging.example.com` —
+    # so a staging cluster churning through subdomains stops production
+    # issuing.
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+
+    # Expiry notices go here. Let's Encrypt sends them when a certificate is
+    # 20 days from expiring and has not been replaced, which is the one external
+    # signal that a renewal loop has been failing — see docs/ingress.md §7.
+    # `example.com` is reserved for documentation (RFC 2606); a deployment that
+    # never edited this registers with an address nobody reads.
+    email: platform@example.com
+
+    # Where cert-manager stores the ACME account's private key. It lands in
+    # cert-manager's own namespace, because that is a ClusterIssuer's cluster
+    # resource namespace. Losing it is not fatal — cert-manager registers a new
+    # account — but the new account starts with fresh rate-limit counters and
+    # no relationship to the certificates the old one issued.
+    privateKeySecretRef:
+      name: letsencrypt-staging-account-key
+
+    solvers:
+      # DNS-01, not HTTP-01, and the choice has three consequences worth
+      # knowing:
+      #
+      #   • It works before the name resolves publicly and before the ingress
+      #     controller has an address, so a first deploy is not a chicken-and-egg
+      #     between the record, the certificate and the Ingress.
+      #   • It is the only challenge type that can issue a wildcard.
+      #   • It needs no path through the ingress, so `ssl-redirect` can stay on
+      #     globally. An HTTP-01 setup has to keep `/.well-known/acme-challenge/`
+      #     reachable over plaintext, and the redirect that breaks it is the
+      #     usual cause of a renewal that worked at issuance and stopped later.
+      #
+      # The cost is IAM: cert-manager writes a TXT record into Route 53, which
+      # is what `EksStack`'s `dns` block grants through IRSA.
+      - dns01:
+          route53:
+            region: us-east-1
+            # `hostedZoneID` is deliberately unset. Pinning it would mean a real
+            # zone identifier committed to a repository whose whole purpose is
+            # being copied into someone else's account; without it cert-manager
+            # resolves the zone by name, which costs one
+            # `route53:ListHostedZonesByName` call — granted in the IRSA policy
+            # for exactly this.
+            #
+            # cert-manager takes its AWS credentials from the pod, which for a
+            # *ClusterIssuer* requires ambient credentials to be permitted. That
+            # is cert-manager's default for cluster issuers
+            # (`--cluster-issuer-ambient-credentials=true`) and is not the
+            # default for namespaced Issuers — one more reason this is a
+            # ClusterIssuer.
+        selector:
+          # Scope the solver to the zone this cluster owns. A solver with no
+          # selector answers every challenge, so a second solver added later for
+          # a different zone would never be reached.
+          dnsZones:
+            - staging.example.com

@@ -1,0 +1,25 @@
+# A platform project permitting `Namespace` without naming which ones. The kind
+# is on the allow-list for a real reason — `CreateNamespace=true` makes the
+# namespace a resource the sync creates — but every Application in this project
+# also prunes, so an unrestricted entry is what a moved or deleted file may
+# remove, and that includes `kube-system`. Rule: cluster-scope-escalation.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: platform
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+spec:
+  description: Cluster add-ons that the workload releases depend on.
+  sourceRepos:
+    - https://kubernetes-sigs.github.io/metrics-server/
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: kube-system
+  clusterResourceWhitelist:
+    - group: apiregistration.k8s.io
+      kind: APIService
+    - group: ""
+      kind: Namespace
+  namespaceResourceBlacklist: []

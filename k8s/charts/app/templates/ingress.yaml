@@ -1,0 +1,91 @@
+{{- if .Values.ingress.enabled -}}
+{{- /*
+  The public entry point: one Ingress, TLS-only, with the certificate issued and
+  renewed by cert-manager and the DNS record written by external-dns.
+
+  Three things about this object are load-bearing and none of them fail loudly.
+
+  **`ingressClassName`, not `kubernetes.io/ingress.class`.** The annotation was
+  deprecated in Kubernetes 1.18 and ingress-nginx 1.0 stopped honouring it
+  unless the controller is started with `--watch-ingress-without-class`. An
+  Ingress carrying only the annotation is admitted by the API server, appears in
+  `kubectl get ingress`, and is picked up by no controller — so it has no
+  address, external-dns writes no record, and cert-manager's ingress-shim never
+  sees it. Every symptom points at DNS.
+
+  **`spec.tls` is what makes the cert-manager annotation mean anything.**
+  ingress-shim creates a Certificate from the hosts in `spec.tls`, not from the
+  hosts in `spec.rules`. An Ingress annotated with `cert-manager.io/cluster-issuer`
+  and no `tls` block is not an error — nothing is created, nothing is logged
+  against the Ingress, and the annotation reads as if TLS were handled. That is
+  why this chart has no `ingress.tls.enabled`: there is no supported shape in
+  which the annotation is present and inert.
+
+  **The `secretName` is per-release.** Two Ingresses naming one secret produce
+  two Certificates that own the same Secret and rewrite each other's key pair on
+  every renewal, which surfaces months later as an outage on a certificate that
+  had been renewing correctly. It is derived from the fullname for that reason
+  and overridable only deliberately.
+
+  What is deliberately *not* here is
+  `external-dns.alpha.kubernetes.io/hostname`. For an Ingress source external-dns
+  already reads `spec.rules[].host` and `spec.tls[].hosts`; the annotation
+  *replaces* that set rather than adding to it, so writing it out duplicates the
+  hosts in a second place that no longer fails when the two disagree — it just
+  publishes the annotation's list. See docs/ingress.md §5.
+*/}}
+{{- $fullName := include "app.fullname" . -}}
+{{- /*
+  Chart-managed annotations are applied over the user's rather than beside them:
+  `merge` into a fresh dict copies `.Values.ingress.annotations`, and the `set`
+  calls below then win outright. Rendering both into the same YAML mapping would
+  emit a duplicate key, which Kubernetes' parser resolves silently and in a
+  direction nobody chose. `npm run audit:helm` fails a values file that sets one
+  of these keys under `ingress.annotations`, so the override is a review comment
+  rather than a surprise.
+*/}}
+{{- $annotations := merge (dict) .Values.ingress.annotations -}}
+{{- $_ := set $annotations "cert-manager.io/cluster-issuer" .Values.ingress.tls.clusterIssuer -}}
+{{- /*
+  Explicit rather than defaulted. cert-manager renews at two thirds of the
+  certificate's lifetime, which for Let's Encrypt's 90 days is the same 30 days
+  written here — so this changes nothing today and keeps changing nothing on the
+  day the ACME issuer shortens its lifetime, which is the point.
+*/}}
+{{- $_ := set $annotations "cert-manager.io/renew-before" .Values.ingress.tls.renewBefore -}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}
+  labels:
+    {{- include "app.labels" . | nindent 4 }}
+  annotations:
+    {{- toYaml $annotations | nindent 4 }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  tls:
+    - hosts:
+        {{- range .Values.ingress.hosts }}
+        - {{ . | quote }}
+        {{- end }}
+      secretName: {{ include "app.tlsSecretName" . }}
+  rules:
+    {{- range .Values.ingress.hosts }}
+    - host: {{ . | quote }}
+      http:
+        paths:
+          - path: {{ $.Values.ingress.path }}
+            pathType: {{ $.Values.ingress.pathType }}
+            backend:
+              service:
+                name: {{ $fullName }}
+                {{- /*
+                  By name, and the name is the *Service* port's — `http` on the
+                  Service, which itself targets the container port by name. A
+                  number here would be `service.port`, correct today and wrong
+                  the first time that value moves.
+                */}}
+                port:
+                  name: http
+    {{- end }}
+{{- end }}

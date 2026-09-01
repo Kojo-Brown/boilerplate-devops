@@ -1,0 +1,10 @@
+# `https://app.example.com` as a host. It is the value everybody writes first,
+# and Kubernetes accepts it: `spec.rules[].host` is a string, so the Ingress is
+# admitted and then matches no request, because the Host header is a hostname
+# and never carries a scheme. The certificate is issued for a SAN that is not a
+# domain, or fails the ACME order for the same reason.
+environment: staging
+ingress:
+  enabled: true
+  hosts:
+    - https://app.example.com
