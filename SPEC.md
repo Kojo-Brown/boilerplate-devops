@@ -161,7 +161,7 @@ no better signal exists in the git object graph.
 - [x] Pod security: non-root, read-only rootfs, dropped capabilities, seccomp — the chart had no `securityContext` at all, which is not neutral: root, containerd's default 14 capabilities, a writable rootfs and seccomp Unconfined are what Kubernetes does when the fields are absent. Both contexts are now `const` in the schema rather than defaults, so an environment file cannot relax one (PR #37)
 - [x] NetworkPolicy default-deny with explicit allowlists — two objects per release (the deny floor and the allowlist, split so that losing the second is a service that stops talking rather than a boundary that stops existing), plus the CNI setting that makes either of them mean anything: Kubernetes ships no policy controller, so without `enableNetworkPolicy` on the VPC CNI the objects are stored, listed and enforced by nothing, with no field anywhere that says so (PR #38)
 - [x] GitOps with ArgoCD: app-of-apps, sync waves, and drift detection — one Argo CD per cluster reading `k8s/argocd/<environment>/`, bootstrapped by a single `root.yaml` nothing manages; two projects because an add-on that extends the Kubernetes API cannot be confined to a namespace and a release should be; drift in three layers, since self-heal covers neither a sync that keeps failing nor a resource created beside the release (PR #39)
-- [ ] Ingress with cert-manager, external-dns, and automatic TLS renewal
+- [x] Ingress with cert-manager, external-dns, and automatic TLS renewal — one TLS-only Ingress and the four controllers behind it, because an `Ingress` has a single status field and it reports on none of them: a class no controller claims, a `cert-manager.io/cluster-issuer` annotation with no `spec.tls` beneath it, and a default-deny policy with no entry for the controller all leave an object that looks exactly like a working one (PR #40)
 
 Item 1 complete as of PR #34 (2026-08-21). What made this one item rather than
 two is that a managed node group without IRSA is a security posture, not an
@@ -516,6 +516,78 @@ which is a controller and a kind rather than a setting. And the release is still
 the only workload: no ingress controller — which is why the chart's NetworkPolicy
 ingress allowlist is still empty — no cert-manager and no external-dns, which is
 item 7 and is one file per environment in `applications/`.
+
+Item 7 complete as of PR #40 (2026-09-01). All six checks green. The Ingress
+itself is a dozen lines; the reason it took `docs/ingress.md` to explain is that
+`status.loadBalancer` is the only status an Ingress has, and it says nothing
+about DNS, nothing about TLS and nothing about whether any controller claimed
+the object. Four of the failures here leave a valid, admitted, healthy-looking
+Ingress: a `kubernetes.io/ingress.class` annotation instead of
+`ingressClassName` (ingress-nginx 1.0 stopped honouring it, so the object is
+served by nothing and every symptom reads as DNS); the cert-manager annotation
+with no `spec.tls`, since ingress-shim builds its Certificate from the TLS hosts
+and not the rule hosts, so nothing is created and nothing is logged; two
+Ingresses sharing a TLS secret, which is two Certificates overwriting each
+other's key pair at a renewal up to sixty days later; and the one this
+repository gates hardest — an enabled Ingress with an empty NetworkPolicy
+allowlist, where DNS resolves, the certificate is valid, the Service has
+endpoints, the pods are Ready, and the controller returns 503 because it cannot
+open a connection to any of them.
+
+Four decisions went the way a reader might not expect. The chart has no
+`ingress.tls.enabled`, because there is no supported shape in which the
+annotation is present and inert. Staging issues from Let's Encrypt's *staging*
+directory, which is not a downgrade: the production endpoint counts its
+50-certificates-per-week limit against the registered domain rather than the
+subdomain, so a staging cluster reissuing on every merge stops production
+issuing. DNS-01 rather than HTTP-01, which needs no plaintext path through the
+ingress and so lets `ssl-redirect` stay on globally — an HTTP-01 setup is the
+one whose renewals stop silently months after issuance, when somebody adds that
+redirect. And two IRSA roles rather than one, each scoped by record *type* as
+well as by zone: `hostedzone/<id>` is the only resource ARN
+`ChangeResourceRecordSets` accepts and it covers every record in the zone, `NS`
+and `SOA` included, so the `route53:ChangeResourceRecordSetsRecordTypes`
+condition is what stops a compromised controller taking the domain off the
+internet. cert-manager is narrowed further to `_acme-challenge.*` so it cannot
+rewrite external-dns's own ownership registry.
+
+The load balancer is an NLB through the AWS cloud controller manager, not the
+AWS Load Balancer Controller — which is the better path and costs another
+add-on plus a sixty-action policy. What that gives up is written down rather
+than glossed: no `target-type: ip`, no WAF on the ingress path (the NLB is
+layer 4 and has no hook for it), and `aws-load-balancer-scheme` not honoured.
+`externalTrafficPolicy: Local` preserves the client source IP at the cost that
+only nodes running a controller pod are healthy targets, which is why production
+runs two replicas behind a budget and a zone spread and staging honestly does
+not.
+
+Three new `audit:helm` rules, four must-fail schema fixtures, two Argo CD
+fixtures, and `aws/cdk/test/cluster-issuers.test.ts` over the ACME manifests —
+the one part of this path no existing audit reads, and where a one-word edit
+pointing staging at the production directory *works*. The platform AppProject
+may now permit `Namespace` only when the entry names which one: these
+Applications prune, so an unrestricted kind is not only what an add-on may
+create but what a moved file may delete, `kube-system` included.
+`EXACT_CHART_VERSION` now accepts a leading `v`, because cert-manager publishes
+exact chart versions as `v1.21.1` and writing `1.21.1` there is a constraint
+Helm re-resolves; ranges are still refused, with a fixture for `>=v1.21.1`.
+
+Known gaps. **Nothing alerts on a failing renewal.** Renewal is not a job that
+can be missing — it is the same cert-manager loop that issued the certificate —
+but a renewal that *fails* keeps failing until expiry, with the reason on a
+CertificateRequest, Order or Challenge rather than on the Ingress, and the
+certificate serving correctly the whole time. The signal is
+`certmanager_certificate_expiration_timestamp_seconds` and there is no
+Prometheus in this repository, so the two available signals are Let's Encrypt's
+expiry mail at 20 days and a `kubectl get certificate` one-liner;
+docs/ingress.md §7 says so plainly and points at the Phase 10 observability
+track. **Still nothing has been applied to a cluster** — the gates parse,
+render, cross-check and reject, and none of them observes a controller starting.
+The upstream chart versions were verified to exist and every values block was
+rendered against the real chart, which is a different and weaker claim than
+having watched a certificate issue. Wildcard hosts are refused by the schema
+rather than supported, since a wildcard SAN is a decision about the issuer and
+the solver's zone scope rather than a longer hostname.
 
 ## Phase 9 — Supply-Chain Security
 - [ ] SBOM generation (CycloneDX) attached to every release artifact
