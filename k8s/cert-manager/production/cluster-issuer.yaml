@@ -1,0 +1,78 @@
+# The ACME issuer for the production cluster.
+#
+# A ClusterIssuer rather than an Issuer: an Issuer is namespaced and would have
+# to be duplicated into every namespace that wants a certificate, each with its
+# own ACME account and its own registration. One account per cluster is also
+# what keeps Let's Encrypt's per-account rate limits legible.
+#
+# Applied by `k8s/argocd/production/applications/cluster-issuer.yaml`, in the
+# wave after cert-manager — this manifest's `apiVersion` does not exist until
+# that chart's CRDs are installed.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-production
+spec:
+  acme:
+    # Let's Encrypt's real endpoint, so the certificate chains to a root
+    # browsers trust.
+    #
+    # Its rate limits are why the staging cluster does not share it. The one to
+    # know is 50 certificates per week counted on the *registered* domain rather
+    # than the subdomain, so exhausting it anywhere under this domain —
+    # including from a test cluster — is what stops issuance here. The window is
+    # a rolling week with no way to shorten it.
+    server: https://acme-v02.api.letsencrypt.org/directory
+
+    # Expiry notices go here, and on this cluster they are worth wiring to
+    # something that pages: Let's Encrypt mails at 20 days before expiry when a
+    # certificate has not been replaced, which is the one external signal that a
+    # renewal loop has been failing — see docs/ingress.md §7. `example.com` is
+    # reserved for documentation (RFC 2606).
+    email: platform@example.com
+
+    # Where cert-manager stores the ACME account's private key. It lands in
+    # cert-manager's own namespace, because that is a ClusterIssuer's cluster
+    # resource namespace. Losing it is not fatal — cert-manager registers a new
+    # account — but the new account starts with fresh rate-limit counters and
+    # no relationship to the certificates the old one issued.
+    privateKeySecretRef:
+      name: letsencrypt-production-account-key
+
+    solvers:
+      # DNS-01, not HTTP-01, and the choice has three consequences worth
+      # knowing:
+      #
+      #   • It works before the name resolves publicly and before the ingress
+      #     controller has an address, so a first deploy is not a chicken-and-egg
+      #     between the record, the certificate and the Ingress.
+      #   • It is the only challenge type that can issue a wildcard.
+      #   • It needs no path through the ingress, so `ssl-redirect` can stay on
+      #     globally. An HTTP-01 setup has to keep `/.well-known/acme-challenge/`
+      #     reachable over plaintext, and the redirect that breaks it is the
+      #     usual cause of a renewal that worked at issuance and stopped later.
+      #
+      # The cost is IAM: cert-manager writes a TXT record into Route 53, which
+      # is what `EksStack`'s `dns` block grants through IRSA.
+      - dns01:
+          route53:
+            region: us-east-1
+            # `hostedZoneID` is deliberately unset. Pinning it would mean a real
+            # zone identifier committed to a repository whose whole purpose is
+            # being copied into someone else's account; without it cert-manager
+            # resolves the zone by name, which costs one
+            # `route53:ListHostedZonesByName` call — granted in the IRSA policy
+            # for exactly this.
+            #
+            # cert-manager takes its AWS credentials from the pod, which for a
+            # *ClusterIssuer* requires ambient credentials to be permitted. That
+            # is cert-manager's default for cluster issuers
+            # (`--cluster-issuer-ambient-credentials=true`) and is not the
+            # default for namespaced Issuers — one more reason this is a
+            # ClusterIssuer.
+        selector:
+          # Scope the solver to the zone this cluster owns. A solver with no
+          # selector answers every challenge, so a second solver added later for
+          # a different zone would never be reached.
+          dnsZones:
+            - example.com

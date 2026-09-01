@@ -24,6 +24,7 @@ must catch it:
 | `application-allow-empty.yaml` | an empty render prunes the whole release | `allow-empty-enabled` |
 | `application-tracking-head.yaml` | `targetRevision: HEAD` | `mutable-target-revision` |
 | `application-floating-chart-version.yaml` | a chart version range | `mutable-target-revision` |
+| `application-with-prefixed-chart-range.yaml` | a range in front of a `v`-prefixed chart version | `mutable-target-revision` |
 | `application-unknown-project.yaml` | a project no AppProject declares | `unknown-project` |
 | `application-foreign-values-file.yaml` | staging rendering `values-production.yaml` | `values-file-mismatch` |
 | `application-outside-project-destination.yaml` | a namespace the project does not permit | `destination-not-permitted` |
@@ -37,6 +38,7 @@ must catch it:
 | `application-sharing-platform-wave.yaml` | a workload in the same wave as the add-on it reads | `sync-wave-ordering` |
 | `project-with-wildcard-destination.yaml` | `namespace: "*"` in a workload project | `open-project-scope` |
 | `project-granting-cluster-rbac.yaml` | a workload project permitting ClusterRoleBindings | `cluster-scope-escalation` |
+| `project-permitting-any-namespace.yaml` | a platform project permitting `Namespace` without naming which | `cluster-scope-escalation` |
 
 Several files trip more than one rule, because the mistakes are not independent:
 an Application pointed at `staging-canary` is both outside its project's

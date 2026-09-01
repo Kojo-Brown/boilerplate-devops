@@ -11,14 +11,17 @@ A chart's gates only ever execute the template paths its own values files
 reach. Every optional block — an `{{- if }}` around a whole object, a `range`
 over a list that is empty in both environments — is unrendered by `helm
 template` in CI and therefore unchecked, so a broken one is found by the next
-person to turn the feature on. That is exactly the position the NetworkPolicy
-ingress allowlist is in: `values.yaml` and both environment files leave
-`networkPolicy.ingress` empty, and correctly so, because the cluster has no
-ingress controller yet.
+person to turn the feature on.
 
 | File | Template path it covers |
 |---|---|
 | `network-policy-allowlist.yaml` | `networkPolicy.ingress` entries, all three peer shapes, and both port forms |
+| `ingress-overrides.yaml` | several hosts, an adopted TLS secret, pass-through controller annotations, a non-default `pathType` |
+
+`network-policy-allowlist.yaml` predates the Ingress and still earns its place:
+the environment files now carry one ingress allowlist entry each, and it is the
+same shape in both, so the `cidr`+`except` peer and the same-namespace
+`podLabels`-only peer are reached by nothing else.
 
 `.github/scripts/lint-helm-chart.sh` renders each of these with
 `helm template --kube-version`, so a fixture that produces invalid YAML or trips

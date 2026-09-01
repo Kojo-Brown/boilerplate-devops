@@ -1,0 +1,12 @@
+# An Ingress turned on with no host. Every object still renders: `spec.rules` is
+# an empty list, `spec.tls[0].hosts` is an empty list, and the API server admits
+# all of it. The controller then serves nothing, external-dns publishes nothing,
+# and cert-manager's ingress-shim creates no Certificate because there is no SAN
+# to put on one — with no error anywhere, because nothing here is invalid.
+#
+# `hosts` is only allowed to be empty while the Ingress is off, so the schema's
+# `if`/`then` is what separates the two.
+environment: staging
+ingress:
+  enabled: true
+  hosts: []

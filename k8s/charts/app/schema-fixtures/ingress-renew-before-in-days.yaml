@@ -1,0 +1,12 @@
+# `30d` as a renewal window. Go's duration parser — which is what cert-manager
+# uses — has no day unit, so this is rejected on the Certificate; but the
+# rejection lands on a resource ingress-shim creates, in an event on that
+# resource, and the Ingress itself stays Ready. The certificate simply never
+# renews, and the first anyone hears of it is the expiry.
+environment: staging
+ingress:
+  enabled: true
+  hosts:
+    - app.example.com
+  tls:
+    renewBefore: 30d

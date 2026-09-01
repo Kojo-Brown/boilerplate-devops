@@ -1,0 +1,63 @@
+# The ACME ClusterIssuer for the staging cluster.
+#
+# A directory-type Application over `k8s/cert-manager/staging/`, not a chart:
+# the manifest is two dozen lines of our own configuration, and wrapping it in a
+# chart would add a template layer over values that never vary within an
+# environment.
+#
+# It is a separate Application from cert-manager rather than an `extraObjects`
+# entry in that chart's values for one reason: a `ClusterIssuer` cannot be
+# created until cert-manager's CRDs exist, and inside one Application, Argo CD
+# applies every object in the same sync. The split is what makes the ordering
+# expressible at all.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cluster-issuer
+  namespace: argocd
+  annotations:
+    # Wave 2: after cert-manager (1), whose CRDs define this object's kind.
+    argocd.argoproj.io/sync-wave: "2"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: platform
+
+  source:
+    repoURL: https://github.com/Kojo-Brown/boilerplate-devops.git
+    targetRevision: main
+    path: k8s/cert-manager/staging
+    directory:
+      # One file, one level. `recurse: true` would pick up anything a later
+      # refactor nested underneath, which for a cluster-scoped issuer is a wider
+      # accident than it looks.
+      recurse: false
+
+  destination:
+    server: https://kubernetes.default.svc
+    # A ClusterIssuer is cluster-scoped, so this namespace does not hold it. It
+    # is where cert-manager keeps a ClusterIssuer's own resources — the ACME
+    # account key Secret named in `privateKeySecretRef` — because that is
+    # cert-manager's cluster resource namespace, and it defaults to the
+    # namespace cert-manager runs in.
+    namespace: cert-manager
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+      - PruneLast=true
+      # The cert-manager Application creates this namespace too. Repeating it
+      # here keeps the ordering advisory rather than load-bearing: a first sync
+      # that arrives before cert-manager's own has a namespace to land in.
+      - CreateNamespace=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+
+  revisionHistoryLimit: 10

@@ -1,0 +1,112 @@
+# external-dns on the production cluster.
+#
+# It reads the Ingress objects in the cluster and writes the matching records
+# into Route 53, so a hostname in `values-production.yaml` is the only place a
+# name is declared. Without it the record is a console click that nothing in git
+# records, and the first sign that it drifted is a certificate renewal failing a
+# DNS-01 challenge against a zone somebody edited by hand.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: external-dns
+  namespace: argocd
+  annotations:
+    # Wave 4: last of the platform add-ons. It needs the ingress controller's
+    # Service to have acquired a load balancer address before there is anything
+    # to publish — an Ingress with an empty `status.loadBalancer` produces no
+    # record and no error.
+    argocd.argoproj.io/sync-wave: "4"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: platform
+
+  source:
+    # Written with the trailing slash the upstream repository uses. Argo CD
+    # compares this against the project's `sourceRepos` after normalising the
+    # case and a `.git` suffix but *not* a trailing slash, so the two have to
+    # agree character for character or the sync fails on a permission error
+    # naming neither of them.
+    repoURL: https://kubernetes-sigs.github.io/external-dns/
+    chart: external-dns
+    targetRevision: 1.20.0
+    helm:
+      releaseName: external-dns
+      values: |
+        provider:
+          name: aws
+
+        serviceAccount:
+          annotations:
+            # IRSA. `EksStack` creates this role from its `dns` block;
+            # 123456789012 is the AWS documentation placeholder.
+            eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/production-external-dns
+
+        # Ingress objects only. The chart's default also watches Services, and a
+        # Service becomes a record through an annotation any namespace owner can
+        # add — so narrowing the source list is what keeps "which names exist"
+        # answerable from the Ingress objects alone.
+        sources:
+          - ingress
+
+        # The blast radius. Without a filter external-dns manages every zone the
+        # role can reach; with it, a record outside this zone is not something
+        # it will create or delete however it is annotated.
+        domainFilters:
+          - example.com
+
+        # The two settings that make `policy: sync` safe, and they only work
+        # together.
+        #
+        # `registry: txt` makes external-dns write a companion TXT record beside
+        # every record it creates, stamped with `txtOwnerId`. It then treats any
+        # record without a matching stamp as somebody else's and leaves it
+        # alone. `txtOwnerId` therefore has to be unique per cluster: two
+        # clusters sharing a zone and an owner id each believe they own the
+        # other's records, and `sync` means each deletes what the other created,
+        # in a loop, for as long as both are running.
+        registry: txt
+        txtOwnerId: production-eks
+
+        # `sync`, not the chart's `upsert-only` default. Upsert-only never
+        # deletes, which sounds safer and means a hostname removed from git
+        # keeps resolving to a load balancer that no longer serves it — a stale
+        # record pointing at an address AWS will eventually hand to someone
+        # else. The TXT registry above is what bounds the deletions to records
+        # this cluster created.
+        policy: sync
+
+        # Records are reconciled on a timer as well as on watch events, because
+        # a change made in the Route 53 console produces no Kubernetes event.
+        interval: 1m
+
+        logLevel: info
+        logFormat: json
+
+        resources:
+          requests:
+            cpu: 10m
+            memory: 64Mi
+          limits:
+            memory: 128Mi
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: external-dns
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      allowEmpty: false
+    syncOptions:
+      - PruneLast=true
+      - CreateNamespace=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+
+  revisionHistoryLimit: 10

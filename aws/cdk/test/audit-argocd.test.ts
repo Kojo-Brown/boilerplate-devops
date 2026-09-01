@@ -126,10 +126,21 @@ describe('the Argo CD manifests in this repository', () => {
         ]),
       );
 
+      // The whole ladder, asserted literally rather than as an ordering: the
+      // gaps are what a new add-on has to be inserted into, and a wave that
+      // moves is a change to which controller exists before which.
       expect(waves).toEqual({
         'AppProject/app': -10,
         'AppProject/platform': -10,
         'Application/metrics-server': 0,
+        // cert-manager first: the ClusterIssuer's `apiVersion` does not exist
+        // until its CRDs are installed.
+        'Application/cert-manager': 1,
+        'Application/cluster-issuer': 2,
+        // The controller before external-dns, which publishes the record from
+        // the address the controller's Service acquires.
+        'Application/ingress-nginx': 3,
+        'Application/external-dns': 4,
         [`Application/app-${candidate.environment}`]: 10,
       });
     }
@@ -268,6 +279,7 @@ const FIXTURE_RULES: Record<string, ViolationRule> = {
   'application-unknown-project.yaml': 'unknown-project',
   'application-unquoted-sync-wave.yaml': 'annotation-not-a-string',
   'application-with-ambiguous-destination.yaml': 'ambiguous-destination',
+  'application-with-prefixed-chart-range.yaml': 'mutable-target-revision',
   'application-without-automated-sync.yaml': 'drift-uncorrected',
   'application-without-finalizer.yaml': 'missing-finalizer',
   'application-without-namespace-creation.yaml': 'namespace-not-created',
@@ -276,6 +288,7 @@ const FIXTURE_RULES: Record<string, ViolationRule> = {
   'application-without-self-heal.yaml': 'drift-uncorrected',
   'application-without-sync-wave.yaml': 'missing-sync-wave',
   'project-granting-cluster-rbac.yaml': 'cluster-scope-escalation',
+  'project-permitting-any-namespace.yaml': 'cluster-scope-escalation',
   'project-with-wildcard-destination.yaml': 'open-project-scope',
 };
 

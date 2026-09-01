@@ -62,10 +62,12 @@ VPC — a bastion, a VPN, or a CI job in a self-hosted runner — not from a lap
 | `PodDisruptionBudget` | `minAvailable` as a count, checked against the fleet's floor |
 | `HorizontalPodAutoscaler` | `autoscaling/v2`, CPU against the request, with an explicit `behavior` |
 | `NetworkPolicy` ×2 | A default-deny for this release's pods, and the allowlist — see §2.2 |
+| `Ingress` | TLS-only, one certificate over `ingress.hosts` — see [docs/ingress.md](./ingress.md) |
 
-Not here, and each its own Phase 8 item: the ArgoCD app-of-apps and the Ingress
-with cert-manager. The chart is the delivery path; automating its rollout and
-putting something in front of it come next.
+The Ingress renders only when `ingress.enabled` is true, which both environment
+files set and the chart defaults do not: the object is meaningless without the
+three controllers behind it, and they are installed through Argo CD rather than
+by this chart.
 
 The pod security context landed with §2.1 below and the network policy with
 §2.2: the rendered pods no longer run with the cluster's defaults, and nothing
@@ -145,10 +147,12 @@ Four things matter before editing that block, and
   destination to `containerPort` before policy is evaluated, so an ingress entry
   naming `service.port` matches nothing and the connections it was written to
   permit are dropped. `npm run audit:helm` fails on it.
-- **`ingress` is empty and that is the real state**, not a placeholder — there is
-  no ingress controller on this cluster yet. Because both environment files
-  leave it empty, `render-fixtures/` is what keeps the ingress half of the
-  template rendered by a gate; see §5.
+- **`ingress` carries exactly one entry in both environments**: the ingress
+  controller. Enabling the chart's Ingress without it is a release that returns
+  503 with everything above it reporting healthy, which `npm run audit:helm`
+  fails as `ingress-peer-not-allowed`. Because one entry of one shape is the
+  whole allowlist, `render-fixtures/` is what keeps the other peer shapes
+  rendered by a gate; see §5.
 
 The HPA and the Cluster Autoscaler in `EksStack` are two halves of one thing and
 are documented together in [docs/autoscaling.md](./autoscaling.md), including
@@ -424,14 +428,15 @@ whoever finally uses it.
 - **Nothing is deployed.** Both gates are lint-and-render: they prove the chart
   produces well-formed manifests for both environments, not that a release comes
   up healthy on a cluster. There is no cluster in CI.
-- **No deploy workflow.** `workflow-templates/` has no `deploy-helm.yml` yet;
-  the rollout path is GitOps, which is its own Phase 8 item, and a
-  `helm upgrade` workflow written now would be replaced by it.
+- **No deploy workflow, deliberately.** `workflow-templates/` has no
+  `deploy-helm.yml`: the rollout path is GitOps
+  ([docs/gitops-argocd.md](./gitops-argocd.md)), and a pipeline holding cluster
+  credentials beside it would be a second, unreviewed way in.
 - **Checkov does not scan the rendered manifests.** Its Kubernetes checks are
   almost entirely pod-security checks — non-root, read-only root filesystem,
-  dropped capabilities, seccomp — which is the *next* Phase 8 item. Wiring the
-  scan up before that item lands would mean either implementing it early or
-  writing a suppression list that then has to be unwound.
+  dropped capabilities, seccomp — all of which `values.schema.json` now fixes as
+  `const` rather than defaults, with a must-fail fixture per rule. Wiring the
+  scan up would duplicate that gate against a weaker one.
 - **No `helm test` hooks and no chart-testing (`ct`) install test**, for the
   same reason as the first point: both want a cluster.
 - **No policy has been observed to permit or deny a packet.** §2.2 and

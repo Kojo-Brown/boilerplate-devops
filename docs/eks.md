@@ -239,9 +239,12 @@ the reasoning behind each one are in
 
 Later Phase 8 items, deliberately out of scope here:
 
-- No ArgoCD, no ingress controller. The cluster has capacity, identity, node
-  scaling, an application chart and policy enforcement; it has no automated
-  rollout path and nothing in front of it.
+- **No controllers.** This stack creates capacity, identity, node scaling and
+  policy enforcement, plus the IRSA roles external-dns and cert-manager assume
+  when `props.dns` names the hosted zones they may write to
+  ([docs/ingress.md](./ingress.md) §2). The controllers themselves — Argo CD,
+  ingress-nginx, cert-manager, external-dns — are installed through
+  `k8s/argocd/`, not from here.
 - **No cluster-wide network baseline.** The CNI enforces policy, and the `app`
   chart closes its own pods (see
   [docs/network-policies.md](./network-policies.md)), but every other pod in the

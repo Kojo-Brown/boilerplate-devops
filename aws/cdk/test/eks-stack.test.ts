@@ -755,6 +755,193 @@ describe('EksStack', () => {
     });
   });
 
+  describe('Ingress DNS and TLS', () => {
+    const ZONE = 'Z0123456789ABCDEFGHIJ';
+    const SECOND_ZONE = 'Z9876543210JIHGFEDCBA';
+
+    /** The inline policy carrying a statement with this Sid. */
+    const policyWithSid = (template: Template, sid: string): Record<string, any>[] =>
+      resourceProps(template, 'AWS::IAM::Policy')
+        .map((policy) => (policy.PolicyDocument as any).Statement as Record<string, any>[])
+        .find((statements) => statements.some((statement) => statement.Sid === sid)) ??
+      (() => {
+        throw new Error(`no IAM policy carrying a statement with Sid "${sid}"`);
+      })();
+
+    it('creates neither role when no zones are given', () => {
+      const { stack, template } = makeStack();
+
+      expect(stack.externalDnsRole).toBeUndefined();
+      expect(stack.certManagerRole).toBeUndefined();
+      expect(
+        resourceProps(template, 'AWS::IAM::Role').map((role) => role.RoleName),
+      ).not.toContain('staging-external-dns');
+    });
+
+    it('names the roles what the Argo CD service-account annotations name', () => {
+      // These two strings are the join between this stack and
+      // `k8s/argocd/<environment>/applications/`. A generated role name would
+      // still work and would have to be copied into those manifests by hand
+      // after every deploy.
+      const { template } = makeStack({ dns: { hostedZoneIds: [ZONE] } });
+      const names = resourceProps(template, 'AWS::IAM::Role').map((role) => role.RoleName);
+
+      expect(names).toContain('staging-external-dns');
+      expect(names).toContain('staging-cert-manager');
+    });
+
+    it('scopes each role to its own controller’s service account', () => {
+      const { template } = makeStack({ dns: { hostedZoneIds: [ZONE] } });
+      const conditions = resourceProps(template, 'Custom::AWSCDKCfnJson').map((json) =>
+        flattenIntrinsic(json.Value),
+      );
+
+      expect(conditions).toContainEqual(
+        expect.stringContaining('system:serviceaccount:external-dns:external-dns'),
+      );
+      expect(conditions).toContainEqual(
+        expect.stringContaining('system:serviceaccount:cert-manager:cert-manager'),
+      );
+    });
+
+    it('takes overridden namespaces and service account names', () => {
+      const { template } = makeStack({
+        dns: {
+          hostedZoneIds: [ZONE],
+          externalDnsNamespace: 'kube-system',
+          externalDnsServiceAccountName: 'dns-writer',
+          certManagerNamespace: 'pki',
+          certManagerServiceAccountName: 'issuer',
+        },
+      });
+      const conditions = resourceProps(template, 'Custom::AWSCDKCfnJson').map((json) =>
+        flattenIntrinsic(json.Value),
+      );
+
+      expect(conditions).toContainEqual(
+        expect.stringContaining('system:serviceaccount:kube-system:dns-writer'),
+      );
+      expect(conditions).toContainEqual(expect.stringContaining('system:serviceaccount:pki:issuer'));
+    });
+
+    it('lets external-dns write only the given zones, and only address records', () => {
+      const { template } = makeStack({ dns: { hostedZoneIds: [ZONE, SECOND_ZONE] } });
+      const statement = statementBySid(
+        policyWithSid(template, 'PublishRecordsInManagedZones'),
+        'PublishRecordsInManagedZones',
+      );
+
+      expect(statement.Action).toBe('route53:ChangeResourceRecordSets');
+      expect((statement.Resource as unknown[]).map(flattenIntrinsic)).toEqual([
+        `arn:${TOKEN}:route53:::hostedzone/${ZONE}`,
+        `arn:${TOKEN}:route53:::hostedzone/${SECOND_ZONE}`,
+      ]);
+
+      // NS and SOA absent is the point of the condition: a controller that can
+      // rewrite the delegation can take the domain off the internet, and needs
+      // neither type to publish an address.
+      const types =
+        statement.Condition['ForAllValues:StringEquals'][
+          'route53:ChangeResourceRecordSetsRecordTypes'
+        ];
+      expect(types).toEqual(['A', 'AAAA', 'CNAME', 'TXT']);
+      expect(types).not.toContain('NS');
+      expect(types).not.toContain('SOA');
+    });
+
+    it('grants external-dns nothing but reads on its unscoped statement', () => {
+      const { template } = makeStack({ dns: { hostedZoneIds: [ZONE] } });
+      const statement = statementBySid(
+        policyWithSid(template, 'PublishRecordsInManagedZones'),
+        'ReadZoneInventory',
+      );
+
+      expect(statement.Resource).toBe('*');
+      for (const action of statement.Action as string[]) {
+        expect(action).toMatch(/^route53:List/);
+      }
+    });
+
+    it('lets cert-manager write only ACME challenge TXT records', () => {
+      const { template } = makeStack({ dns: { hostedZoneIds: [ZONE] } });
+      const statement = statementBySid(
+        policyWithSid(template, 'SolveAcmeChallenges'),
+        'SolveAcmeChallenges',
+      );
+
+      expect(statement.Action).toBe('route53:ChangeResourceRecordSets');
+      expect(
+        statement.Condition['ForAllValues:StringEquals'][
+          'route53:ChangeResourceRecordSetsRecordTypes'
+        ],
+      ).toEqual(['TXT']);
+      // Without the name condition the role could rewrite any TXT record in the
+      // zone, external-dns's own ownership registry included.
+      expect(
+        statement.Condition['ForAllValues:StringLike'][
+          'route53:ChangeResourceRecordSetsNormalizedRecordNames'
+        ],
+      ).toEqual(['_acme-challenge.*']);
+    });
+
+    it('lets cert-manager poll only change IDs, and resolve zones by name', () => {
+      const { template } = makeStack({ dns: { hostedZoneIds: [ZONE] } });
+      const statements = policyWithSid(template, 'SolveAcmeChallenges');
+
+      expect(flattenIntrinsic(statementBySid(statements, 'PollChangePropagation').Resource)).toBe(
+        `arn:${TOKEN}:route53:::change/*`,
+      );
+
+      // The ClusterIssuer deliberately pins no hostedZoneID, so cert-manager
+      // resolves the zone by name — this is what pays for that.
+      const resolve = statementBySid(statements, 'ResolveZoneByName');
+      expect(resolve.Action).toBe('route53:ListHostedZonesByName');
+      expect(resolve.Resource).toBe('*');
+    });
+
+    it('keeps the two roles apart rather than sharing one', () => {
+      const { template } = makeStack({ dns: { hostedZoneIds: [ZONE] } });
+
+      // A shared role would be the union of both, held by both, permanently —
+      // and the interesting half of that is cert-manager gaining the ability to
+      // rewrite the address records external-dns publishes.
+      expect(policyWithSid(template, 'PublishRecordsInManagedZones')).not.toContainEqual(
+        expect.objectContaining({ Sid: 'SolveAcmeChallenges' }),
+      );
+    });
+
+    it('exports both role ARNs for the environment', () => {
+      const { template } = makeStack({ dns: { hostedZoneIds: [ZONE] } });
+
+      expect(outputByExportName(template, 'staging-eks-external-dns-role-arn')).toBeDefined();
+      expect(outputByExportName(template, 'staging-eks-cert-manager-role-arn')).toBeDefined();
+    });
+
+    it('exports neither when no zones are given', () => {
+      const { template } = makeStack();
+
+      expect(outputByExportName(template, 'staging-eks-external-dns-role-arn')).toBeUndefined();
+      expect(outputByExportName(template, 'staging-eks-cert-manager-role-arn')).toBeUndefined();
+    });
+
+    it('rejects an empty zone list rather than creating two useless roles', () => {
+      expect(() => makeStack({ dns: { hostedZoneIds: [] } })).toThrow(/hostedZoneIds is empty/);
+    });
+
+    it.each([
+      ['example.com', 'a domain name'],
+      ['/hostedzone/Z0123456789ABCDEFGHIJ', 'the ARN path prefix'],
+      ['z0123456789abcdefghij', 'the lower-cased form'],
+    ])('rejects %s, which is %s rather than a zone ID', (zoneId) => {
+      // Each of these builds a syntactically valid ARN that matches no zone, so
+      // the failure would otherwise be an access denied at runtime with nothing
+      // pointing at the value that caused it.
+      expect(() => makeStack({ dns: { hostedZoneIds: [zoneId] } })).toThrow(
+        /not a Route 53 hosted zone ID/,
+      );
+    });
+  });
+
   describe('Outputs', () => {
     it.each([
       'staging-eks-cluster-name',

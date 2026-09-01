@@ -89,8 +89,35 @@ podDisruptionBudget:
 # than the longest in-flight request truncates responses on every deploy.
 terminationGracePeriodSeconds: 60
 
-# `networkPolicy` is inherited whole from the chart defaults — see the note at
-# the end of values-staging.yaml. Production adds nothing to the allowlist
-# because nothing reaches these pods yet: the ingress controller is the last
-# Phase 8 item, so `ingress: []` is the state of the cluster rather than an
-# omission. docs/network-policies.md §4 has the entry that opens it.
+# The public entry point. `example.com` is reserved for documentation (RFC 2606);
+# an unedited copy of this file fails at external-dns, which finds no hosted
+# zone for it, rather than writing a record into a domain that is not yours.
+ingress:
+  enabled: true
+  hosts:
+    - app.example.com
+  tls:
+    # The real ACME endpoint, so the certificate chains to a root browsers
+    # trust. Its rate limits are the reason staging does not share it: 50
+    # certificates per week counted on the registered domain rather than the
+    # subdomain, so exhausting them anywhere under this domain means no issuance
+    # anywhere under it until the rolling window clears.
+    clusterIssuer: letsencrypt-production
+
+# `networkPolicy` is otherwise inherited whole from the chart defaults — see the
+# note in values-staging.yaml.
+#
+# The ingress allowlist is restated rather than inherited because Helm replaces
+# lists wholesale: an environment file that sets any part of a list replaces all
+# of it. This entry is byte-for-byte the staging one, and deliberately so — the
+# boundary production runs is the boundary staging exercised.
+networkPolicy:
+  ingress:
+    - name: ingress-controller
+      namespaceLabels:
+        kubernetes.io/metadata.name: ingress-nginx
+      podLabels:
+        app.kubernetes.io/name: ingress-nginx
+      ports:
+        - port: http
+          protocol: TCP

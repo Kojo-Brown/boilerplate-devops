@@ -1383,11 +1383,35 @@ const productionEksAdminRoleArns = parseList(
     process.env.PRODUCTION_EKS_ADMIN_ROLE_ARNS,
 );
 
+// Route 53 access for external-dns and cert-manager, which publish the record
+// and issue the certificate behind the Ingress in `k8s/charts/app`:
+//
+//   cdk deploy --context stagingEksHostedZoneIds=Z0123456789ABCDEFGHIJ
+//   PRODUCTION_EKS_HOSTED_ZONE_IDS=Z0123456789ABCDEFGHIJ cdk deploy
+//
+// Left unset, neither role is created — and that is the default rather than a
+// placeholder zone, because an IAM policy naming a zone that is not yours grants
+// nothing and fails as an access denied against a zone the reader has never
+// seen. The Argo CD Applications annotate their service accounts with
+// `<environment>-external-dns` and `<environment>-cert-manager`, which are the
+// role names `EksStack` creates here. See docs/ingress.md §2.
+const stagingEksHostedZoneIds = parseList(
+  (app.node.tryGetContext('stagingEksHostedZoneIds') as string | undefined) ??
+    process.env.STAGING_EKS_HOSTED_ZONE_IDS,
+);
+
+const productionEksHostedZoneIds = parseList(
+  (app.node.tryGetContext('productionEksHostedZoneIds') as string | undefined) ??
+    process.env.PRODUCTION_EKS_HOSTED_ZONE_IDS,
+);
+
 new EksStack(app, 'EksStack-Staging', {
   vpc: vpcStackStaging.vpc,
   envName: 'staging',
   publicApiAccessCidrs: stagingEksPublicAccessCidrs,
   clusterAdminRoleArns: stagingEksAdminRoleArns,
+  dns:
+    stagingEksHostedZoneIds.length > 0 ? { hostedZoneIds: stagingEksHostedZoneIds } : undefined,
   systemNodeGroup: {
     instanceTypes: [ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.LARGE)],
     minSize: 2,
@@ -1407,6 +1431,10 @@ new EksStack(app, 'EksStack-Production', {
   envName: 'production',
   publicApiAccessCidrs: productionEksPublicAccessCidrs,
   clusterAdminRoleArns: productionEksAdminRoleArns,
+  dns:
+    productionEksHostedZoneIds.length > 0
+      ? { hostedZoneIds: productionEksHostedZoneIds }
+      : undefined,
   systemNodeGroup: {
     instanceTypes: [ec2.InstanceType.of(ec2.InstanceClass.M6I, ec2.InstanceSize.LARGE)],
     minSize: 3,

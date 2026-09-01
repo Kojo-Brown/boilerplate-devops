@@ -15,17 +15,40 @@ spec:
   description: Cluster add-ons that the workload releases depend on.
 
   sourceRepos:
+    # This repository, for the ClusterIssuer under `k8s/cert-manager/production`.
     - https://github.com/Kojo-Brown/boilerplate-devops.git
+    # Four upstream chart repositories, each pinned to an exact chart version in
+    # the Application that reads it. Two are conventionally written with a
+    # trailing slash and two without; Argo CD does not normalise one, so each
+    # must match its Application character for character.
     - https://kubernetes-sigs.github.io/metrics-server/
+    - https://kubernetes-sigs.github.io/external-dns/
+    - https://kubernetes.github.io/ingress-nginx
+    - https://charts.jetstack.io
 
+  # One namespace per add-on, named. A wildcard would let any of these charts
+  # deploy into `production` beside the workload release, or into `argocd`
+  # beside Argo CD's own service account.
   destinations:
     - server: https://kubernetes.default.svc
       namespace: kube-system
+    - server: https://kubernetes.default.svc
+      namespace: cert-manager
+    - server: https://kubernetes.default.svc
+      namespace: ingress-nginx
+    - server: https://kubernetes.default.svc
+      namespace: external-dns
 
-  # The aggregation-layer registration and the two RBAC objects metrics-server
-  # needs; nothing else. A project that may create ClusterRoleBindings may bind
-  # any subject to cluster-admin, so this list is the ceiling on what a
-  # compromised add-on chart can do.
+  # Exactly what these four add-ons need: metrics-server's aggregation-layer
+  # registration, the RBAC objects all of them create, cert-manager's CRDs and
+  # webhook configurations, ingress-nginx's IngressClass, the ACME ClusterIssuer,
+  # and the three namespaces `CreateNamespace=true` creates — those restricted by
+  # name. The staging project carries the reason for each entry.
+  #
+  # A project that may create ClusterRoleBindings may bind any subject to
+  # cluster-admin, so this list is the ceiling on what a compromised add-on
+  # chart can do; `npm run audit:argocd` fails on an entry that is not in
+  # `PLATFORM_CLUSTER_KINDS` in `tools/audit-argocd.ts`.
   clusterResourceWhitelist:
     - group: apiregistration.k8s.io
       kind: APIService
@@ -33,7 +56,29 @@ spec:
       kind: ClusterRole
     - group: rbac.authorization.k8s.io
       kind: ClusterRoleBinding
+    - group: apiextensions.k8s.io
+      kind: CustomResourceDefinition
+    - group: admissionregistration.k8s.io
+      kind: ValidatingWebhookConfiguration
+    - group: admissionregistration.k8s.io
+      kind: MutatingWebhookConfiguration
+    - group: networking.k8s.io
+      kind: IngressClass
+    - group: cert-manager.io
+      kind: ClusterIssuer
+    - group: ""
+      kind: Namespace
+      name: cert-manager
+    - group: ""
+      kind: Namespace
+      name: ingress-nginx
+    - group: ""
+      kind: Namespace
+      name: external-dns
 
+  # Namespaced resources are unrestricted, bounded by the destination namespaces
+  # above: enumerating what an upstream chart may ship turns every chart bump
+  # into a permission failure at sync time.
   namespaceResourceBlacklist: []
 
   # Orphaned-resource tracking stays off here: kube-system holds hundreds of

@@ -22,6 +22,31 @@ private (docs/eks.md §3), so from a workstation use a port-forward rather than
 expecting an address:
 
   kubectl port-forward svc/{{ include "app.fullname" . }} 8080:{{ .Values.service.port }} -n {{ .Release.Namespace }}
+{{- if .Values.ingress.enabled }}
+
+From outside the cluster, once the certificate has been issued:
+{{ range .Values.ingress.hosts }}
+  https://{{ . }}{{ $.Values.ingress.path }}
+{{- end }}
+
+The Ingress is Ready long before that URL works. Three things happen after it,
+none of them part of the release, and each fails independently:
+
+  kubectl get ingress {{ include "app.fullname" . }} -n {{ .Release.Namespace }}
+      an ADDRESS appears when ingress-nginx has adopted the object; an empty one
+      means no controller claimed class `{{ .Values.ingress.className }}`
+
+  kubectl get certificate {{ include "app.tlsSecretName" . }} -n {{ .Release.Namespace }}
+      READY=True when the ACME order completed. While it is False, follow it
+      down: `kubectl describe certificaterequest`, then `order`, then
+      `challenge` — the reason is on the last of those, not on the Certificate
+
+  external-dns writes the record from this Ingress's ADDRESS, so the name does
+      not resolve until the line above has one. Its logs name the zone it chose
+
+Until the certificate is issued the controller serves its own self-signed
+default, so a browser shows a name-mismatch warning rather than an outage.
+{{- end }}
 
 {{- if not .Values.serviceAccount.annotations }}
 

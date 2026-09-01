@@ -38,6 +38,51 @@ const DEFAULT_CLUSTER_AUTOSCALER_CHART_VERSION = '9.51.0';
 const CLUSTER_AUTOSCALER_SERVICE_ACCOUNT = 'cluster-autoscaler';
 
 /**
+ * Where the two DNS controllers run, matching the Argo CD Applications in
+ * `k8s/argocd/<environment>/applications/`.
+ *
+ * An IRSA trust policy names `system:serviceaccount:<namespace>:<name>` exactly,
+ * so these are half of a pair with those manifests. Getting one wrong does not
+ * fail a deploy — the pod starts, and `AssumeRoleWithWebIdentity` rejects the
+ * token at the first AWS call with an access-denied that names the role rather
+ * than the mismatch.
+ */
+const EXTERNAL_DNS_NAMESPACE = 'external-dns';
+const EXTERNAL_DNS_SERVICE_ACCOUNT = 'external-dns';
+const CERT_MANAGER_NAMESPACE = 'cert-manager';
+const CERT_MANAGER_SERVICE_ACCOUNT = 'cert-manager';
+
+/**
+ * Record types the DNS controllers may create, change and delete.
+ *
+ * Route 53's `route53:ChangeResourceRecordSetsRecordTypes` condition key is what
+ * turns "may write to this zone" into "may write these records in this zone",
+ * and the difference is the zone's own `NS` and `SOA` records: a controller that
+ * can rewrite the delegation can take the domain off the internet, and it needs
+ * neither of them to publish an address.
+ *
+ * external-dns manages A, AAAA and CNAME records (its own `managedRecordTypes`
+ * default) plus the TXT records of its ownership registry. cert-manager writes
+ * only the `_acme-challenge` TXT record for a DNS-01 challenge.
+ */
+const EXTERNAL_DNS_RECORD_TYPES = ['A', 'AAAA', 'CNAME', 'TXT'];
+const CERT_MANAGER_RECORD_TYPES = ['TXT'];
+
+/**
+ * The record names cert-manager may touch.
+ *
+ * `route53:ChangeResourceRecordSetsNormalizedRecordNames` is matched against the
+ * name lower-cased and without its trailing dot, which is why the pattern is
+ * written that way. A DNS-01 challenge is always `_acme-challenge.<name>`, so
+ * this bounds the role to challenge records even inside the zones it is given —
+ * cert-manager could otherwise rewrite the very A record external-dns publishes.
+ */
+const ACME_CHALLENGE_RECORD_NAMES = ['_acme-challenge.*'];
+
+/** Route 53 hosted zone identifier: `Z` followed by upper-case alphanumerics. */
+const HOSTED_ZONE_ID = /^Z[A-Z0-9]+$/;
+
+/**
  * A Go duration string, which is what every Cluster Autoscaler flag that takes a
  * time expects. Seconds are always valid and always unambiguous —
  * `Duration.toIsoString()` is not, and a bare number is read as nanoseconds.
@@ -143,6 +188,38 @@ export interface ClusterAutoscalerOptions {
   readonly maxNodeProvisionTime?: cdk.Duration;
 }
 
+/**
+ * Route 53 access for the two controllers behind the chart's Ingress.
+ *
+ * Left unset the roles are not created, and that is the default because there is
+ * no zone this stack could invent: an IAM policy naming a hosted zone that is
+ * not yours grants nothing, and a boilerplate that shipped one would cost
+ * whoever deployed it an afternoon on an access-denied that names a zone they
+ * have never seen. Supplying the zones is one context value — see the EKS
+ * section of `bin/app.ts` — and creates both roles with the names the Argo CD
+ * manifests already annotate their service accounts with.
+ *
+ * The roles are separate rather than one shared role because the two controllers
+ * need different things: external-dns writes the address records for every
+ * Ingress in the cluster, cert-manager writes one `_acme-challenge` TXT record
+ * at a time. A shared role is the union, held by both, permanently.
+ */
+export interface ClusterDnsOptions {
+  /**
+   * Hosted zones the controllers may write records into. Every zone is a zone
+   * either controller can change, so this is the blast radius of both.
+   */
+  readonly hostedZoneIds: readonly string[];
+  /** Namespace external-dns runs in (default: `external-dns`) */
+  readonly externalDnsNamespace?: string;
+  /** external-dns service account name (default: `external-dns`) */
+  readonly externalDnsServiceAccountName?: string;
+  /** Namespace cert-manager runs in (default: `cert-manager`) */
+  readonly certManagerNamespace?: string;
+  /** cert-manager service account name (default: `cert-manager`) */
+  readonly certManagerServiceAccountName?: string;
+}
+
 export interface EksStackProps extends cdk.StackProps {
   /** VPC from VpcStack (required) — nodes and the kubectl handler run in its private subnets */
   readonly vpc: ec2.IVpc;
@@ -179,6 +256,11 @@ export interface EksStackProps extends cdk.StackProps {
   /** Cluster Autoscaler configuration (default: installed, with the thresholds in docs/autoscaling.md) */
   readonly clusterAutoscaler?: ClusterAutoscalerOptions;
   /**
+   * Route 53 access for external-dns and cert-manager (default: neither role is
+   * created — there is no zone this stack could invent). See docs/ingress.md §2.
+   */
+  readonly dns?: ClusterDnsOptions;
+  /**
    * Attach `AmazonSSMManagedInstanceCore` to the node role so operators can
    * open a Session Manager shell on a node (default: false — nodes are cattle,
    * and the policy is broader than most clusters need).
@@ -203,6 +285,11 @@ export interface EksStackProps extends cdk.StackProps {
  *                    scaling story: the chart's HPA adds pods, and pods that do
  *                    not fit stay Pending until something adds a node. See
  *                    docs/autoscaling.md.
+ *   Ingress DNS/TLS — IRSA roles for external-dns and cert-manager, created only
+ *                    when `dns` names the hosted zones they may write to. The
+ *                    controllers themselves are installed through Argo CD
+ *                    (`k8s/argocd/<environment>/applications/`), not from here;
+ *                    what this stack owns is the AWS half. See docs/ingress.md.
  *
  * Security defaults:
  *   - API server endpoint is private; `publicApiAccessCidrs` opens it to an
@@ -236,6 +323,10 @@ export class EksStack extends cdk.Stack {
   public readonly secretsKey: kms.IKey;
   /** IRSA role the Cluster Autoscaler assumes; `undefined` when it is disabled */
   public readonly clusterAutoscalerRole?: iam.Role;
+  /** IRSA role external-dns assumes; `undefined` when no `dns` zones are given */
+  public readonly externalDnsRole?: iam.Role;
+  /** IRSA role cert-manager assumes; `undefined` when no `dns` zones are given */
+  public readonly certManagerRole?: iam.Role;
 
   private readonly envName: string;
 
@@ -430,6 +521,13 @@ export class EksStack extends cdk.Stack {
       this.clusterAutoscalerRole = this.addClusterAutoscaler(clusterAutoscaler);
     }
 
+    // ── Ingress DNS and TLS ───────────────────────────────────────────────────
+    if (props.dns) {
+      const roles = this.addDnsControllerRoles(props.dns);
+      this.externalDnsRole = roles.externalDns;
+      this.certManagerRole = roles.certManager;
+    }
+
     // ── Cluster access ────────────────────────────────────────────────────────
     for (const [index, roleArn] of (props.clusterAdminRoleArns ?? []).entries()) {
       this.cluster.grantAccess(`ClusterAdminAccess${index}`, roleArn, [
@@ -497,6 +595,22 @@ export class EksStack extends cdk.Stack {
         value: this.clusterAutoscalerRole.roleArn,
         description: 'IRSA role assumed by the Cluster Autoscaler',
         exportName: `${envName}-eks-cluster-autoscaler-role-arn`,
+      });
+    }
+
+    if (this.externalDnsRole) {
+      new cdk.CfnOutput(this, 'ExternalDnsRoleArn', {
+        value: this.externalDnsRole.roleArn,
+        description: 'IRSA role assumed by external-dns',
+        exportName: `${envName}-eks-external-dns-role-arn`,
+      });
+    }
+
+    if (this.certManagerRole) {
+      new cdk.CfnOutput(this, 'CertManagerRoleArn', {
+        value: this.certManagerRole.roleArn,
+        description: 'IRSA role assumed by cert-manager for DNS-01 challenges',
+        exportName: `${envName}-eks-cert-manager-role-arn`,
       });
     }
   }
@@ -672,6 +786,143 @@ export class EksStack extends cdk.Stack {
     chart.node.addDependency(this.systemNodeGroup);
 
     return role;
+  }
+
+  /**
+   * IRSA roles for external-dns and cert-manager, scoped to the given hosted
+   * zones and to the records each controller actually writes.
+   *
+   * **Why two roles.** external-dns publishes the address records for every
+   * Ingress in the cluster and keeps a TXT ownership registry beside them;
+   * cert-manager writes one `_acme-challenge` TXT record per order and deletes
+   * it again. Sharing a role would give each of them the other's permissions
+   * for the lifetime of the cluster, and the interesting half of that is
+   * cert-manager gaining the ability to rewrite the very A record external-dns
+   * publishes.
+   *
+   * **Why the conditions matter more than the resource.** `hostedzone/<id>` is
+   * the only resource ARN `route53:ChangeResourceRecordSets` accepts, and
+   * within a zone it permits every record — including the `NS` and `SOA`
+   * records that delegate the domain. The
+   * `route53:ChangeResourceRecordSetsRecordTypes` condition is what stops a
+   * compromised controller from taking the domain off the internet, and it
+   * costs nothing: neither controller writes either type.
+   *
+   * **What is still wide.** Three list actions support no resource-level
+   * permission at all and are granted on `*`, per CLAUDE.md's rule about
+   * documenting a wildcard. They are reads of zone metadata, and
+   * `ListHostedZonesByName` is load-bearing: the ClusterIssuer deliberately
+   * does not pin `hostedZoneID`, so cert-manager resolves the zone by name.
+   */
+  private addDnsControllerRoles(options: ClusterDnsOptions): {
+    readonly externalDns: iam.Role;
+    readonly certManager: iam.Role;
+  } {
+    const zoneIds = options.hostedZoneIds;
+
+    if (zoneIds.length === 0) {
+      throw new Error(
+        'EksStack: dns.hostedZoneIds is empty. Leave `dns` unset for a cluster with no ' +
+          'external-dns or cert-manager, rather than creating two roles that can reach no zone.',
+      );
+    }
+
+    for (const zoneId of zoneIds) {
+      if (!HOSTED_ZONE_ID.test(zoneId)) {
+        throw new Error(
+          `EksStack: ${JSON.stringify(zoneId)} is not a Route 53 hosted zone ID. Expected the ` +
+            'zone ID itself (`Z0123456789ABCDEFGHIJ`, from `aws route53 list-hosted-zones`), not ' +
+            'the domain name and not a `/hostedzone/` prefix — an ARN built from either produces ' +
+            'a policy that matches nothing and denies every write with no indication why.',
+        );
+      }
+    }
+
+    // Route 53 is a global service: its ARNs carry no region and no account.
+    const zoneArns = zoneIds.map((zoneId) => `arn:${this.partition}:route53:::hostedzone/${zoneId}`);
+
+    const externalDns = this.addIrsaRole('ExternalDnsRole', {
+      namespace: options.externalDnsNamespace ?? EXTERNAL_DNS_NAMESPACE,
+      serviceAccountName: options.externalDnsServiceAccountName ?? EXTERNAL_DNS_SERVICE_ACCOUNT,
+      // Named rather than generated, because the Argo CD Application annotates
+      // its service account with this ARN and the two have to agree.
+      roleName: `${this.envName}-external-dns`,
+      description: `external-dns for the ${this.envName} EKS cluster`,
+      inlinePolicyStatements: [
+        new iam.PolicyStatement({
+          sid: 'PublishRecordsInManagedZones',
+          actions: ['route53:ChangeResourceRecordSets'],
+          resources: zoneArns,
+          conditions: {
+            // `ForAllValues` because the key is multi-valued: one change batch
+            // may carry several records, and every one of them has to be a type
+            // on this list for the call to be authorised.
+            'ForAllValues:StringEquals': {
+              'route53:ChangeResourceRecordSetsRecordTypes': EXTERNAL_DNS_RECORD_TYPES,
+            },
+          },
+        }),
+        new iam.PolicyStatement({
+          sid: 'ReadZoneInventory',
+          // Documented wildcard, per CLAUDE.md. None of these three supports a
+          // resource ARN — `route53:ListHostedZones` with one returns an access
+          // denied for every zone, the ones the ARN names included — and
+          // external-dns has to enumerate zones to decide which of them its
+          // `domainFilters` select.
+          actions: [
+            'route53:ListHostedZones',
+            'route53:ListResourceRecordSets',
+            'route53:ListTagsForResource',
+          ],
+          resources: ['*'],
+        }),
+      ],
+    });
+
+    const certManager = this.addIrsaRole('CertManagerRole', {
+      namespace: options.certManagerNamespace ?? CERT_MANAGER_NAMESPACE,
+      serviceAccountName: options.certManagerServiceAccountName ?? CERT_MANAGER_SERVICE_ACCOUNT,
+      roleName: `${this.envName}-cert-manager`,
+      description: `cert-manager DNS-01 solver for the ${this.envName} EKS cluster`,
+      inlinePolicyStatements: [
+        new iam.PolicyStatement({
+          sid: 'SolveAcmeChallenges',
+          actions: ['route53:ChangeResourceRecordSets'],
+          resources: zoneArns,
+          conditions: {
+            'ForAllValues:StringEquals': {
+              'route53:ChangeResourceRecordSetsRecordTypes': CERT_MANAGER_RECORD_TYPES,
+            },
+            // Narrower than the record type alone: without this, cert-manager
+            // could rewrite any TXT record in the zone — including the ownership
+            // registry external-dns uses to decide which records are its own.
+            'ForAllValues:StringLike': {
+              'route53:ChangeResourceRecordSetsNormalizedRecordNames':
+                ACME_CHALLENGE_RECORD_NAMES,
+            },
+          },
+        }),
+        new iam.PolicyStatement({
+          sid: 'PollChangePropagation',
+          // `route53:GetChange` takes a change ID, which does not exist until
+          // the change is submitted, so `change/*` is the only resource that can
+          // be written here — this is Route 53's own documented shape for it
+          // rather than a wildcard chosen for convenience.
+          actions: ['route53:GetChange'],
+          resources: [`arn:${this.partition}:route53:::change/*`],
+        }),
+        new iam.PolicyStatement({
+          sid: 'ResolveZoneByName',
+          // Documented wildcard, per CLAUDE.md. Supports no resource-level
+          // permission, and is what lets the ClusterIssuer omit `hostedZoneID`
+          // — see `k8s/cert-manager/<environment>/cluster-issuer.yaml`.
+          actions: ['route53:ListHostedZonesByName'],
+          resources: ['*'],
+        }),
+      ],
+    });
+
+    return { externalDns, certManager };
   }
 
   /**

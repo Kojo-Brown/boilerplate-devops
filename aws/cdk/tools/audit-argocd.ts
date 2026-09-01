@@ -144,20 +144,64 @@ export const PREEXISTING_NAMESPACES: readonly string[] = [
 /**
  * Cluster-scoped kinds the platform project may create.
  *
- * `APIService` registers `v1beta1.metrics.k8s.io` with the aggregation layer,
- * and the two RBAC kinds are what let the API server delegate authentication to
- * the add-on. Adding an entry widens what a compromised upstream chart can do,
- * so the list lives in code with a reason attached rather than in the manifests
- * it checks — the same shape as `lib/checkov-suppressions.ts`.
+ * Adding an entry widens what a compromised upstream chart can do to the whole
+ * cluster, so the list lives in code with a reason attached rather than in the
+ * manifests it checks — the same shape as `lib/checkov-suppressions.ts`.
+ *
+ *   APIService                     metrics-server's aggregation-layer
+ *                                  registration for `v1beta1.metrics.k8s.io`
+ *   ClusterRole/ClusterRoleBinding every add-on creates them; for metrics-server
+ *                                  also the `system:auth-delegator` binding that
+ *                                  lets the API server delegate authn to it
+ *   CustomResourceDefinition       cert-manager's. The widest entry here: a CRD
+ *                                  is a new API, and a chart that may define one
+ *                                  may define any of them
+ *   Validating/MutatingWebhookConfiguration
+ *                                  cert-manager's admission webhooks and
+ *                                  ingress-nginx's. A mutating webhook can
+ *                                  rewrite every object it matches
+ *   IngressClass                   ingress-nginx's `nginx` class
+ *   ClusterIssuer                  the ACME issuer in `k8s/cert-manager/`
+ *   Namespace                      the namespaces `CreateNamespace=true`
+ *                                  creates, and the one kind here that must
+ *                                  additionally be restricted by `name` — see
+ *                                  {@link NAME_RESTRICTED_PLATFORM_KINDS}
  */
 export const PLATFORM_CLUSTER_KINDS: readonly string[] = [
   'apiregistration.k8s.io/APIService',
   'rbac.authorization.k8s.io/ClusterRole',
   'rbac.authorization.k8s.io/ClusterRoleBinding',
+  'apiextensions.k8s.io/CustomResourceDefinition',
+  'admissionregistration.k8s.io/ValidatingWebhookConfiguration',
+  'admissionregistration.k8s.io/MutatingWebhookConfiguration',
+  'networking.k8s.io/IngressClass',
+  'cert-manager.io/ClusterIssuer',
+  '/Namespace',
 ];
 
-/** Semantic version with no range operator. Chart revisions are exact. */
-const EXACT_CHART_VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+/**
+ * Kinds the platform project may permit only when the entry names the specific
+ * resource, rather than the kind as a whole.
+ *
+ * `Namespace` is the only one, and the distinction is not decorative: these
+ * Applications prune, so a project permitting `Namespace` unrestricted may
+ * delete any namespace in the cluster — `kube-system` included — the moment a
+ * refactor moves a file. The workload project has always been held to naming
+ * its namespace; this holds the privileged project to the same rule.
+ */
+export const NAME_RESTRICTED_PLATFORM_KINDS: readonly string[] = ['/Namespace'];
+
+/**
+ * Semantic version with no range operator. Chart revisions are exact.
+ *
+ * The optional `v` is not laxity. A chart may publish its versions with the
+ * prefix its releases carry — cert-manager's are `v1.21.1` — and writing
+ * `1.21.1` for one of those is a *constraint* Helm re-resolves rather than the
+ * exact version the repository index lists. What this still refuses is
+ * everything that can move: `^1.21`, `~1.21.1`, `>=1.21`, `*`, and a bare
+ * `1.21`.
+ */
+const EXACT_CHART_VERSION = /^v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 
 /** What Argo CD considers a possible manifest in a directory-type Application. */
 const MANIFEST_FILE = /\.(ya?ml|json)$/;
@@ -606,6 +650,22 @@ export const auditProject = (manifest: ManifestDocument): Violation[] => {
             'not in PLATFORM_CLUSTER_KINDS in tools/audit-argocd.ts. That list is the ceiling on ' +
             'what an upstream add-on chart can do to this cluster, so widening it belongs in a ' +
             'diff with a reason attached rather than in a chart bump.',
+        });
+        continue;
+      }
+
+      if (
+        NAME_RESTRICTED_PLATFORM_KINDS.includes(identifier) &&
+        asString(resource.name) === undefined
+      ) {
+        violations.push({
+          rule: 'cluster-scope-escalation',
+          file,
+          message:
+            `project \`${name}\` permits \`${identifier}\` without restricting it by \`name\`. ` +
+            'Every Application in this project prunes, so an unrestricted kind here is not only ' +
+            'what an add-on may create — it is what a moved file may delete, and for `Namespace` ' +
+            'that includes `kube-system`. Name the namespaces the Applications actually create.',
         });
       }
     }

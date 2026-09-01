@@ -3,9 +3,10 @@ name: app
 description: >-
   A stateless HTTP service on EKS: Deployment, Service, ServiceAccount wired for
   IRSA, a configuration ConfigMap, a PodDisruptionBudget, a
-  HorizontalPodAutoscaler, and a default-deny NetworkPolicy with an explicit
-  allowlist. Every value is constrained by values.schema.json, and every
-  environment supplies its own values file.
+  HorizontalPodAutoscaler, a default-deny NetworkPolicy with an explicit
+  allowlist, and a TLS-only Ingress whose certificate cert-manager issues and
+  renews and whose DNS record external-dns publishes. Every value is constrained
+  by values.schema.json, and every environment supplies its own values file.
 type: application
 
 # `version` is the chart's own version and `appVersion` is the default version
@@ -14,7 +15,7 @@ type: application
 # application is the reverse. Chart consumers pin `version`; `image.tag` — not
 # `appVersion` — is what actually selects the image, because appVersion is
 # chart metadata and cannot be set per environment.
-version: 0.4.0
+version: 0.5.0
 appVersion: "0.1.0"
 
 # The floor is a real constraint, not a formality:
@@ -22,6 +23,7 @@ appVersion: "0.1.0"
 #   • autoscaling/v2 HPA, `behavior`   1.23
 #   • `minDomains` on spread, PDB      1.25+ semantics
 #   • networking.k8s.io/v1 NetworkPolicy   1.7; `endPort` (1.25) is not used
+#   • networking.k8s.io/v1 Ingress, `ingressClassName`   1.19
 #   • EKS supports 1.28 and later on the standard support calendar
 # `-0` makes the constraint match pre-release versions of 1.28 too, which is
 # how EKS reports some of its patched control planes. Without it a cluster
