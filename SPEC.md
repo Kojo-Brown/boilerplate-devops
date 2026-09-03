@@ -590,7 +590,7 @@ rather than supported, since a wildcard SAN is a decision about the issuer and
 the solver's zone scope rather than a longer hostname.
 
 ## Phase 9 — Supply-Chain Security
-- [ ] SBOM generation (CycloneDX) attached to every release artifact
+- [x] SBOM generation (CycloneDX) attached to every release artifact — the two templates that publish anything, `docker-build-push.yml` (image → ECR) and `deploy-static-site.yml` (bundle → S3), inventoried neither. Both now scan with Syft pinned to v1.51.1, verify, and attach before the artifact ships; the image SBOM goes into ECR as an OCI 1.1 referrer via `oras attach`, since a workflow artifact expires after 90 days and the image does not. Four near-misses drove the design, each of which looks healthy: `anchore/sbom-action`'s `format` input **defaults to `spdx-json`**, so an omitted line produces a good SBOM in the wrong format; a scan of the source tree cannot see the base image's OS packages, where most CVEs are; a scan after the push gates nothing; and Syft exits 0 with a schema-valid `"components": []` when it finds nothing at all, which passes every other check in the pipeline. `aws/cdk/tools/audit-sbom.ts` (8 rules, 66 tests) is the gate, and it caught a real gap in the static-site template while being written. `sbom.yml` is a new reusable workflow for artifacts neither template builds and is where release-asset upload lives, because that needs `contents: write`. Nothing here signs anything — the next two items are what make the inventory trustworthy (PR #41)
 - [ ] Container image signing with cosign + verification enforced at deploy
 - [ ] SLSA provenance attestation in the build workflow
 - [ ] Dependency pinning by digest for Actions and base images
