@@ -1,3 +1,19 @@
+# Build a container image, inventory it, and push both to ECR.
+#
+# The SBOM is generated from the built image *before* the push, so an image
+# whose contents cannot be inventoried never becomes a release. It is then
+# attached to the pushed image as an OCI referrer, which is what makes it travel
+# with the artifact: a workflow artifact expires after 90 days, an image in ECR
+# does not, and the thing an incident responder has in front of them when the
+# next Log4Shell lands is the image.
+#
+# Scanning the *image* rather than the source tree is the whole point. A scan of
+# `.` reports what the repository declares — it cannot see the base image's OS
+# packages, anything a `RUN apt-get install` added, or a dependency the build
+# vendored in. Those are the layers CVEs are usually found in.
+#
+# See docs/sbom.md.
+
 name: Docker Build & Push to ECR
 
 on:
@@ -12,19 +28,45 @@ on:
       dockerfile:
         type: string
         default: Dockerfile
+      sbom-retention-days:
+        description: "Days to keep the SBOM as a workflow artifact. The copy attached to the image in ECR does not expire."
+        type: number
+        default: 90
+
     secrets:
       AWS_ROLE_ARN:
         required: true
 
+    # Job-level `outputs:` are not visible to a caller of a reusable workflow —
+    # they have to be re-declared here. Without this block `image-uri` was
+    # unreachable from the calling workflow, and the SBOM digest would be too.
+    outputs:
+      image-uri:
+        description: "Fully qualified URI of the image that was pushed"
+        value: ${{ jobs.build-push.outputs.image-uri }}
+      sbom-referrer-digest:
+        description: "Digest of the SBOM manifest attached to the image, for verifying the inventory a deploy was gated on"
+        value: ${{ jobs.build-push.outputs.sbom-referrer-digest }}
+
 permissions:
   id-token: write
   contents: read
+
+env:
+  # Pinned so the inventory is reproducible: two runs of the same commit should
+  # not disagree about what is in the image because the scanner moved underneath
+  # them. v1.51.1 is also sbom-action v0.24.2's own default — pinning it here
+  # keeps that true after the action is bumped.
+  SYFT_VERSION: v1.51.1
+  ORAS_VERSION: 1.3.4
+  SBOM_FILE: sbom.cdx.json
 
 jobs:
   build-push:
     runs-on: ubuntu-latest
     outputs:
       image-uri: ${{ steps.build.outputs.image-uri }}
+      sbom-referrer-digest: ${{ steps.attach-sbom.outputs.referrer-digest }}
     steps:
       - uses: actions/checkout@v4
 
@@ -38,15 +80,148 @@ jobs:
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build and push
+      # Build only. The push is a separate step below so that everything between
+      # the two — the inventory and its verification — gates the release.
+      - name: Build image
         id: build
         env:
           REGISTRY: ${{ steps.ecr-login.outputs.registry }}
           IMAGE: ${{ inputs.image-name }}
           SHA: ${{ github.sha }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
         run: |
           IMAGE_URI="$REGISTRY/$IMAGE:$SHA"
-          docker build -f "${{ inputs.dockerfile }}" -t "$IMAGE_URI" -t "$REGISTRY/$IMAGE:latest" .
+          docker build -f "$DOCKERFILE" -t "$IMAGE_URI" -t "$REGISTRY/$IMAGE:latest" .
+          echo "image-uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+
+      # oras reads ~/.docker/config.json, which amazon-ecr-login has already
+      # populated for this registry, so `oras attach` needs no separate login.
+      - name: Install ORAS
+        uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
+        with:
+          version: ${{ env.ORAS_VERSION }}
+
+      # Syft resolves a bare image reference against the local Docker daemon
+      # first, so this inventories the image just built rather than pulling
+      # whatever the registry happens to hold under that tag.
+      - name: Generate CycloneDX SBOM
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        with:
+          image: ${{ steps.build.outputs.image-uri }}
+          format: cyclonedx-json
+          output-file: ${{ env.SBOM_FILE }}
+          syft-version: ${{ env.SYFT_VERSION }}
+          upload-artifact: true
+          artifact-name: ${{ env.SBOM_FILE }}
+          upload-artifact-retention: ${{ inputs.sbom-retention-days }}
+
+      # Syft exits 0 and writes a schema-valid CycloneDX document when it finds
+      # nothing at all — a mistyped reference, a scratch image, a source it does
+      # not understand all produce `"components": []`. Every gate downstream of
+      # here would pass on that file, and the SBOM would be worthless in exactly
+      # the situation it exists for. Assert the document is what it claims to be
+      # and that it actually found something before the image ships.
+      - name: Verify SBOM
+        env:
+          IMAGE_URI: ${{ steps.build.outputs.image-uri }}
+        run: |
+          set -euo pipefail
+
+          jq empty "$SBOM_FILE"
+
+          FORMAT=$(jq -r '.bomFormat // ""' "$SBOM_FILE")
+          if [ "$FORMAT" != "CycloneDX" ]; then
+            echo "::error::$SBOM_FILE has bomFormat '$FORMAT', expected 'CycloneDX'."
+            exit 1
+          fi
+
+          SPEC=$(jq -r '.specVersion // ""' "$SBOM_FILE")
+          if [ -z "$SPEC" ]; then
+            echo "::error::$SBOM_FILE declares no specVersion."
+            exit 1
+          fi
+
+          COMPONENTS=$(jq '.components | length' "$SBOM_FILE")
+          if [ "$COMPONENTS" -eq 0 ]; then
+            echo "::error::$SBOM_FILE lists no components. Syft found nothing in $IMAGE_URI."
+            echo "::error::A scratch or distroless image with a statically linked binary is the"
+            echo "::error::one legitimate cause; anything else means the scan missed the image."
+            exit 1
+          fi
+
+          # The SBOM names its subject in metadata.component. If that is not the
+          # image just built, the file describes something else and attaching it
+          # to this image would be a lie told with a valid document.
+          SUBJECT=$(jq -r '.metadata.component.name // ""' "$SBOM_FILE")
+          if [ -z "$SUBJECT" ]; then
+            # Checked separately: an empty subject would match the glob below
+            # and pass, which is the one way this assertion could be vacuous.
+            echo "::error::$SBOM_FILE names no subject in metadata.component.name."
+            exit 1
+          fi
+          case "$IMAGE_URI" in
+            *"$SUBJECT"*) ;;
+            *)
+              echo "::error::$SBOM_FILE describes '$SUBJECT', which is not part of $IMAGE_URI."
+              exit 1
+              ;;
+          esac
+
+          echo "CycloneDX $SPEC, $COMPONENTS components, subject '$SUBJECT'."
+
+      - name: Push image
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE: ${{ inputs.image-name }}
+          IMAGE_URI: ${{ steps.build.outputs.image-uri }}
+        run: |
+          set -euo pipefail
           docker push "$IMAGE_URI"
           docker push "$REGISTRY/$IMAGE:latest"
-          echo "image-uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+
+      # `oras attach` writes the SBOM as a separate manifest whose `subject` is
+      # the image manifest, so `oras discover` finds it from the image alone and
+      # a `docker pull` is unaffected. ORAS negotiates the OCI 1.1 Referrers API
+      # and falls back to the referrers-tag schema on registries that predate it;
+      # ECR supports the API directly.
+      - name: Attach SBOM to the image
+        id: attach-sbom
+        env:
+          IMAGE_URI: ${{ steps.build.outputs.image-uri }}
+        run: |
+          set -euo pipefail
+          oras attach \
+            --artifact-type application/vnd.cyclonedx+json \
+            --export-manifest referrer-manifest.json \
+            "$IMAGE_URI" \
+            "$SBOM_FILE:application/vnd.cyclonedx+json"
+
+          # An OCI digest is the hash over the manifest's exact bytes, which is
+          # what --export-manifest writes. Deriving it here rather than parsing
+          # `oras attach --format go-template` keeps this off ORAS's experimental
+          # output flags, which carry no compatibility promise.
+          REFERRER_DIGEST="sha256:$(sha256sum referrer-manifest.json | cut -d ' ' -f 1)"
+          echo "referrer-digest=$REFERRER_DIGEST" >> "$GITHUB_OUTPUT"
+          echo "Attached $SBOM_FILE to $IMAGE_URI as $REFERRER_DIGEST"
+
+      - name: Summary
+        env:
+          IMAGE_URI: ${{ steps.build.outputs.image-uri }}
+          REFERRER_DIGEST: ${{ steps.attach-sbom.outputs.referrer-digest }}
+        run: |
+          {
+            echo "## Image published with an SBOM"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Image | \`$IMAGE_URI\` |"
+            echo "| SBOM | CycloneDX JSON, \`$(jq -r '.specVersion' "$SBOM_FILE")\` |"
+            echo "| Components | $(jq '.components | length' "$SBOM_FILE") |"
+            echo "| Referrer digest | \`$REFERRER_DIGEST\` |"
+            echo ""
+            echo "Retrieve it with:"
+            echo ""
+            echo '```bash'
+            echo "oras discover $IMAGE_URI"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

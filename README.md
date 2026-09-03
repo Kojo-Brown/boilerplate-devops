@@ -417,11 +417,36 @@ the two mistakes that survive a copy:
 | `npm run audit:flags` | Feature flags with no owner, ticket, or removal date; deadlines beyond 90 days or before the creation date; a field nothing reads; a percentage on a flag that is off, or a flag on at 0% | `aws/cdk/tools/audit-feature-flags.ts` |
 | `npm run audit:helm` | Chart values that fail the schema once merged; a schema object that accepts unknown keys and so catches nothing; an environment with no values file, or a values file for one that does not exist; `key: null`, which deletes a chart default rather than overriding it; a PodDisruptionBudget that permits no drain | `aws/cdk/tools/audit-helm-values.ts` |
 | `npm run audit:argocd` | Argo CD manifests the API server accepts and Argo CD then misreads: a project that does not exist, a destination or repository the project does not permit, an Application without `selfHeal` or the cascade-delete finalizer, a chart version range, one environment rendering another's values file, a manifest in the GitOps tree that the root Application's glob does not apply | `aws/cdk/tools/audit-argocd.ts` |
+| `npm run audit:sbom` | A workflow that publishes a release artifact without inventorying it; an SBOM in SPDX (the generator's default) rather than CycloneDX; a container image inventoried from the source tree instead of the image; a scan that runs after the push and so gates nothing; an image SBOM kept only in a workflow artifact that expires; an unpinned scanner; an SBOM nothing verifies, so `"components": []` ships unnoticed | `aws/cdk/tools/audit-sbom.ts` |
 
 Placeholders must use one of the AWS documentation account IDs
 (`123456789012`, `111122223333`, …) — the scan permits those and nothing else.
 For a genuine exception, add `scan-allow: <rule-id> <reason>` to the line; a
 suppression without a reason is rejected.
+
+## Software bills of materials
+
+Every artifact these templates publish is inventoried in CycloneDX JSON before
+it ships, and the inventory travels with it: a container image gets its SBOM
+attached in ECR as an [OCI 1.1 referrer], findable with `oras discover` long
+after the build logs and the workflow artifact are gone; a static-site bundle
+gets one uploaded as a workflow artifact, and `workflow-templates/sbom.yml` will
+attach it to a GitHub Release. The image is scanned rather than the source tree,
+because a scan of `.` cannot see the base image's OS packages — the layers CVEs
+are usually found in.
+
+The scan runs *before* the push, so a build nobody can inventory never becomes a
+release, and each template asserts the document is a non-empty CycloneDX SBOM
+naming the right subject. That assertion is the point: Syft exits 0 and writes a
+schema-valid CycloneDX document when it finds nothing at all, so
+`"components": []` otherwise passes every check in the pipeline and reaches the
+registry looking like a successful scan.
+
+See [docs/sbom.md](./docs/sbom.md) for the retrieval commands, why the SBOM is
+deliberately kept out of the public site bucket, and what `npm run audit:sbom`
+can and cannot prove.
+
+[OCI 1.1 referrer]: https://github.com/opencontainers/distribution-spec/blob/main/spec.md#listing-referrers
 
 ## Trunk-based development
 
