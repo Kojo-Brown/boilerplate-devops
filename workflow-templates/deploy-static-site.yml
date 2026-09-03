@@ -28,6 +28,19 @@
 
 name: Deploy Static Site
 
+# The release artifact here is the built bundle synced to S3, and its SBOM is
+# taken from the *source tree after the build* rather than from the bundle
+# itself. That is deliberate: a bundler erases package identity, so a scan of
+# `dist/` finds a handful of minified files and no components at all, while the
+# lockfile beside it names every dependency that went in. Scanning after the
+# build rather than before means a build that rewrites the lockfile is
+# inventoried as it shipped.
+#
+# The SBOM is kept as a workflow artifact and is deliberately *not* synced to
+# the site bucket: that bucket is served to the public through CloudFront, and
+# publishing a complete dependency-and-version list there hands an attacker the
+# CVE shortlist for free. See docs/sbom.md.
+
 on:
   workflow_call:
     inputs:
@@ -83,6 +96,11 @@ on:
         type: string
         required: false
         default: "."
+      sbom-retention-days:
+        description: "Days to keep the CycloneDX SBOM as a workflow artifact (1–90)"
+        type: number
+        required: false
+        default: 90
     secrets:
       aws-role-arn:
         description: "ARN of the IAM role to assume via OIDC"
@@ -94,6 +112,12 @@ on:
       distribution-domain:
         description: "CloudFront domain name (*.cloudfront.net)"
         value: ${{ jobs.deploy.outputs.distribution-domain }}
+
+env:
+  # v1.51.1 is also sbom-action v0.24.2's own default — pinning it here keeps
+  # that true after the action is bumped.
+  SYFT_VERSION: v1.51.1
+  SBOM_FILE: sbom.cdx.json
 
 jobs:
   deploy:
@@ -155,6 +179,64 @@ jobs:
             exit 1
           fi
           find "$BUILD_DIR" -maxdepth 1 -printf '%10s  %p\n' | head -20
+
+      # ── Software bill of materials ────────────────────────────────────────────
+      # Generated before the first `aws s3 sync` so that a bundle nobody can
+      # inventory never reaches the bucket. Syft is pinned for the same reason
+      # the lockfile is: two runs of one commit must not disagree about what
+      # shipped because the scanner moved underneath them.
+      - name: Generate CycloneDX SBOM
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        with:
+          path: ${{ inputs.working-directory }}
+          format: cyclonedx-json
+          output-file: ${{ env.SBOM_FILE }}
+          syft-version: ${{ env.SYFT_VERSION }}
+          upload-artifact: true
+          artifact-name: sbom-${{ inputs.environment }}.cdx.json
+          upload-artifact-retention: ${{ inputs.sbom-retention-days }}
+          # Nothing here cuts a GitHub Release, and the default would make every
+          # deploy try to and log a failure nobody acts on.
+          upload-release-assets: false
+
+      # Syft exits 0 and writes a schema-valid CycloneDX document when it finds
+      # nothing — a wrong `working-directory`, a lockfile format it does not
+      # understand, an install that never ran. `"components": []` passes every
+      # other check in this file, so assert the document is what it claims to be
+      # and that it actually found something.
+      - name: Verify SBOM
+        env:
+          SCANNED_PATH: ${{ inputs.working-directory }}
+        run: |
+          set -euo pipefail
+
+          jq empty "$SBOM_FILE"
+
+          FORMAT=$(jq -r '.bomFormat // ""' "$SBOM_FILE")
+          if [ "$FORMAT" != "CycloneDX" ]; then
+            echo "::error::$SBOM_FILE has bomFormat '$FORMAT', expected 'CycloneDX'."
+            exit 1
+          fi
+
+          SPEC=$(jq -r '.specVersion // ""' "$SBOM_FILE")
+          if [ -z "$SPEC" ]; then
+            echo "::error::$SBOM_FILE declares no specVersion."
+            exit 1
+          fi
+
+          COMPONENTS=$(jq '.components | length' "$SBOM_FILE")
+          if [ "$COMPONENTS" -eq 0 ]; then
+            echo "::error::$SBOM_FILE lists no components. Syft found no packages under"
+            echo "::error::'$SCANNED_PATH' — check that the lockfile is committed and that"
+            echo "::error::'working-directory' points at the project root."
+            exit 1
+          fi
+
+          # Exported so the deployment summary below can tie this deploy to the
+          # exact inventory that gated it.
+          SBOM_SHA=$(sha256sum "$SBOM_FILE" | cut -d ' ' -f 1)
+          echo "SBOM_SHA256=$SBOM_SHA" >> "$GITHUB_ENV"
+          echo "CycloneDX $SPEC, $COMPONENTS components, sha256:$SBOM_SHA"
 
       # ── AWS credentials via OIDC ──────────────────────────────────────────────
       - name: Configure AWS credentials (OIDC)
@@ -271,4 +353,6 @@ jobs:
             echo "| Invalidation | \`${{ steps.invalidate.outputs.invalidation-id }}\` |"
             echo "| Site URL | ${{ steps.site-info.outputs.site-url }} |"
             echo "| Commit | \`${{ github.sha }}\` |"
+            echo "| SBOM | \`sbom-${{ inputs.environment }}.cdx.json\` (CycloneDX, $(jq '.components | length' "$SBOM_FILE") components) |"
+            echo "| SBOM sha256 | \`$SBOM_SHA256\` |"
           } >> "$GITHUB_STEP_SUMMARY"

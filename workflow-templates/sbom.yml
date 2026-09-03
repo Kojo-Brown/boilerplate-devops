@@ -1,0 +1,271 @@
+# Generate a CycloneDX SBOM for a release artifact and attach it to the artifact.
+#
+# `docker-build-push.yml` and `deploy-static-site.yml` already inventory what
+# they publish, inline, because they hold the artifact in the same job. This
+# workflow is for everything else: a release you cut from a tag, an image built
+# by a pipeline this repository does not own, a bundle produced somewhere else.
+#
+# Two attachment targets, because "attached" means different things:
+#
+#   image      the SBOM is pushed to the registry as an OCI referrer of the
+#              image manifest. `oras discover` finds it from the image alone, so
+#              the inventory survives the workflow, the runner, and the repo.
+#
+#   directory  the SBOM is uploaded as a workflow artifact and, when the caller
+#              asks for it, as an asset on the GitHub Release for the current
+#              tag — the only durable home a directory-shaped release has.
+#
+# Release-asset upload needs `contents: write`, which is why it lives here and
+# not in the deploy templates: a deploy workflow that can rewrite the repository
+# is a much larger blast radius than a deploy workflow that cannot.
+#
+# Usage. GitHub only resolves `uses:` against `.github/workflows/`, so copy this
+# file there — in the consuming repository, or in whichever repository holds
+# your shared workflows — and call it by that path:
+#
+#   jobs:
+#     sbom:
+#       uses: <owner>/<repo>/.github/workflows/sbom.yml@main
+#       with:
+#         artifact-kind: image
+#         image: 111122223333.dkr.ecr.us-east-1.amazonaws.com/api:${{ github.sha }}
+#         aws-region: us-east-1
+#       secrets:
+#         aws-role-arn: ${{ secrets.AWS_ROLE_ARN }}
+#
+# See docs/sbom.md.
+
+name: SBOM
+
+on:
+  workflow_call:
+    inputs:
+      artifact-kind:
+        description: "What is being inventoried: 'image' (a container image) or 'directory' (a source tree or bundle)"
+        type: string
+        required: true
+      image:
+        description: "Image reference to scan and attach to. Required when artifact-kind is 'image'."
+        type: string
+        required: false
+        default: ""
+      path:
+        description: "Directory to scan. Required when artifact-kind is 'directory'."
+        type: string
+        required: false
+        default: "."
+      aws-region:
+        description: "Region of the ECR registry holding the image. Only used when artifact-kind is 'image'."
+        type: string
+        required: false
+        default: "us-east-1"
+      attach-to-release:
+        description: "Upload the SBOM as an asset on the GitHub Release for the current tag. Only used when artifact-kind is 'directory'."
+        type: boolean
+        required: false
+        default: false
+      retention-days:
+        description: "Days to keep the SBOM as a workflow artifact (1–90)"
+        type: number
+        required: false
+        default: 90
+    secrets:
+      aws-role-arn:
+        description: "ARN of the IAM role to assume via OIDC. Required when artifact-kind is 'image'."
+        required: false
+    outputs:
+      sbom-artifact:
+        description: "Name of the workflow artifact holding the SBOM"
+        value: ${{ jobs.sbom.outputs.sbom-artifact }}
+      sbom-sha256:
+        description: "SHA-256 of the SBOM file, so a caller can pin the exact inventory"
+        value: ${{ jobs.sbom.outputs.sbom-sha256 }}
+
+env:
+  # v1.51.1 is also sbom-action v0.24.2's own default — pinning it here keeps
+  # that true after the action is bumped.
+  SYFT_VERSION: v1.51.1
+  ORAS_VERSION: 1.3.4
+  SBOM_FILE: sbom.cdx.json
+
+jobs:
+  sbom:
+    name: CycloneDX SBOM
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      # `id-token` for the ECR OIDC role; `contents: write` for the release
+      # asset. Both are unconditional because GitHub resolves `permissions:`
+      # before any input is read, and a job cannot narrow them at run time.
+      # A caller that inventories directories and never cuts releases should
+      # copy this file and delete both.
+      id-token: write
+      contents: write
+    outputs:
+      sbom-artifact: ${{ steps.name.outputs.artifact }}
+      sbom-sha256: ${{ steps.verify.outputs.sha256 }}
+
+    steps:
+      # Reject a contradictory call up front. Without this the run reaches the
+      # scan step, syft is handed an empty reference, and the failure reads as a
+      # scanner problem rather than a caller problem.
+      - name: Validate inputs
+        env:
+          KIND: ${{ inputs.artifact-kind }}
+          IMAGE: ${{ inputs.image }}
+          SCAN_PATH: ${{ inputs.path }}
+        run: |
+          set -euo pipefail
+          case "$KIND" in
+            image)
+              if [ -z "$IMAGE" ]; then
+                echo "::error::artifact-kind 'image' requires the 'image' input."
+                exit 1
+              fi
+              ;;
+            directory)
+              if [ -z "$SCAN_PATH" ]; then
+                echo "::error::artifact-kind 'directory' requires the 'path' input."
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error::artifact-kind must be 'image' or 'directory', got '$KIND'."
+              exit 1
+              ;;
+          esac
+
+      - name: Checkout
+        if: inputs.artifact-kind == 'directory'
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        if: inputs.artifact-kind == 'image'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.aws-role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+          role-session-name: sbom-${{ github.run_id }}
+
+      # Also populates ~/.docker/config.json, which is where ORAS looks for
+      # registry credentials — `oras attach` below needs no separate login.
+      - name: Login to ECR
+        if: inputs.artifact-kind == 'image'
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Install ORAS
+        if: inputs.artifact-kind == 'image'
+        uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.1
+        with:
+          version: ${{ env.ORAS_VERSION }}
+
+      - name: Resolve artifact name
+        id: name
+        env:
+          KIND: ${{ inputs.artifact-kind }}
+        run: |
+          set -euo pipefail
+          echo "artifact=sbom-$KIND-${{ github.run_id }}.cdx.json" >> "$GITHUB_OUTPUT"
+
+      - name: Generate CycloneDX SBOM
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        with:
+          # Exactly one of these is non-empty; syft ignores the empty one.
+          image: ${{ inputs.artifact-kind == 'image' && inputs.image || '' }}
+          path: ${{ inputs.artifact-kind == 'directory' && inputs.path || '' }}
+          format: cyclonedx-json
+          output-file: ${{ env.SBOM_FILE }}
+          syft-version: ${{ env.SYFT_VERSION }}
+          upload-artifact: true
+          artifact-name: ${{ steps.name.outputs.artifact }}
+          upload-artifact-retention: ${{ inputs.retention-days }}
+          # Handled below, conditionally, rather than on every call.
+          upload-release-assets: false
+
+      # A syft run that finds nothing still exits 0 and still writes a
+      # schema-valid CycloneDX document. `"components": []` satisfies every
+      # other check here and every consumer downstream, and it is the shape a
+      # mistyped reference or an unrecognised ecosystem produces. Fail on it.
+      - name: Verify SBOM
+        id: verify
+        run: |
+          set -euo pipefail
+
+          jq empty "$SBOM_FILE"
+
+          FORMAT=$(jq -r '.bomFormat // ""' "$SBOM_FILE")
+          if [ "$FORMAT" != "CycloneDX" ]; then
+            echo "::error::$SBOM_FILE has bomFormat '$FORMAT', expected 'CycloneDX'."
+            exit 1
+          fi
+
+          SPEC=$(jq -r '.specVersion // ""' "$SBOM_FILE")
+          if [ -z "$SPEC" ]; then
+            echo "::error::$SBOM_FILE declares no specVersion."
+            exit 1
+          fi
+
+          COMPONENTS=$(jq '.components | length' "$SBOM_FILE")
+          if [ "$COMPONENTS" -eq 0 ]; then
+            echo "::error::$SBOM_FILE lists no components — the scan found nothing."
+            exit 1
+          fi
+
+          SHA=$(sha256sum "$SBOM_FILE" | cut -d ' ' -f 1)
+          {
+            echo "sha256=$SHA"
+            echo "components=$COMPONENTS"
+            echo "spec=$SPEC"
+          } >> "$GITHUB_OUTPUT"
+          echo "CycloneDX $SPEC, $COMPONENTS components, sha256:$SHA"
+
+      - name: Attach SBOM to the image
+        if: inputs.artifact-kind == 'image'
+        env:
+          IMAGE: ${{ inputs.image }}
+        run: |
+          set -euo pipefail
+          oras attach \
+            --artifact-type application/vnd.cyclonedx+json \
+            --export-manifest referrer-manifest.json \
+            "$IMAGE" \
+            "$SBOM_FILE:application/vnd.cyclonedx+json"
+
+          # An OCI digest is the hash over the manifest's exact bytes, which is
+          # what --export-manifest writes. Deriving it here keeps this off ORAS's
+          # experimental output-format flags, which carry no compatibility
+          # promise.
+          echo "Attached as sha256:$(sha256sum referrer-manifest.json | cut -d ' ' -f 1)"
+
+      # `gh release upload` needs a release to exist, which is only true on a
+      # tag the caller has already released. `--clobber` makes a re-run of the
+      # same tag replace the asset rather than fail on the second attempt.
+      - name: Attach SBOM to the GitHub Release
+        if: inputs.artifact-kind == 'directory' && inputs.attach-to-release && startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          ARTIFACT: ${{ steps.name.outputs.artifact }}
+        run: |
+          set -euo pipefail
+          cp "$SBOM_FILE" "$ARTIFACT"
+          gh release upload "$TAG" "$ARTIFACT" --clobber
+
+      - name: Summary
+        env:
+          KIND: ${{ inputs.artifact-kind }}
+          SUBJECT: ${{ inputs.artifact-kind == 'image' && inputs.image || inputs.path }}
+          ARTIFACT: ${{ steps.name.outputs.artifact }}
+        run: |
+          {
+            echo "## CycloneDX SBOM"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Kind | \`$KIND\` |"
+            echo "| Subject | \`$SUBJECT\` |"
+            echo "| Spec version | ${{ steps.verify.outputs.spec }} |"
+            echo "| Components | ${{ steps.verify.outputs.components }} |"
+            echo "| Workflow artifact | \`$ARTIFACT\` |"
+            echo "| sha256 | \`${{ steps.verify.outputs.sha256 }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

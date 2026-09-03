@@ -13,6 +13,7 @@
     "audit:flags": "ts-node tools/audit-feature-flags.ts",
     "audit:helm": "ts-node tools/audit-helm-values.ts",
     "audit:argocd": "ts-node tools/audit-argocd.ts",
+    "audit:sbom": "ts-node tools/audit-sbom.ts",
     "cdk": "cdk"
   },
   "devDependencies": {
