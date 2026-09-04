@@ -108,6 +108,17 @@ jobs:
       - name: Audit SBOM coverage of release artifacts
         run: npm run audit:sbom
 
+      # An image nobody signed and an image nobody verifies are both perfectly
+      # green pipelines. So is the middle case that actually happens: a deploy
+      # that runs `cosign verify --certificate-identity-regexp '.*'`, which
+      # asserts that somebody signed the image — a property anyone with a GitHub
+      # account can arrange for an image of their own. This also holds the two
+      # halves in step, since a signature made over a tag, or a deploy that
+      # verifies a digest and then ships a tag, verifies something other than
+      # what runs. See docs/image-signing.md.
+      - name: Audit image signing and deploy-time verification
+        run: npm run audit:signing
+
       # Synth runs before the suite deliberately. It is the build step and takes
       # seconds, while the suite takes minutes; ordering it first means a test
       # failure never hides whether the app still synthesises.
