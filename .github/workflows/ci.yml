@@ -34,7 +34,7 @@ jobs:
         working-directory: aws/cdk
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -148,7 +148,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install actionlint
         env:
@@ -191,7 +191,7 @@ jobs:
       KUBE_VERSION: "1.33.0"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # The chart's schema is enforced at deploy time by Helm's own validator,
       # which is a different implementation of JSON Schema from the ajv one the
@@ -213,7 +213,7 @@ jobs:
     needs: cdk
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
         uses: actions/setup-python@v5

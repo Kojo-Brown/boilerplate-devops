@@ -178,7 +178,7 @@ jobs:
           fi
 
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -460,7 +460,7 @@ jobs:
       # Only the two shell scripts are needed, not the branch under review —
       # which by now may not exist.
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           sparse-checkout: .github/scripts
           sparse-checkout-cone-mode: false
