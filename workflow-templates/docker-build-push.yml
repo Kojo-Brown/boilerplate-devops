@@ -12,7 +12,17 @@
 # packages, anything a `RUN apt-get install` added, or a dependency the build
 # vendored in. Those are the layers CVEs are usually found in.
 #
-# See docs/sbom.md.
+# The image is then signed, keylessly, with the run's own GitHub OIDC identity,
+# and the signature is verified before the workflow reports success. Signing is
+# the only step here that has to happen *after* the push — there is no manifest
+# to sign until the registry holds one — which is the mirror image of the SBOM's
+# ordering and the reason the two gates read the workflow in opposite directions.
+#
+# The signature is made over the digest, never the tag. `cosign sign app:v1`
+# resolves the tag and signs whatever it pointed at, which is a different
+# statement from "this run signed the image this run built".
+#
+# See docs/sbom.md and docs/image-signing.md.
 
 name: Docker Build & Push to ECR
 
@@ -32,6 +42,17 @@ on:
         description: "Days to keep the SBOM as a workflow artifact. The copy attached to the image in ECR does not expire."
         type: number
         default: 90
+      signer-identity-regexp:
+        description: >-
+          Regular expression the signing certificate's identity must match when
+          this workflow verifies its own signature. Defaults to any workflow in
+          the repository the run belongs to, which is correct when this template
+          has been copied into that repository. Set it explicitly when the
+          workflow is called from another repository: the identity is then the
+          *reusable* workflow's path in the repository that hosts it, not the
+          caller's.
+        type: string
+        default: ""
 
     secrets:
       AWS_ROLE_ARN:
@@ -47,6 +68,15 @@ on:
       sbom-referrer-digest:
         description: "Digest of the SBOM manifest attached to the image, for verifying the inventory a deploy was gated on"
         value: ${{ jobs.build-push.outputs.sbom-referrer-digest }}
+      image-digest:
+        description: "Digest of the pushed manifest, e.g. sha256:… . This is what was signed."
+        value: ${{ jobs.build-push.outputs.image-digest }}
+      image-ref:
+        description: >-
+          The image pinned by digest. Hand *this* to a deploy rather than
+          `image-uri`: a tag is a pointer, and a deploy that verifies one
+          reference and runs another has verified nothing.
+        value: ${{ jobs.build-push.outputs.image-ref }}
 
 permissions:
   id-token: write
@@ -60,6 +90,14 @@ env:
   SYFT_VERSION: v1.51.1
   ORAS_VERSION: 1.3.4
   SBOM_FILE: sbom.cdx.json
+  # The version cosign-installer v4.1.2 defaults to. Pinned explicitly so that
+  # bumping the action — a routine dependency update — cannot quietly change the
+  # binary that decides what a signature over this repository's images means.
+  COSIGN_VERSION: v3.0.6
+  # Where GitHub's OIDC tokens come from. A signature is only evidence of who
+  # made it if the issuer is pinned too: an identity string proves nothing when
+  # any issuer may assert it.
+  OIDC_ISSUER: https://token.actions.githubusercontent.com
 
 jobs:
   build-push:
@@ -67,6 +105,8 @@ jobs:
     outputs:
       image-uri: ${{ steps.build.outputs.image-uri }}
       sbom-referrer-digest: ${{ steps.attach-sbom.outputs.referrer-digest }}
+      image-digest: ${{ steps.push.outputs.image-digest }}
+      image-ref: ${{ steps.push.outputs.image-ref }}
     steps:
       - uses: actions/checkout@v4
 
@@ -169,15 +209,45 @@ jobs:
 
           echo "CycloneDX $SPEC, $COMPONENTS components, subject '$SUBJECT'."
 
+      # The digest is captured here rather than derived later because everything
+      # after this point — the signature, and every deploy that checks it —
+      # names the image by digest. `docker image inspect` would answer from the
+      # local daemon, which is the image that was *built*; the push output is
+      # the registry telling us what it stored.
       - name: Push image
+        id: push
         env:
           REGISTRY: ${{ steps.ecr-login.outputs.registry }}
           IMAGE: ${{ inputs.image-name }}
           IMAGE_URI: ${{ steps.build.outputs.image-uri }}
         run: |
           set -euo pipefail
-          docker push "$IMAGE_URI"
+          docker push "$IMAGE_URI" | tee push.log
           docker push "$REGISTRY/$IMAGE:latest"
+
+          DIGEST="$(sed -n 's/.*digest: \(sha256:[0-9a-f]\{64\}\).*/\1/p' push.log | tail -n 1)"
+          if [ -z "$DIGEST" ]; then
+            echo "::error::Could not read the pushed digest out of docker push's output." >&2
+            echo "::error::Nothing below this point can name the image safely; refusing to sign." >&2
+            exit 1
+          fi
+
+          # The daemon and the registry must agree: a mismatch means the tag was
+          # repointed between the build and the push, and the image about to be
+          # signed is not the one that was inventoried a few steps ago.
+          LOCAL_DIGEST="$(docker image inspect "$IMAGE_URI" \
+            --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+            | sed -n 's/.*@\(sha256:[0-9a-f]\{64\}\)$/\1/p' | sort -u)"
+          if [ "$(printf '%s\n' "$LOCAL_DIGEST" | grep -c .)" -ne 1 ] || [ "$LOCAL_DIGEST" != "$DIGEST" ]; then
+            echo "::error::The registry stored $DIGEST but the local image resolves to:" >&2
+            printf '%s\n' "$LOCAL_DIGEST" >&2
+            exit 1
+          fi
+
+          {
+            echo "image-digest=$DIGEST"
+            echo "image-ref=$REGISTRY/$IMAGE@$DIGEST"
+          } >> "$GITHUB_OUTPUT"
 
       # `oras attach` writes the SBOM as a separate manifest whose `subject` is
       # the image manifest, so `oras discover` finds it from the image alone and
@@ -204,24 +274,88 @@ jobs:
           echo "referrer-digest=$REFERRER_DIGEST" >> "$GITHUB_OUTPUT"
           echo "Attached $SBOM_FILE to $IMAGE_URI as $REFERRER_DIGEST"
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+
+      # Keyless. There is no private key to store, rotate, or leak: cosign
+      # exchanges this job's OIDC token for a short-lived Fulcio certificate
+      # that records *which workflow, in which repository, at which ref* asked
+      # for it, and logs the signature in Rekor. That recorded identity is the
+      # thing a deploy checks — a signing key, by contrast, only proves that
+      # whoever holds the key signed, which is a much weaker claim and one that
+      # survives the key being stolen.
+      #
+      # Requires `id-token: write`, which this workflow already declares for
+      # AWS OIDC.
+      - name: Sign the image
+        env:
+          IMAGE_REF: ${{ steps.push.outputs.image-ref }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "$IMAGE_REF"
+
+      # Sign, then immediately verify with the same constraints a deploy will
+      # apply. Without this, a signature nothing can verify — the wrong issuer,
+      # an identity that does not match what the deploy expects, a Rekor entry
+      # that never landed — is indistinguishable from a good one until the
+      # deploy fails, in a different repository, hours later.
+      - name: Verify the signature this run just made
+        env:
+          IMAGE_REF: ${{ steps.push.outputs.image-ref }}
+          IDENTITY_REGEXP: ${{ inputs.signer-identity-regexp }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$IDENTITY_REGEXP" ]; then
+            # `.` is legal in a repository name, so escape before interpolating
+            # into a regular expression. `$` sits last in the character class
+            # only so that the linter does not read `$(` as a command
+            # substitution inside the single quotes.
+            ESCAPED_REPO="$(printf '%s' "$GITHUB_REPOSITORY" | sed 's/[.[\*^()+?{|$]/\\&/g')"
+            IDENTITY_REGEXP="^https://github\.com/${ESCAPED_REPO}/\.github/workflows/"
+          fi
+
+          if ! cosign verify \
+            --certificate-identity-regexp "$IDENTITY_REGEXP" \
+            --certificate-oidc-issuer "$OIDC_ISSUER" \
+            "$IMAGE_REF" > cosign-verification.json; then
+            echo "::error::The signature this run just made does not verify against" >&2
+            echo "::error::  identity  $IDENTITY_REGEXP" >&2
+            echo "::error::  issuer    $OIDC_ISSUER" >&2
+            echo "::error::If this workflow is called from another repository, the signing" >&2
+            echo "::error::identity is this workflow's own path in the repository that hosts" >&2
+            echo "::error::it — pass signer-identity-regexp to match it." >&2
+            exit 1
+          fi
+
+          echo "Signed by $(jq -r '.[0].optional.Issuer // "unknown issuer"' cosign-verification.json)"
+
       - name: Summary
         env:
           IMAGE_URI: ${{ steps.build.outputs.image-uri }}
+          IMAGE_REF: ${{ steps.push.outputs.image-ref }}
           REFERRER_DIGEST: ${{ steps.attach-sbom.outputs.referrer-digest }}
         run: |
           {
-            echo "## Image published with an SBOM"
+            echo "## Image published, inventoried, and signed"
             echo ""
             echo "| Field | Value |"
             echo "|---|---|"
             echo "| Image | \`$IMAGE_URI\` |"
+            echo "| Digest | \`$IMAGE_REF\` |"
             echo "| SBOM | CycloneDX JSON, \`$(jq -r '.specVersion' "$SBOM_FILE")\` |"
             echo "| Components | $(jq '.components | length' "$SBOM_FILE") |"
             echo "| Referrer digest | \`$REFERRER_DIGEST\` |"
+            echo "| Signature | keyless, \`$OIDC_ISSUER\` |"
             echo ""
-            echo "Retrieve it with:"
+            echo "Inspect them with:"
             echo ""
             echo '```bash'
-            echo "oras discover $IMAGE_URI"
+            echo "oras discover $IMAGE_REF"
+            echo "cosign verify --certificate-identity-regexp ... --certificate-oidc-issuer $OIDC_ISSUER $IMAGE_REF"
             echo '```'
+            echo ""
+            echo "Deploy \`$IMAGE_REF\`, not the tag: the signature is over the digest."
           } >> "$GITHUB_STEP_SUMMARY"
