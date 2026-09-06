@@ -22,7 +22,15 @@
 # resolves the tag and signs whatever it pointed at, which is a different
 # statement from "this run signed the image this run built".
 #
-# See docs/sbom.md and docs/image-signing.md.
+# Last, the image gets SLSA build provenance: a signed statement of *how* it was
+# produced — which repository, which commit, which workflow, on which runner —
+# bound to the same digest. That is a third question, and none of the other two
+# answers it. The SBOM says what is inside the image; the signature says this
+# workflow published it; provenance says what went in and what built it, which
+# is what has to be evidence rather than memory the first time someone asks
+# whether the thing in production came from `main`.
+#
+# See docs/sbom.md, docs/image-signing.md and docs/provenance.md.
 
 name: Docker Build & Push to ECR
 
@@ -45,12 +53,12 @@ on:
       signer-identity-regexp:
         description: >-
           Regular expression the signing certificate's identity must match when
-          this workflow verifies its own signature. Defaults to any workflow in
-          the repository the run belongs to, which is correct when this template
-          has been copied into that repository. Set it explicitly when the
-          workflow is called from another repository: the identity is then the
-          *reusable* workflow's path in the repository that hosts it, not the
-          caller's.
+          this workflow verifies its own signature and its own provenance.
+          Defaults to any workflow in the repository the run belongs to, which
+          is correct when this template has been copied into that repository.
+          Set it explicitly when the workflow is called from another repository:
+          the identity is then the *reusable* workflow's path in the repository
+          that hosts it, not the caller's.
         type: string
         default: ""
 
@@ -77,10 +85,19 @@ on:
           `image-uri`: a tag is a pointer, and a deploy that verifies one
           reference and runs another has verified nothing.
         value: ${{ jobs.build-push.outputs.image-ref }}
+      provenance-url:
+        description: "GitHub summary page for the SLSA build provenance attested over the pushed digest"
+        value: ${{ jobs.build-push.outputs.provenance-url }}
 
 permissions:
   id-token: write
   contents: read
+  # `actions/attest` uploads the signed provenance to the attestations API.
+  # Without this the step fails at run time, after the image has already been
+  # published — and a caller of this reusable workflow has to grant it too: the
+  # token a called workflow gets is the intersection of the two blocks, so a
+  # caller job that narrows `permissions:` silently takes it away again.
+  attestations: write
 
 env:
   # Pinned so the inventory is reproducible: two runs of the same commit should
@@ -98,6 +115,11 @@ env:
   # made it if the issuer is pinned too: an identity string proves nothing when
   # any issuer may assert it.
   OIDC_ISSUER: https://token.actions.githubusercontent.com
+  # The predicate type SLSA build provenance carries. Pinned as a value rather
+  # than left to the verifier's default, because it is the difference between
+  # "this image has an attestation" and "this image has a *provenance*
+  # attestation" — and `actions/attest` can produce three different kinds.
+  SLSA_PREDICATE_TYPE: https://slsa.dev/provenance/v1
 
 jobs:
   build-push:
@@ -107,6 +129,7 @@ jobs:
       sbom-referrer-digest: ${{ steps.attach-sbom.outputs.referrer-digest }}
       image-digest: ${{ steps.push.outputs.image-digest }}
       image-ref: ${{ steps.push.outputs.image-ref }}
+      provenance-url: ${{ steps.provenance.outputs.attestation-url }}
     steps:
       - uses: actions/checkout@v4
 
@@ -132,7 +155,13 @@ jobs:
         run: |
           IMAGE_URI="$REGISTRY/$IMAGE:$SHA"
           docker build -f "$DOCKERFILE" -t "$IMAGE_URI" -t "$REGISTRY/$IMAGE:latest" .
-          echo "image-uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+          {
+            echo "image-uri=$IMAGE_URI"
+            # The repository with no tag on it. The provenance attestation names
+            # the subject this way — a tag in `subject-name` makes the push to
+            # the registry target a reference that is not the image.
+            echo "image-repository=$REGISTRY/$IMAGE"
+          } >> "$GITHUB_OUTPUT"
 
       # oras reads ~/.docker/config.json, which amazon-ecr-login has already
       # populated for this registry, so `oras attach` needs no separate login.
@@ -279,6 +308,31 @@ jobs:
         with:
           cosign-release: ${{ env.COSIGN_VERSION }}
 
+      # Both self-verifications below — the signature and the provenance — ask
+      # the same question of the same certificate, so the identity is resolved
+      # once here rather than derived twice in two shell blocks that can drift
+      # apart. A build that verified its signature against one identity and its
+      # provenance against another would be asserting two different things and
+      # reporting one.
+      - name: Resolve the signer identity
+        id: signer
+        env:
+          IDENTITY_REGEXP: ${{ inputs.signer-identity-regexp }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$IDENTITY_REGEXP" ]; then
+            # `.` is legal in a repository name, so escape before interpolating
+            # into a regular expression. `$` sits last in the character class
+            # only so that the linter does not read `$(` as a command
+            # substitution inside the single quotes.
+            ESCAPED_REPO="$(printf '%s' "$GITHUB_REPOSITORY" | sed 's/[.[\*^()+?{|$]/\\&/g')"
+            IDENTITY_REGEXP="^https://github\.com/${ESCAPED_REPO}/\.github/workflows/"
+          fi
+
+          echo "identity-regexp=$IDENTITY_REGEXP" >> "$GITHUB_OUTPUT"
+          echo "Signer identity must match /${IDENTITY_REGEXP}/"
+
       # Keyless. There is no private key to store, rotate, or leak: cosign
       # exchanges this job's OIDC token for a short-lived Fulcio certificate
       # that records *which workflow, in which repository, at which ref* asked
@@ -304,18 +358,9 @@ jobs:
       - name: Verify the signature this run just made
         env:
           IMAGE_REF: ${{ steps.push.outputs.image-ref }}
-          IDENTITY_REGEXP: ${{ inputs.signer-identity-regexp }}
+          IDENTITY_REGEXP: ${{ steps.signer.outputs.identity-regexp }}
         run: |
           set -euo pipefail
-
-          if [ -z "$IDENTITY_REGEXP" ]; then
-            # `.` is legal in a repository name, so escape before interpolating
-            # into a regular expression. `$` sits last in the character class
-            # only so that the linter does not read `$(` as a command
-            # substitution inside the single quotes.
-            ESCAPED_REPO="$(printf '%s' "$GITHUB_REPOSITORY" | sed 's/[.[\*^()+?{|$]/\\&/g')"
-            IDENTITY_REGEXP="^https://github\.com/${ESCAPED_REPO}/\.github/workflows/"
-          fi
 
           if ! cosign verify \
             --certificate-identity-regexp "$IDENTITY_REGEXP" \
@@ -332,14 +377,107 @@ jobs:
 
           echo "Signed by $(jq -r '.[0].optional.Issuer // "unknown issuer"' cosign-verification.json)"
 
+      # SLSA build provenance. GitHub mints an in-toto statement describing this
+      # run — source repository and commit, workflow path and ref, runner
+      # environment, the build's own parameters — binds it to the pushed digest,
+      # and signs it with the same short-lived Sigstore certificate the cosign
+      # signature above used.
+      #
+      # `push-to-registry` is what makes it travel with the artifact. Without it
+      # the attestation exists only in GitHub's attestations API, keyed to *this
+      # repository*, and everything that has the image but not the repository —
+      # a registry replica, another account's ECR, an air-gapped pull — has no
+      # way to reach it. With it, the attestation is an OCI referrer on the
+      # image, discoverable from the digest alone, which is the only identifier
+      # a deploy is guaranteed to have.
+      #
+      # This is Build L2 provenance, not L3: the build and the attestation run
+      # in the same job as everything else this workflow does, so anything that
+      # can influence that job can influence what the provenance says about it.
+      # L3 requires a builder the caller cannot reach into. See
+      # docs/provenance.md §5.
+      - name: Attest build provenance
+        id: provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          # The repository without a tag, plus the digest the push returned —
+          # `subject-path` would attest a file on the runner, which is not the
+          # thing anybody pulls.
+          subject-name: ${{ steps.build.outputs.image-repository }}
+          subject-digest: ${{ steps.push.outputs.image-digest }}
+          push-to-registry: true
+          # The storage record is a GitHub-side index entry, and creating one
+          # needs the `artifact-metadata: write` permission. It is not the
+          # attestation: the signed bundle still reaches both the attestations
+          # API and the registry without it, and the registry copy is the one a
+          # consumer can actually reach.
+          create-storage-record: false
+
+      # Attest, then immediately verify — for the same reason the signature is
+      # verified above, and against two failures the step above cannot report.
+      #
+      # `actions/attest` chooses what kind of attestation to make from which
+      # inputs it was given: an `sbom-path` makes an SBOM attestation, a
+      # `predicate-type` makes a custom one, and only the absence of both makes
+      # build provenance. All three sign, upload and attach identically, and
+      # every gate downstream of here that only asks "is there an attestation?"
+      # is satisfied by all three.
+      #
+      # And `--bundle-from-oci` reads the attestation back out of the registry
+      # rather than from the local file or GitHub's API, so this fails when the
+      # push to the registry did not land — the half that everything outside
+      # this repository depends on, and the half that is invisible here without
+      # asking for it.
+      - name: Verify the provenance this run just made
+        env:
+          IMAGE_REF: ${{ steps.push.outputs.image-ref }}
+          BUNDLE_PATH: ${{ steps.provenance.outputs.bundle-path }}
+          IDENTITY_REGEXP: ${{ steps.signer.outputs.identity-regexp }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          PREDICATE_TYPE="$(jq -r '.dsseEnvelope.payload // ""' "$BUNDLE_PATH" \
+            | base64 -d \
+            | jq -r '.predicateType // ""')"
+          if [ "$PREDICATE_TYPE" != "$SLSA_PREDICATE_TYPE" ]; then
+            echo "::error::The attestation this run made carries predicate type" >&2
+            echo "::error::  '${PREDICATE_TYPE}'" >&2
+            echo "::error::but build provenance is $SLSA_PREDICATE_TYPE. A predicate, sbom-path" >&2
+            echo "::error::or predicate-type input on the step above switches actions/attest out" >&2
+            echo "::error::of provenance mode without failing." >&2
+            exit 1
+          fi
+
+          if ! gh attestation verify "oci://$IMAGE_REF" \
+            --bundle-from-oci \
+            --repo "$GITHUB_REPOSITORY" \
+            --cert-identity-regex "$IDENTITY_REGEXP" \
+            --cert-oidc-issuer "$OIDC_ISSUER" \
+            --predicate-type "$SLSA_PREDICATE_TYPE" \
+            --format json > provenance-verification.json; then
+            echo "::error::The provenance this run just attested does not verify against" >&2
+            echo "::error::  repository  $GITHUB_REPOSITORY" >&2
+            echo "::error::  identity    $IDENTITY_REGEXP" >&2
+            echo "::error::  issuer      $OIDC_ISSUER" >&2
+            echo "::error::  predicate   $SLSA_PREDICATE_TYPE" >&2
+            echo "::error::If this workflow is called from another repository, the signing" >&2
+            echo "::error::identity is this workflow's own path in the repository that hosts" >&2
+            echo "::error::it — pass signer-identity-regexp to match it." >&2
+            exit 1
+          fi
+
+          echo "Provenance verified for $IMAGE_REF"
+
       - name: Summary
         env:
           IMAGE_URI: ${{ steps.build.outputs.image-uri }}
           IMAGE_REF: ${{ steps.push.outputs.image-ref }}
           REFERRER_DIGEST: ${{ steps.attach-sbom.outputs.referrer-digest }}
+          PROVENANCE_URL: ${{ steps.provenance.outputs.attestation-url }}
         run: |
           {
-            echo "## Image published, inventoried, and signed"
+            echo "## Image published, inventoried, signed, and attested"
             echo ""
             echo "| Field | Value |"
             echo "|---|---|"
@@ -349,12 +487,14 @@ jobs:
             echo "| Components | $(jq '.components | length' "$SBOM_FILE") |"
             echo "| Referrer digest | \`$REFERRER_DIGEST\` |"
             echo "| Signature | keyless, \`$OIDC_ISSUER\` |"
+            echo "| Provenance | SLSA \`$SLSA_PREDICATE_TYPE\`, [attestation]($PROVENANCE_URL) |"
             echo ""
             echo "Inspect them with:"
             echo ""
             echo '```bash'
             echo "oras discover $IMAGE_REF"
             echo "cosign verify --certificate-identity-regexp ... --certificate-oidc-issuer $OIDC_ISSUER $IMAGE_REF"
+            echo "gh attestation verify oci://$IMAGE_REF --bundle-from-oci --repo $GITHUB_REPOSITORY"
             echo '```'
             echo ""
             echo "Deploy \`$IMAGE_REF\`, not the tag: the signature is over the digest."

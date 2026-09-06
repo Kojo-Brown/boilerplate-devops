@@ -15,6 +15,7 @@
     "audit:argocd": "ts-node tools/audit-argocd.ts",
     "audit:sbom": "ts-node tools/audit-sbom.ts",
     "audit:signing": "ts-node tools/audit-image-signing.ts",
+    "audit:provenance": "ts-node tools/audit-provenance.ts",
     "cdk": "cdk"
   },
   "devDependencies": {
