@@ -419,6 +419,7 @@ the two mistakes that survive a copy:
 | `npm run audit:argocd` | Argo CD manifests the API server accepts and Argo CD then misreads: a project that does not exist, a destination or repository the project does not permit, an Application without `selfHeal` or the cascade-delete finalizer, a chart version range, one environment rendering another's values file, a manifest in the GitOps tree that the root Application's glob does not apply | `aws/cdk/tools/audit-argocd.ts` |
 | `npm run audit:sbom` | A workflow that publishes a release artifact without inventorying it; an SBOM in SPDX (the generator's default) rather than CycloneDX; a container image inventoried from the source tree instead of the image; a scan that runs after the push and so gates nothing; an image SBOM kept only in a workflow artifact that expires; an unpinned scanner; an SBOM nothing verifies, so `"components": []` ships unnoticed | `aws/cdk/tools/audit-sbom.ts` |
 | `npm run audit:signing` | An image published without a signature, or signed over a mutable tag; a signature made before the push, or one nothing verifies before the image ships; keyless signing in a workflow with no `id-token: write`; signing with a long-lived key; a deploy that never verifies, one that verifies `--certificate-identity-regexp '.*'` — "signed by anyone" — and one that verifies a digest and then deploys a tag; an unpinned cosign | `aws/cdk/tools/audit-image-signing.ts` |
+| `npm run audit:provenance` | An image published with no record of how it was built; an attestation over a path on the runner rather than the pushed digest, or one that never reaches the registry and so cannot be found from the digest; an attestation that is not provenance, because `sbom-path` or `predicate-type` quietly switched the mode; an attesting job with no `attestations: write`; an attestation nothing verifies, one verified with a catch-all identity, and one verified over a tag; an unpinned attesting action | `aws/cdk/tools/audit-provenance.ts` |
 
 Placeholders must use one of the AWS documentation account IDs
 (`123456789012`, `111122223333`, …) — the scan permits those and nothing else.
@@ -474,6 +475,34 @@ See [docs/image-signing.md](./docs/image-signing.md) for the identity patterns,
 the two extra IAM permissions a deploy role needs, and what this does not
 cover — cluster-side admission control, and anything that is not a container
 image.
+
+## Build provenance
+
+Every image `docker-build-push.yml` pushes also carries SLSA build provenance:
+a signed statement of which repository and commit it was built from, which
+workflow at which ref built it, and on what kind of runner — bound to the same
+digest, and pushed to the registry as an OCI referrer so it is findable from
+that digest alone rather than only through GitHub's API.
+
+It is a third claim, not a restatement of the other two. The SBOM says what is
+inside the image and the signature says who published it; neither records how it
+was built, which is the question a rollback or a post-mortem opens with.
+
+The build verifies its own attestation before reporting success, reading it back
+*out of the registry* so a push that did not land fails here rather than in a
+consumer's pipeline. It also asserts the predicate type, because `actions/attest`
+picks its mode from its inputs: an `sbom-path` or a `predicate-type` produces a
+perfectly valid attestation that is not provenance, and satisfies any gate that
+only asks whether one exists.
+
+This is SLSA Build **L2**, not L3: the build and the attestation run in the same
+job, so anything that can influence that job can influence what the provenance
+says. L3 needs a trusted builder the caller cannot reach into. Provenance is
+also not yet enforced at deploy — the deploy paths gate on the signature.
+
+See [docs/provenance.md](./docs/provenance.md) for the verification commands,
+the `attestations: write` permission consumers of the reusable workflow have to
+grant too, and both gaps in full.
 
 ## Trunk-based development
 
