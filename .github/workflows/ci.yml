@@ -34,10 +34,10 @@ jobs:
         working-directory: aws/cdk
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
@@ -131,6 +131,20 @@ jobs:
       - name: Audit SLSA build provenance
         run: npm run audit:provenance
 
+      # The three gates above all reason about an image this pipeline builds.
+      # This one is about everything it *consumes*: `uses: actions/checkout@v4`
+      # runs whatever commit that tag points at when the job starts, with this
+      # job's token, OIDC identity and secrets, and the tag moving leaves no
+      # diff for anyone to review. Same for a task definition naming an image
+      # by tag — two tasks in one service can be running different code with
+      # nothing in CloudFormation drift saying so. The near miss is a pin with
+      # no `# v4.4.0` beside it: Dependabot reads that comment, so a repository
+      # that pins everything and labels nothing has swapped a supply-chain risk
+      # for a toolchain that never gets updated again. See
+      # docs/dependency-pinning.md.
+      - name: Audit dependency pinning
+        run: npm run audit:pins
+
       # Synth runs before the suite deliberately. It is the build step and takes
       # seconds, while the suite takes minutes; ordering it first means a test
       # failure never hides whether the app still synthesises.
@@ -145,7 +159,7 @@ jobs:
       # few MB to over 60. Checkov reads the templates and nothing else, and the
       # glob keeps the nested stack templates, which it also scans.
       - name: Upload synthesised templates
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cdk-out
           path: aws/cdk/cdk.out/*.template.json
@@ -160,7 +174,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install actionlint
         env:
@@ -203,7 +217,7 @@ jobs:
       KUBE_VERSION: "1.33.0"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # The chart's schema is enforced at deploy time by Helm's own validator,
       # which is a different implementation of JSON Schema from the ajv one the
@@ -211,7 +225,7 @@ jobs:
       # not been checked against the thing that decides whether an upgrade
       # succeeds.
       - name: Install Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
         with:
           version: v3.19.0
 
@@ -225,10 +239,10 @@ jobs:
     needs: cdk
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
@@ -236,7 +250,7 @@ jobs:
         run: pip install --disable-pip-version-check "checkov==3.3.8"
 
       - name: Download synthesised templates
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: cdk-out
           path: cdk.out

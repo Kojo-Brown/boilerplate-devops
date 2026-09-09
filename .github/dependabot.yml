@@ -1,7 +1,16 @@
 version: 2
+
+# Pinning by digest and keeping pins current are one policy, not two. A commit
+# SHA with nothing proposing to move it is a dependency frozen at whatever was
+# current the day someone pinned it, which trades a supply-chain risk for a
+# toolchain that stops receiving fixes — so `npm run audit:pins` requires the
+# `# vX.Y.Z` comment beside every SHA, and Dependabot reads that comment to know
+# which release it is offering to move you off. See docs/dependency-pinning.md.
 updates:
+  # The CDK app is the only npm package in the tree. `/` matched no
+  # package.json, so this ecosystem had never opened a pull request.
   - package-ecosystem: npm
-    directory: /
+    directory: /aws/cdk
     schedule:
       interval: weekly
     groups:
@@ -15,6 +24,17 @@ updates:
     schedule:
       interval: weekly
 
+  # Covers `.github/workflows/` — the workflows this repository runs. It cannot
+  # reach `workflow-templates/`: the github-actions ecosystem looks for
+  # `<directory>/.github/workflows` and for an `action.yml` at `<directory>`,
+  # and the templates are neither. What keeps them from drifting is
+  # `audit-dependency-pins.ts`'s `action-pin-inconsistent` rule, which fails CI
+  # when one action is pinned to two commits — so a Dependabot pull request
+  # bumping an action used in both places goes red until the template is
+  # updated with it. The six actions used *only* in templates
+  # (`amazon-ecs-deploy-task-definition`, `pnpm/action-setup`,
+  # `anchore/sbom-action`, `oras-project/setup-oras`, `actions/attest`,
+  # `github/codeql-action`) have no automated proposer and are a documented gap.
   - package-ecosystem: github-actions
     directory: /
     schedule:

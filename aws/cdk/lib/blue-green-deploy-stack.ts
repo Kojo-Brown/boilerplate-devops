@@ -8,6 +8,7 @@ import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import { Construct } from 'constructs';
+import { NGINX_PLACEHOLDER_IMAGE } from './base-images';
 
 export type BlueGreenDeploymentConfigType =
   | 'AllAtOnce'
@@ -21,7 +22,7 @@ export interface BlueGreenDeployStackProps extends cdk.StackProps {
   readonly certificateArn: string;
   /** Environment name used for resource naming */
   readonly envName?: string;
-  /** Container image URI (default: nginx stable-alpine for bootstrapping) */
+  /** Container image URI (default: the pinned nginx placeholder, for bootstrapping) */
   readonly containerImage?: string;
   /** Port the container listens on (default: 3000) */
   readonly containerPort?: number;
@@ -147,7 +148,7 @@ export class BlueGreenDeployStack extends cdk.Stack {
 
     taskDefinition.addContainer('AppContainer', {
       image: ecs.ContainerImage.fromRegistry(
-        props.containerImage ?? 'public.ecr.aws/nginx/nginx:stable-alpine',
+        props.containerImage ?? NGINX_PLACEHOLDER_IMAGE.reference,
       ),
       portMappings: [{ containerPort, protocol: ecs.Protocol.TCP }],
       logging: ecs.LogDrivers.awsLogs({ logGroup, streamPrefix: 'app' }),

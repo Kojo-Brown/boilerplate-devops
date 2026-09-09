@@ -27,6 +27,7 @@ import { WafStack } from '../lib/waf-stack';
 import { StaticSiteStack } from '../lib/static-site-stack';
 import { PreviewEnvironmentStack } from '../lib/preview-environment-stack';
 import { PreviewPrStack } from '../lib/preview-pr-stack';
+import { NGINX_PLACEHOLDER_IMAGE } from '../lib/base-images';
 import { DoraMetricsStack } from '../lib/dora-metrics-stack';
 import { EksStack } from '../lib/eks-stack';
 
@@ -1269,7 +1270,7 @@ const previewPrNumber = Number(
 const previewImageUri =
   (app.node.tryGetContext('previewImageUri') as string | undefined) ??
   process.env.PREVIEW_IMAGE_URI ??
-  'public.ecr.aws/nginx/nginx:stable-alpine';
+  NGINX_PLACEHOLDER_IMAGE.reference;
 
 new PreviewPrStack(app, `PreviewPrStack-${previewPrNumber}`, {
   prNumber: previewPrNumber,

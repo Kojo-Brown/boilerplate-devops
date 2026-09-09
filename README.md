@@ -504,6 +504,37 @@ See [docs/provenance.md](./docs/provenance.md) for the verification commands,
 the `attestations: write` permission consumers of the reusable workflow have to
 grant too, and both gaps in full.
 
+## Dependency pinning
+
+The three gates above are about the image this pipeline *publishes*. Everything
+it *consumes* is pinned by content: actions by commit SHA, third-party container
+images by manifest digest.
+
+`uses: actions/checkout@v4` is not a version — it is a mutable ref in someone
+else's repository, resolved when the job starts, and whatever it points at then
+runs with the job's `GITHUB_TOKEN`, OIDC identity and secrets. Moving it
+produces no diff here and nothing in the run log. A task definition holding
+`:latest` has the same shape: it resolves at every task placement, so two tasks
+in one service can be running different images while CloudFormation reports no
+drift, and a rollback rolls back to the same moving tag.
+
+Pinning without labelling is the other half of the failure, so `npm run
+audit:pins` requires a `# v4.4.0` beside every SHA: bare SHAs are unreviewable,
+and Dependabot reads that comment to know which release it is offering to move
+you off. Eight rules cover unpinned actions, unpinned `docker://` actions,
+missing and non-version labels, one action pinned to two different commits,
+untagged and malformed image digests, and image literals written into a stack
+instead of `lib/base-images.ts`. Run against the tree before this landed, it
+reports 64 violations.
+
+Your own application image is deliberately out of scope — its digest is decided
+per release, and that it reaches a runtime by digest is enforced more strictly
+by the signing gate, which requires the digest a `cosign verify` just resolved.
+
+See [docs/dependency-pinning.md](./docs/dependency-pinning.md) for how to
+resolve a pin, why the `^{}` in `git ls-remote` matters, and what has no
+automated proposer today.
+
 ## Trunk-based development
 
 Required status checks and a merge queue are declared in
