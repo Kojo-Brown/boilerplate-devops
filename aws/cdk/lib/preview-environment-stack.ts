@@ -14,6 +14,7 @@ import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as route53targets from 'aws-cdk-lib/aws-route53-targets';
 import * as sns from 'aws-cdk-lib/aws-sns';
 import { Construct } from 'constructs';
+import { POSTGRES_CLIENT_IMAGE } from './base-images';
 
 /** Tag key marking a stack as a per-PR preview environment the reaper may delete. */
 export const PREVIEW_TAG_KEY = 'PreviewEnvironment';
@@ -80,7 +81,8 @@ export interface PreviewEnvironmentStackProps extends cdk.StackProps {
   readonly databaseAllocatedStorageGiB?: number;
   /**
    * Image providing `psql`, used to create and drop per-PR databases.
-   * Pin by digest in your own copy — see `docs/preview-environments.md`.
+   * Digest form only — see `lib/base-images.ts` and
+   * `docs/dependency-pinning.md`.
    */
   readonly databaseClientImage?: string;
   /** Port preview containers listen on (default: 3000). */
@@ -170,8 +172,7 @@ export class PreviewEnvironmentStack extends cdk.Stack {
     const maxDeletionsPerRun = props.maxDeletionsPerRun ?? 10;
     const reaperDryRun = props.reaperDryRun ?? false;
     const logRetention = props.logRetention ?? logs.RetentionDays.TWO_WEEKS;
-    const databaseClientImage =
-      props.databaseClientImage ?? 'public.ecr.aws/docker/library/postgres:16-alpine';
+    const databaseClientImage = props.databaseClientImage ?? POSTGRES_CLIENT_IMAGE.reference;
 
     if (unknownStateTtlHours > maxLifetimeHours) {
       throw new Error(

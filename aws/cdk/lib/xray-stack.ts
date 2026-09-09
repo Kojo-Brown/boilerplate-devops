@@ -3,6 +3,7 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as ecs from 'aws-cdk-lib/aws-ecs';
 import * as xray from 'aws-cdk-lib/aws-xray';
 import { Construct } from 'constructs';
+import { XRAY_DAEMON_IMAGE } from './base-images';
 
 export interface XRayStackProps extends cdk.StackProps {
   /** Environment name used for resource naming and tagging */
@@ -74,9 +75,7 @@ export class XRayStack extends cdk.Stack {
   ): ecs.ContainerDefinition {
     return taskDefinition.addContainer('XRayDaemon', {
       containerName: 'xray-daemon',
-      image: ecs.ContainerImage.fromRegistry(
-        'public.ecr.aws/xray/aws-xray-daemon:latest',
-      ),
+      image: ecs.ContainerImage.fromRegistry(XRAY_DAEMON_IMAGE.reference),
       cpu: opts.cpuUnits ?? 32,
       memoryLimitMiB: opts.memoryMiB ?? 256,
       portMappings: [

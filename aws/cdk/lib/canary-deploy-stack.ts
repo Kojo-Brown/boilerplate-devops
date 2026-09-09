@@ -14,6 +14,7 @@ import * as tasks from 'aws-cdk-lib/aws-stepfunctions-tasks';
 import * as sns from 'aws-cdk-lib/aws-sns';
 import * as sns_sub from 'aws-cdk-lib/aws-sns-subscriptions';
 import { Construct } from 'constructs';
+import { NGINX_PLACEHOLDER_IMAGE } from './base-images';
 
 /**
  * What the analyzer does when the canary served too little traffic to judge.
@@ -77,7 +78,7 @@ export interface CanaryDeployStackProps extends cdk.StackProps {
   readonly certificateArn: string;
   /** Environment name used for resource naming (default: production) */
   readonly envName?: string;
-  /** Container image URI (default: nginx stable-alpine for bootstrapping) */
+  /** Container image URI (default: the pinned nginx placeholder, for bootstrapping) */
   readonly containerImage?: string;
   /** Port the container listens on (default: 3000) */
   readonly containerPort?: number;
@@ -311,7 +312,7 @@ export class CanaryDeployStack extends cdk.Stack {
 
     taskDefinition.addContainer('AppContainer', {
       image: ecs.ContainerImage.fromRegistry(
-        props.containerImage ?? 'public.ecr.aws/nginx/nginx:stable-alpine',
+        props.containerImage ?? NGINX_PLACEHOLDER_IMAGE.reference,
       ),
       portMappings: [{ containerPort, protocol: ecs.Protocol.TCP }],
       logging: ecs.LogDrivers.awsLogs({ logGroup: taskLogGroup, streamPrefix: 'app' }),
