@@ -145,6 +145,21 @@ jobs:
       - name: Audit dependency pinning
         run: npm run audit:pins
 
+      # The four gates above are about identity: what is in the artifact, who
+      # published it, how it was built, and what went into it. None of them asks
+      # whether any of it is known to be exploitable — a pinned, signed,
+      # inventoried, fully attested image with a critical CVE in its base layer
+      # satisfies every one of them. The near miss is the default rather than a
+      # mistake: `aquasecurity/trivy-action`'s `exit-code` and the `trivy` CLI's
+      # `--exit-code` are both `'0'`, so a scan that says nothing about them
+      # prints a table of CVEs into a log and succeeds, which is what most
+      # "we scan our images" pipelines are. Deliberately runs without `--now`:
+      # an exception's deadline is enforced by Trivy at scan time, not by
+      # turning every build in this repository red on a date the pull request in
+      # front of you did not choose. See docs/vulnerability-scanning.md.
+      - name: Audit vulnerability scanning
+        run: npm run audit:vulns
+
       # Synth runs before the suite deliberately. It is the build step and takes
       # seconds, while the suite takes minutes; ordering it first means a test
       # failure never hides whether the app still synthesises.

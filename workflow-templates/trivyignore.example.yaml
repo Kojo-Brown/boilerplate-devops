@@ -1,0 +1,69 @@
+# Accepted-risk exceptions for the vulnerability gate. Copy this to
+# `.trivyignore.yaml` in your repository and point `trivyignore-file` at it:
+#
+#   jobs:
+#     build:
+#       uses: <owner>/<repo>/.github/workflows/docker-build-push.yml@main
+#       with:
+#         image-name: api
+#         trivyignore-file: .trivyignore.yaml
+#
+# Use the YAML format, not the plain-text `.trivyignore`. The plain one is a
+# list of identifiers and nothing else: there is nowhere in it to say who
+# accepted the risk, on what grounds, or until when, so every entry is
+# permanent by construction. That file is where a gate goes to quietly stop
+# covering things — the entry outlives the release it was added for, the person
+# who added it, and usually the vulnerability.
+#
+# Two fields carry the whole difference, and `npm run audit:vulns` requires
+# both:
+#
+#   statement   why this is acceptable *here*. Not "false positive" — why it is
+#               one in this image, on this path, for this deploy.
+#   expired_at  YYYY-MM-DD. Trivy drops the entry once that date has passed and
+#               the finding starts failing builds again, which is what makes an
+#               exception a decision that gets revisited rather than one that
+#               gets forgotten.
+#
+# Trivy ignores fields it does not recognise rather than rejecting them, so
+# `expires_at` for `expired_at` is not an error — it is a suppression that never
+# expires and reads in review exactly like one that does. The audit reports any
+# key outside the known set for that reason.
+#
+# See docs/vulnerability-scanning.md §4.
+
+vulnerabilities:
+  # An example, with fake identifiers. Both entries are the shape the audit
+  # accepts; neither is a real finding.
+  - id: CVE-2026-00000
+    statement: >-
+      Reachable only from the image's build stage, which is discarded before the
+      final layer. Tracked in PLATFORM-1234; drops out when the base image moves
+      to trixie, which is scheduled for the same quarter.
+    expired_at: 2026-12-31
+
+  - id: CVE-2026-11111
+    # `paths` narrows an exception to where the reasoning actually holds. Without
+    # it the entry suppresses this CVE everywhere in the image, including the
+    # copy that ships in the runtime layer.
+    paths:
+      - "usr/local/lib/node_modules/npm/**"
+    statement: >-
+      Present only in the bundled npm CLI, which nothing in this service
+      executes at run time. Removing npm from the final stage is the real fix
+      and is PLATFORM-1240.
+    expired_at: 2026-12-31
+
+# The other sections Trivy accepts, held to the same two fields:
+#
+# misconfigurations:
+#   - id: AVD-AWS-0088
+#     statement: Bucket is public by design; it serves the marketing site.
+#     expired_at: 2026-12-31
+#
+# secrets:
+#   - id: aws-access-key-id
+#     paths:
+#       - "test/fixtures/**"
+#     statement: Fixture credentials, structurally valid and never issued.
+#     expired_at: 2026-12-31

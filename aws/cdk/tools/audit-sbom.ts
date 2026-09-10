@@ -177,6 +177,13 @@ export interface Step {
   readonly uses?: string;
   readonly run?: string;
   readonly with: Record<string, unknown>;
+  /**
+   * Step-level `env:`. A workflow passes an input into a shell through it, so
+   * the literal beside a flag in a `run:` block is a variable name far more
+   * often than it is a value — see `audit-vulnerability-scanning.ts`, which
+   * resolves `--severity "$SEVERITY"` through this.
+   */
+  readonly env: Record<string, unknown>;
 }
 
 export interface Job {
@@ -215,6 +222,7 @@ export const parseJobs = (document: unknown): Job[] => {
           uses: asString(step.uses),
           run: asString(step.run),
           with: asRecord(step.with) ?? {},
+          env: asRecord(step.env) ?? {},
         },
       ];
     });

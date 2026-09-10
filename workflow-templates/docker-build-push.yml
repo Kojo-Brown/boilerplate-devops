@@ -22,6 +22,26 @@
 # resolves the tag and signs whatever it pointed at, which is a different
 # statement from "this run signed the image this run built".
 #
+# Between the inventory and the push, the image is scanned for known
+# vulnerabilities and the build fails on fixable HIGH and CRITICAL findings. The
+# SBOM records what is in the image; this asks whether any of it is known to be
+# exploitable, which is a question none of the other three gates here answers —
+# a pinned, signed, inventoried, fully attested image with a critical CVE in its
+# base layer satisfies all of them.
+#
+# `--exit-code 1` is the whole of it. Both the `trivy` CLI and
+# `aquasecurity/trivy-action` default to exit code 0, so a scan with nothing
+# said about it prints a table of CVEs into a log nobody reads and succeeds.
+# That is the default, not a mistake somebody has to make.
+#
+# The gate blocks on *fixable* findings only. A CRITICAL with no patched version
+# available is real and worth an alert, and there is nothing this build can do
+# about it: blocking would stop every unrelated deploy until upstream ships, and
+# what gets changed under that pressure is the exit code — which switches the
+# gate off for the fixable ones too. The step above it records every severity,
+# fixable or not, so nothing is hidden by the threshold. See
+# docs/vulnerability-scanning.md.
+#
 # Last, the image gets SLSA build provenance: a signed statement of *how* it was
 # produced — which repository, which commit, which workflow, on which runner —
 # bound to the same digest. That is a third question, and none of the other two
@@ -30,7 +50,8 @@
 # is what has to be evidence rather than memory the first time someone asks
 # whether the thing in production came from `main`.
 #
-# See docs/sbom.md, docs/image-signing.md and docs/provenance.md.
+# See docs/sbom.md, docs/vulnerability-scanning.md, docs/image-signing.md and
+# docs/provenance.md.
 
 name: Docker Build & Push to ECR
 
@@ -50,6 +71,40 @@ on:
         description: "Days to keep the SBOM as a workflow artifact. The copy attached to the image in ECR does not expire."
         type: number
         default: 90
+      trivy-image:
+        description: >-
+          Trivy image, in digest form (`repository:tag@sha256:…`). The scanner
+          decides what "no findings" means, so it is pinned by content for the
+          same reason `secret-scanning.yml` pins TruffleHog: a tag is a pointer
+          its publisher can move, and `latest` — which
+          `aquasecurity/trivy-action`'s `version` input defaults to — makes two
+          runs of the same commit able to disagree. Anything without a digest
+          is rejected at run time rather than pulled.
+        type: string
+        default: "public.ecr.aws/aquasecurity/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969"
+      vulnerability-severity:
+        description: >-
+          Severities that fail the build, as a Trivy severity list. The default
+          is this repository's documented policy; lowering it below
+          HIGH,CRITICAL is refused at run time, because a gate that lets a
+          fixable CRITICAL through is reporting rather than gating.
+        type: string
+        default: "HIGH,CRITICAL"
+      trivyignore-file:
+        description: >-
+          Path, relative to the repository root, of a `.trivyignore.yaml`
+          holding accepted-risk exceptions. Every entry needs a `statement` and
+          an `expired_at`; see docs/vulnerability-scanning.md §4. Empty means no
+          exceptions.
+        type: string
+        default: ""
+      vulnerability-db-max-age-hours:
+        description: >-
+          How old Trivy's vulnerability database may be before the scan is
+          treated as untrustworthy. A scan against a stale database reports
+          nothing and looks identical to a clean one.
+        type: number
+        default: 48
       signer-identity-regexp:
         description: >-
           Regular expression the signing certificate's identity must match when
@@ -88,6 +143,9 @@ on:
       provenance-url:
         description: "GitHub summary page for the SLSA build provenance attested over the pushed digest"
         value: ${{ jobs.build-push.outputs.provenance-url }}
+      vulnerability-counts:
+        description: "Findings by severity in the image that was published, as JSON — every severity, not just the ones that block"
+        value: ${{ jobs.build-push.outputs.vulnerability-counts }}
 
 permissions:
   id-token: write
@@ -107,6 +165,10 @@ env:
   SYFT_VERSION: v1.51.1
   ORAS_VERSION: 1.3.4
   SBOM_FILE: sbom.cdx.json
+  # The full report, every severity, fixable or not. Written before the gate
+  # runs so that what the build blocked on is inspectable afterwards rather than
+  # being whatever scrolled past in a log.
+  VULN_REPORT: trivy-report.json
   # The version cosign-installer v4.1.2 defaults to. Pinned explicitly so that
   # bumping the action — a routine dependency update — cannot quietly change the
   # binary that decides what a signature over this repository's images means.
@@ -130,6 +192,7 @@ jobs:
       image-digest: ${{ steps.push.outputs.image-digest }}
       image-ref: ${{ steps.push.outputs.image-ref }}
       provenance-url: ${{ steps.provenance.outputs.attestation-url }}
+      vulnerability-counts: ${{ steps.vuln-report.outputs.counts }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
@@ -237,6 +300,181 @@ jobs:
           esac
 
           echo "CycloneDX $SPEC, $COMPONENTS components, subject '$SUBJECT'."
+
+      # Trivy exits 0 and writes a schema-valid report with no `Results` key at
+      # all when it cannot identify anything to scan — an unreadable archive, an
+      # image whose package manager it does not recognise. Every gate downstream
+      # of that passes, and the release looks like one that came back clean. It
+      # is the same shape as the SBOM's `"components": []` a few steps above,
+      # and it is checked here for the same reason.
+      #
+      # The database is checked too. A scan against a stale one reports fewer
+      # findings and is indistinguishable in a log from a scan that found
+      # nothing, so "the scanner ran" is not the property worth asserting.
+      - name: Inventory the image's vulnerabilities
+        id: vuln-report
+        env:
+          IMAGE_URI: ${{ steps.build.outputs.image-uri }}
+          TRIVY_IMAGE: ${{ inputs.trivy-image }}
+          DB_MAX_AGE_HOURS: ${{ inputs.vulnerability-db-max-age-hours }}
+        run: |
+          set -euo pipefail
+
+          # A scanner named by tag is chosen by the registry at the moment the
+          # step starts. This is the one tool in the pipeline whose output is a
+          # statement about what it did *not* find.
+          case "$TRIVY_IMAGE" in
+            *@sha256:*) ;;
+            *)
+              echo "::error::trivy-image must be pinned by digest (repository:tag@sha256:…)." >&2
+              echo "::error::Got '$TRIVY_IMAGE'." >&2
+              exit 1
+              ;;
+          esac
+
+          mkdir -p "${RUNNER_TEMP}/trivy-cache"
+
+          # `--input` on a saved archive rather than a reference the scanner
+          # resolves itself, so Trivy never needs the Docker socket. Mounting it
+          # would give a third-party image full control of the daemon in a job
+          # that is also holding this build's AWS credentials.
+          docker save "$IMAGE_URI" -o "${RUNNER_TEMP}/image.tar"
+
+          # Report-only, every severity: this is the record, not the gate. The
+          # gate is the next step, and it deliberately narrows to the severities
+          # policy says block — but nothing should be invisible just because it
+          # does not block.
+          docker run --rm \
+            -v "${RUNNER_TEMP}:/work" \
+            "$TRIVY_IMAGE" \
+            image \
+              --input /work/image.tar \
+              --cache-dir /work/trivy-cache \
+              --scanners vuln \
+              --format json \
+              --output "/work/${VULN_REPORT}" \
+              --exit-code 0
+
+          REPORT="${RUNNER_TEMP}/${VULN_REPORT}"
+          jq empty "$REPORT"
+
+          DB_UPDATED="$(docker run --rm \
+            -v "${RUNNER_TEMP}:/work" \
+            "$TRIVY_IMAGE" \
+            version --cache-dir /work/trivy-cache --format json \
+            | jq -r '.VulnerabilityDB.UpdatedAt // ""')"
+
+          if [ -z "$DB_UPDATED" ]; then
+            echo "::error::Trivy reports no vulnerability database. The scan above consulted" >&2
+            echo "::error::nothing and its empty result means nothing." >&2
+            exit 1
+          fi
+
+          DB_AGE_HOURS=$(( ( $(date -u +%s) - $(date -u -d "$DB_UPDATED" +%s) ) / 3600 ))
+          if [ "$DB_AGE_HOURS" -gt "$DB_MAX_AGE_HOURS" ]; then
+            echo "::error::Trivy's vulnerability database was last updated $DB_UPDATED," >&2
+            echo "::error::${DB_AGE_HOURS}h ago, which is older than the ${DB_MAX_AGE_HOURS}h this" >&2
+            echo "::error::workflow accepts. Anything published since is invisible to this scan." >&2
+            exit 1
+          fi
+
+          RESULT_COUNT="$(jq '(.Results // []) | length' "$REPORT")"
+          if [ "$RESULT_COUNT" -eq 0 ]; then
+            echo "::error::Trivy identified nothing to scan in $IMAGE_URI: the report contains no" >&2
+            echo "::error::results at all, which is what it writes when it cannot read the image" >&2
+            echo "::error::or recognise any package source in it. A scratch or distroless image" >&2
+            echo "::error::holding one statically linked binary is the single legitimate cause;" >&2
+            echo "::error::anything else means this build was not scanned." >&2
+            exit 1
+          fi
+
+          COUNTS="$(jq -c '
+            [(.Results // [])[] | (.Vulnerabilities // [])[]]
+            | group_by(.Severity)
+            | map({ key: .[0].Severity, value: length })
+            | from_entries
+          ' "$REPORT")"
+
+          {
+            echo "counts=$COUNTS"
+            echo "db-updated=$DB_UPDATED"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Trivy DB from $DB_UPDATED (${DB_AGE_HOURS}h old); $RESULT_COUNT target(s); $COUNTS"
+
+      # The gate. `--exit-code 1` is the entire difference between this and a
+      # scan that decorates a log: both the CLI flag and the trivy-action input
+      # default to 0.
+      - name: Fail on fixable HIGH and CRITICAL vulnerabilities
+        env:
+          TRIVY_IMAGE: ${{ inputs.trivy-image }}
+          SEVERITY: ${{ inputs.vulnerability-severity }}
+          TRIVYIGNORE_FILE: ${{ inputs.trivyignore-file }}
+        run: |
+          set -euo pipefail
+
+          # A caller can raise the threshold but not lower it past the policy.
+          # `audit-vulnerability-scanning.ts` checks the literal in this file;
+          # an input's value only exists at run time, and "HIGH,CRITICAL"
+          # narrowed to "CRITICAL" by a caller is exactly the change that no
+          # review in this repository would ever see.
+          for REQUIRED in HIGH CRITICAL; do
+            case ",${SEVERITY}," in
+              *",${REQUIRED},"*) ;;
+              *)
+                echo "::error::vulnerability-severity is '${SEVERITY}', which omits ${REQUIRED}." >&2
+                echo "::error::A gate that lets a fixable ${REQUIRED} through is reporting, not" >&2
+                echo "::error::gating. See docs/vulnerability-scanning.md §2." >&2
+                exit 1
+                ;;
+            esac
+          done
+
+          IGNORE=()
+          if [ -n "$TRIVYIGNORE_FILE" ]; then
+            if [ ! -f "${GITHUB_WORKSPACE}/${TRIVYIGNORE_FILE}" ]; then
+              # Trivy treats a missing ignore file as no exceptions and carries
+              # on, so a typo'd path is a gate that is stricter than intended
+              # today and silently unenforced the day someone "fixes" it.
+              echo "::error::trivyignore-file '${TRIVYIGNORE_FILE}' does not exist." >&2
+              exit 1
+            fi
+            IGNORE=(--ignorefile "/src/${TRIVYIGNORE_FILE}")
+          fi
+
+          # `--ignore-unfixed`: fail on what this build can act on. An
+          # unfixable CRITICAL is in the report above and belongs in an alert;
+          # blocking on it holds every unrelated deploy until upstream ships,
+          # and the change that gets made under that pressure is to this exit
+          # code. See docs/vulnerability-scanning.md §2.
+          #
+          # `--skip-db-update`: the step above downloaded the database and
+          # asserted its age. Re-downloading 100+ MB to reach the same verdict
+          # is the thing that makes people cache badly.
+          docker run --rm \
+            -v "${RUNNER_TEMP}:/work" \
+            -v "${GITHUB_WORKSPACE}:/src:ro" \
+            "$TRIVY_IMAGE" \
+            image \
+              --input /work/image.tar \
+              --cache-dir /work/trivy-cache \
+              --scanners vuln \
+              --severity "$SEVERITY" \
+              --ignore-unfixed \
+              --skip-db-update \
+              "${IGNORE[@]}" \
+              --format table \
+              --exit-code 1
+
+          echo "No fixable ${SEVERITY} findings in the image."
+
+      - name: Upload the vulnerability report
+        if: always() && steps.vuln-report.outputs.counts != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ env.VULN_REPORT }}
+          path: ${{ runner.temp }}/${{ env.VULN_REPORT }}
+          retention-days: ${{ inputs.sbom-retention-days }}
 
       # The digest is captured here rather than derived later because everything
       # after this point — the signature, and every deploy that checks it —
@@ -475,9 +713,12 @@ jobs:
           IMAGE_REF: ${{ steps.push.outputs.image-ref }}
           REFERRER_DIGEST: ${{ steps.attach-sbom.outputs.referrer-digest }}
           PROVENANCE_URL: ${{ steps.provenance.outputs.attestation-url }}
+          VULN_COUNTS: ${{ steps.vuln-report.outputs.counts }}
+          VULN_DB_UPDATED: ${{ steps.vuln-report.outputs.db-updated }}
+          SEVERITY: ${{ inputs.vulnerability-severity }}
         run: |
           {
-            echo "## Image published, inventoried, signed, and attested"
+            echo "## Image published, scanned, inventoried, signed, and attested"
             echo ""
             echo "| Field | Value |"
             echo "|---|---|"
@@ -486,6 +727,8 @@ jobs:
             echo "| SBOM | CycloneDX JSON, \`$(jq -r '.specVersion' "$SBOM_FILE")\` |"
             echo "| Components | $(jq '.components | length' "$SBOM_FILE") |"
             echo "| Referrer digest | \`$REFERRER_DIGEST\` |"
+            echo "| Vulnerabilities | \`$VULN_COUNTS\` (blocking: fixable \`$SEVERITY\`) |"
+            echo "| Vulnerability DB | $VULN_DB_UPDATED |"
             echo "| Signature | keyless, \`$OIDC_ISSUER\` |"
             echo "| Provenance | SLSA \`$SLSA_PREDICATE_TYPE\`, [attestation]($PROVENANCE_URL) |"
             echo ""

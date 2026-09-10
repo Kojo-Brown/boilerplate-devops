@@ -419,6 +419,7 @@ the two mistakes that survive a copy:
 | `npm run audit:argocd` | Argo CD manifests the API server accepts and Argo CD then misreads: a project that does not exist, a destination or repository the project does not permit, an Application without `selfHeal` or the cascade-delete finalizer, a chart version range, one environment rendering another's values file, a manifest in the GitOps tree that the root Application's glob does not apply | `aws/cdk/tools/audit-argocd.ts` |
 | `npm run audit:sbom` | A workflow that publishes a release artifact without inventorying it; an SBOM in SPDX (the generator's default) rather than CycloneDX; a container image inventoried from the source tree instead of the image; a scan that runs after the push and so gates nothing; an image SBOM kept only in a workflow artifact that expires; an unpinned scanner; an SBOM nothing verifies, so `"components": []` ships unnoticed | `aws/cdk/tools/audit-sbom.ts` |
 | `npm run audit:signing` | An image published without a signature, or signed over a mutable tag; a signature made before the push, or one nothing verifies before the image ships; keyless signing in a workflow with no `id-token: write`; signing with a long-lived key; a deploy that never verifies, one that verifies `--certificate-identity-regexp '.*'` — "signed by anyone" — and one that verifies a digest and then deploys a tag; an unpinned cosign | `aws/cdk/tools/audit-image-signing.ts` |
+| `npm run audit:vulns` | An artifact published without ever being scanned for known vulnerabilities; a scan that cannot fail the build, which is what both scanners do by default; a scan that runs after the push, or reads the source tree while shipping an image; a threshold left to the tool, or set below HIGH and CRITICAL; a gate that blocks on findings no build can fix, and so gets disabled; an unpinned scanner; the plain-text `.trivyignore`, and a YAML exception with no id, reason, or expiry — or with a typo'd key Trivy silently ignores | `aws/cdk/tools/audit-vulnerability-scanning.ts` |
 | `npm run audit:provenance` | An image published with no record of how it was built; an attestation over a path on the runner rather than the pushed digest, or one that never reaches the registry and so cannot be found from the digest; an attestation that is not provenance, because `sbom-path` or `predicate-type` quietly switched the mode; an attesting job with no `attestations: write`; an attestation nothing verifies, one verified with a catch-all identity, and one verified over a tag; an unpinned attesting action | `aws/cdk/tools/audit-provenance.ts` |
 
 Placeholders must use one of the AWS documentation account IDs
@@ -449,6 +450,42 @@ deliberately kept out of the public site bucket, and what `npm run audit:sbom`
 can and cannot prove.
 
 [OCI 1.1 referrer]: https://github.com/opencontainers/distribution-spec/blob/main/spec.md#listing-referrers
+
+## Known vulnerabilities
+
+The SBOM records what is in an artifact. This asks whether any of it is known to
+be exploitable — a question none of the other gates here answers, because a
+pinned, signed, inventoried, fully attested image with a critical CVE in its
+base layer satisfies every one of them.
+
+Both publishing templates scan with Trivy before the artifact ships and **fail
+on fixable HIGH and CRITICAL findings**. `--exit-code 1` is the whole of it:
+both `aquasecurity/trivy-action`'s `exit-code` input and the `trivy` CLI's flag
+default to `0`, so a scan with nothing said about them prints a table of CVEs
+into a log nobody reads and succeeds. That is the default, not a mistake anyone
+has to make, and it is what most "we scan our images" pipelines are.
+
+The gate blocks on *fixable* findings only. An unfixable CRITICAL is real,
+recorded, and worth an alert — and blocking on it holds every unrelated deploy
+until upstream ships, which is what turns an exit code into a `0`. A separate
+non-blocking step records every severity, so the threshold hides nothing.
+
+Two things a scan does not assert about itself are asserted here: that it
+scanned anything at all — Trivy exits 0 with no `Results` key when it cannot
+read the artifact, exactly as Syft writes `"components": []` — and that its
+vulnerability database is current, since a stale one reports fewer findings and
+looks identical to a clean scan. The scanner itself is pinned by digest, for the
+same reason TruffleHog is.
+
+Exceptions live in `.trivyignore.yaml` and need a `statement` and an
+`expired_at`. The plain-text `.trivyignore` is refused outright: it is a list of
+identifiers with nowhere to say why or until when, so every entry in it is
+permanent by construction.
+
+See [docs/vulnerability-scanning.md](./docs/vulnerability-scanning.md) for the
+full severity policy, how to accept a risk, and the three gaps this leaves —
+chiefly that nothing re-checks an image against advisories published after it
+was built.
 
 ## Image signing
 
