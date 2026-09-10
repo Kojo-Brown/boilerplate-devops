@@ -17,6 +17,7 @@
     "audit:signing": "ts-node tools/audit-image-signing.ts",
     "audit:provenance": "ts-node tools/audit-provenance.ts",
     "audit:pins": "ts-node tools/audit-dependency-pins.ts",
+    "audit:vulns": "ts-node tools/audit-vulnerability-scanning.ts",
     "cdk": "cdk"
   },
   "devDependencies": {

@@ -101,6 +101,38 @@ on:
         type: number
         required: false
         default: 90
+      trivy-image:
+        description: >-
+          Trivy image, in digest form (`repository:tag@sha256:…`). Pinned by
+          content because the scanner is what decides whether "no findings" is
+          true; anything without a digest is rejected at run time.
+        type: string
+        required: false
+        default: "public.ecr.aws/aquasecurity/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969"
+      vulnerability-severity:
+        description: >-
+          Severities that fail the deploy, as a Trivy severity list. Raising the
+          threshold is a caller's choice; lowering it below HIGH,CRITICAL is
+          refused at run time. See docs/vulnerability-scanning.md §2.
+        type: string
+        required: false
+        default: "HIGH,CRITICAL"
+      trivyignore-file:
+        description: >-
+          Path, relative to the repository root, of a `.trivyignore.yaml` of
+          accepted-risk exceptions. Every entry needs a `statement` and an
+          `expired_at`. Empty means no exceptions.
+        type: string
+        required: false
+        default: ""
+      vulnerability-db-max-age-hours:
+        description: >-
+          How old Trivy's vulnerability database may be before this scan is
+          treated as untrustworthy. A stale database reports fewer findings and
+          looks exactly like a clean scan.
+        type: number
+        required: false
+        default: 48
     secrets:
       aws-role-arn:
         description: "ARN of the IAM role to assume via OIDC"
@@ -118,6 +150,9 @@ env:
   # that true after the action is bumped.
   SYFT_VERSION: v1.51.1
   SBOM_FILE: sbom.cdx.json
+  # Every severity, fixable or not. The gate narrows to what policy blocks on;
+  # this is the record of everything that shipped.
+  VULN_REPORT: trivy-report.json
 
 jobs:
   deploy:
@@ -237,6 +272,168 @@ jobs:
           SBOM_SHA=$(sha256sum "$SBOM_FILE" | cut -d ' ' -f 1)
           echo "SBOM_SHA256=$SBOM_SHA" >> "$GITHUB_ENV"
           echo "CycloneDX $SPEC, $COMPONENTS components, sha256:$SBOM_SHA"
+
+      # ── Known vulnerabilities ─────────────────────────────────────────────────
+      # The SBOM says what went into the bundle; this asks whether any of it is
+      # known to be exploitable. Both run before the first `aws s3 sync`, so a
+      # bundle that fails either never reaches the bucket — which is the only
+      # place the ordering matters, since after the sync it is already served.
+      #
+      # Scanned from the source tree for the same reason the SBOM is: a bundler
+      # erases package identity, so `dist/` is a handful of minified files with
+      # no versions in them, while the lockfile beside it names every dependency
+      # that went in.
+      - name: Inventory the bundle's vulnerabilities
+        id: vuln-report
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          TRIVY_IMAGE: ${{ inputs.trivy-image }}
+          DB_MAX_AGE_HOURS: ${{ inputs.vulnerability-db-max-age-hours }}
+        run: |
+          set -euo pipefail
+
+          case "$TRIVY_IMAGE" in
+            *@sha256:*) ;;
+            *)
+              echo "::error::trivy-image must be pinned by digest (repository:tag@sha256:…)." >&2
+              echo "::error::Got '$TRIVY_IMAGE'." >&2
+              exit 1
+              ;;
+          esac
+
+          mkdir -p "${RUNNER_TEMP}/trivy-cache"
+
+          docker run --rm \
+            -v "${RUNNER_TEMP}:/work" \
+            -v "${PWD}:/src:ro" \
+            "$TRIVY_IMAGE" \
+            fs \
+              --scanners vuln \
+              --cache-dir /work/trivy-cache \
+              --format json \
+              --output "/work/${VULN_REPORT}" \
+              --exit-code 0 \
+              /src
+
+          REPORT="${RUNNER_TEMP}/${VULN_REPORT}"
+          jq empty "$REPORT"
+
+          DB_UPDATED="$(docker run --rm \
+            -v "${RUNNER_TEMP}:/work" \
+            "$TRIVY_IMAGE" \
+            version --cache-dir /work/trivy-cache --format json \
+            | jq -r '.VulnerabilityDB.UpdatedAt // ""')"
+
+          if [ -z "$DB_UPDATED" ]; then
+            echo "::error::Trivy reports no vulnerability database. The scan above consulted" >&2
+            echo "::error::nothing, and its empty result means nothing." >&2
+            exit 1
+          fi
+
+          DB_AGE_HOURS=$(( ( $(date -u +%s) - $(date -u -d "$DB_UPDATED" +%s) ) / 3600 ))
+          if [ "$DB_AGE_HOURS" -gt "$DB_MAX_AGE_HOURS" ]; then
+            echo "::error::Trivy's vulnerability database was last updated $DB_UPDATED," >&2
+            echo "::error::${DB_AGE_HOURS}h ago, older than the ${DB_MAX_AGE_HOURS}h this workflow" >&2
+            echo "::error::accepts. Anything published since is invisible to this scan." >&2
+            exit 1
+          fi
+
+          # Trivy writes a schema-valid report with no `Results` key at all when
+          # it recognises no package source — a wrong `working-directory`, an
+          # uncommitted lockfile, a manifest format it does not read. That
+          # report passes every other check here and looks exactly like a clean
+          # one, which is the same failure the SBOM step above guards against.
+          RESULT_COUNT="$(jq '(.Results // []) | length' "$REPORT")"
+          if [ "$RESULT_COUNT" -eq 0 ]; then
+            echo "::error::Trivy found no package source under '$PWD'. Nothing was scanned," >&2
+            echo "::error::so the clean result below is about nothing — check that the lockfile" >&2
+            echo "::error::is committed and that 'working-directory' points at the project root." >&2
+            exit 1
+          fi
+
+          COUNTS="$(jq -c '
+            [(.Results // [])[] | (.Vulnerabilities // [])[]]
+            | group_by(.Severity)
+            | map({ key: .[0].Severity, value: length })
+            | from_entries
+          ' "$REPORT")"
+
+          {
+            echo "counts=$COUNTS"
+            echo "db-updated=$DB_UPDATED"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Trivy DB from $DB_UPDATED (${DB_AGE_HOURS}h old); $RESULT_COUNT target(s); $COUNTS"
+
+      # The gate. `--exit-code 1` is the whole of it: the flag defaults to 0, so
+      # a scan that says nothing about it prints its findings and succeeds.
+      - name: Fail on fixable HIGH and CRITICAL vulnerabilities
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          TRIVY_IMAGE: ${{ inputs.trivy-image }}
+          SEVERITY: ${{ inputs.vulnerability-severity }}
+          TRIVYIGNORE_FILE: ${{ inputs.trivyignore-file }}
+        run: |
+          set -euo pipefail
+
+          for REQUIRED in HIGH CRITICAL; do
+            case ",${SEVERITY}," in
+              *",${REQUIRED},"*) ;;
+              *)
+                echo "::error::vulnerability-severity is '${SEVERITY}', which omits ${REQUIRED}." >&2
+                echo "::error::A gate that lets a fixable ${REQUIRED} through is reporting, not" >&2
+                echo "::error::gating. See docs/vulnerability-scanning.md §2." >&2
+                exit 1
+                ;;
+            esac
+          done
+
+          IGNORE=()
+          if [ -n "$TRIVYIGNORE_FILE" ]; then
+            if [ ! -f "${GITHUB_WORKSPACE}/${TRIVYIGNORE_FILE}" ]; then
+              # A missing ignore file is not an error to Trivy — it means "no
+              # exceptions". So a typo'd path is a gate that is stricter than
+              # anyone intended until the day somebody corrects the path.
+              echo "::error::trivyignore-file '${TRIVYIGNORE_FILE}' does not exist." >&2
+              exit 1
+            fi
+            IGNORE=(--ignorefile "/ignore/${TRIVYIGNORE_FILE}")
+          fi
+
+          # `--ignore-unfixed`: block on what this deploy can act on. An
+          # unfixable HIGH is in the report above and is worth an alert; holding
+          # every unrelated deploy until upstream ships is what turns this exit
+          # code into a 0. `--skip-db-update`: the step above downloaded the
+          # database and asserted its age.
+          docker run --rm \
+            -v "${RUNNER_TEMP}:/work" \
+            -v "${PWD}:/src:ro" \
+            -v "${GITHUB_WORKSPACE}:/ignore:ro" \
+            "$TRIVY_IMAGE" \
+            fs \
+              --scanners vuln \
+              --cache-dir /work/trivy-cache \
+              --severity "$SEVERITY" \
+              --ignore-unfixed \
+              --skip-db-update \
+              "${IGNORE[@]}" \
+              --format table \
+              --exit-code 1 \
+              /src
+
+          echo "No fixable ${SEVERITY} findings in the bundle's dependencies."
+
+      # Deliberately a workflow artifact and never synced to the site bucket,
+      # for the same reason the SBOM is not: that bucket is public, and a list
+      # of every version you are running is worth more to an attacker than to
+      # anyone else.
+      - name: Upload the vulnerability report
+        if: always() && steps.vuln-report.outputs.counts != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: trivy-report-${{ inputs.environment }}.json
+          path: ${{ runner.temp }}/${{ env.VULN_REPORT }}
+          retention-days: ${{ inputs.sbom-retention-days }}
 
       # ── AWS credentials via OIDC ──────────────────────────────────────────────
       - name: Configure AWS credentials (OIDC)

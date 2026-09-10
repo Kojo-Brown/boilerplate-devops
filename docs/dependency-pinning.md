@@ -161,7 +161,8 @@ close it, and is not written.
 
 **Not a gap, worth saying plainly.** A pin freezes the code, not the
 vulnerabilities in it. Pinning is why an upgrade is a reviewable event; it is not
-why the version you are on is safe. That question belongs to the Trivy/Grype
+why the version you are on is safe. That question belongs to the
+[vulnerability gate](./vulnerability-scanning.md) — the Trivy/Grype
 gate, which is the next Phase 9 item and is not built yet.
 
 ## 6. The audit

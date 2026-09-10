@@ -139,6 +139,7 @@ const step = (overrides: Partial<Step> = {}): Step => ({
   index: 0,
   name: 'a step',
   with: {},
+  env: {},
   ...overrides,
 });
 
