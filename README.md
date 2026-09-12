@@ -572,6 +572,37 @@ See [docs/dependency-pinning.md](./docs/dependency-pinning.md) for how to
 resolve a pin, why the `^{}` in `git ls-remote` matters, and what has no
 automated proposer today.
 
+## Policy as code
+
+Two jobs read the CloudFormation `cdk synth` writes. Checkov asks whether a
+template breaks a rule that is true of everyone's infrastructure; the Conftest
+pack in `policy/cloudformation/` asks whether it breaks one that is true of
+*ours* — which tags a resource must carry, which three ports may face the
+internet, what a database tagged `Environment=production` owes that one tagged
+`Environment=preview` does not. Sixteen rules, `package cloudformation`,
+enforced by `.github/scripts/run-policy-gate.sh`.
+
+The difference shows in what each does with a correct template it dislikes. A
+public ALB on port 80 redirecting to 443 trips `CKV_AWS_260`, and the only
+answer is `.checkov.baseline` — which then silences that check for every future
+port-80 rule in the repository. The Rego rule names 80, 443 and 8443 as the
+ports that may be world-reachable and denies the rest, so the ALB passes on its
+merits and a new `0.0.0.0/0` on 5432 fails by default.
+
+The wiring is the part that fails quietly. conftest evaluates the `main` package
+and nothing else unless told otherwise: pointed at this pack without a
+`--namespace`, or with a misspelt one, it prints `0 tests, 0 passed, 0 failures`
+and exits 0. So the gate runs a deny canary — a template that trips every rule
+exactly once — and refuses to pass unless the rule ids it reports match
+`policy/canary-expectations.txt` exactly, in both directions. `npm run
+audit:policy` covers the same ground in review with ten rules: a `warn` written
+where a `deny` was meant, a rule named `denied` that conftest never queries, a
+rule with no unit test or no canary case, and an install of the scanner with no
+exact version or no checksum.
+
+See [docs/policy-as-code.md](./docs/policy-as-code.md) for the rule table, how
+to add one, and what is enforced in the pipeline rather than at the account.
+
 ## Trunk-based development
 
 Required status checks and a merge queue are declared in

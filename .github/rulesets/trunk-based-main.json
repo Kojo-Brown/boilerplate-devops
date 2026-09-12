@@ -34,6 +34,7 @@
           { "context": "actionlint", "integration_id": 15368 },
           { "context": "Checkov", "integration_id": 15368 },
           { "context": "Helm chart", "integration_id": 15368 },
+          { "context": "Policy gate", "integration_id": 15368 },
           { "context": "Short-lived branch", "integration_id": 15368 }
         ]
       }

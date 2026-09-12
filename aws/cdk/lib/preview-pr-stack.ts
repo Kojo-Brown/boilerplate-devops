@@ -281,6 +281,10 @@ export class PreviewPrStack extends cdk.Stack {
     cdk.Tags.of(this).add('PreviewRepository', props.repository);
     cdk.Tags.of(this).add('Environment', envName);
     cdk.Tags.of(this).add('ManagedBy', 'CDK');
+    // A preview stack is the one most likely to outlive the thing that created
+    // it — the reaper can fail, or the PR can be force-pushed away — so it is
+    // the one that most needs a tag naming the stack that owns it.
+    cdk.Tags.of(this).add('Stack', id);
 
     // ── Outputs ───────────────────────────────────────────────────────────────
     // No `exportName` on any of these. An export is a cross-stack lock, and
