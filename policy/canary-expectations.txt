@@ -1,0 +1,39 @@
+# Every rule id the CloudFormation policy pack can report.
+#
+# `.github/scripts/run-policy-gate.sh` runs the pack against
+# policy/fixtures/deny-canary.json and requires the set of reported ids to equal
+# this list exactly — neither a subset nor a superset.
+#
+# Equality in both directions is deliberate:
+#
+#   • A rule here that the canary does not trip is a rule nobody has seen fire.
+#     It may have been broken by a refactor, or by an OPA upgrade changing what
+#     a builtin returns, and a policy that reports nothing is indistinguishable
+#     from a repository with nothing wrong in it.
+#
+#   • A rule the canary trips that is not here is a rule added without a canary
+#     case. That is how the first bullet happens later.
+#
+# `aws/cdk/tools/audit-policy-gate.ts` checks the other half of the loop: that
+# every `[rule-id]` appearing in a .rego source is listed here, so adding a rule
+# and forgetting the canary fails on the pull request that adds it rather than
+# silently months afterwards.
+#
+# Blank lines and lines starting with # are ignored.
+
+database-not-encrypted
+environment-tag-value
+image-not-digest-pinned
+image-resolved-at-deploy-time
+lambda-runtime-unset
+lambda-runtime-unsupported
+log-retention-invalid
+log-retention-unset
+production-database-backup-window
+production-database-deletable
+production-database-single-az
+production-log-retention-floor
+required-tags
+tag-shape-unsupported
+world-open-all-protocols
+world-open-ingress

@@ -717,13 +717,22 @@ new FeatureFlagLifecycleStack(app, 'FeatureFlagLifecycleStack', {
 //
 // Replace MIGRATION_IMAGE_URI with your actual ECR migration image URI.
 // The image must run the migration on startup (e.g. `npm run migrate`, `alembic upgrade head`).
+//
+// Pass it **by digest**, not by tag. The placeholder below is a digest of all
+// zeroes so that it is obviously fake and so that copying its shape produces a
+// correct reference. `docker-build-push.yml` already outputs the digest the
+// push returned; `db-migration-deploy.yml` is what forwards it here. A tag is
+// resolved once per task placement rather than once per deployment, so a
+// retried migration task can pull a different image from the one the pipeline
+// verified — and the `image-not-digest-pinned` policy in policy/cloudformation
+// fails the build on one.
 
 new DbMigrationStack(app, 'DbMigrationStack-Staging', {
   vpc: vpcStackStaging.vpc,
   envName: 'staging',
   migrationImageUri:
     process.env.MIGRATION_IMAGE_URI ??
-    '123456789012.dkr.ecr.us-east-1.amazonaws.com/app:migrate-latest',
+    '123456789012.dkr.ecr.us-east-1.amazonaws.com/app@sha256:0000000000000000000000000000000000000000000000000000000000000000',
   dbSecretArn: rdsStackStaging.secret.secretArn,
   dbSecurityGroup: rdsStackStaging.securityGroup,
   migrationCommand: ['npm', 'run', 'migrate'],
@@ -901,7 +910,7 @@ new DbMigrationStack(app, 'DbMigrationStack-Production', {
   envName: 'production',
   migrationImageUri:
     process.env.MIGRATION_IMAGE_URI ??
-    '123456789012.dkr.ecr.us-east-1.amazonaws.com/app:migrate-latest',
+    '123456789012.dkr.ecr.us-east-1.amazonaws.com/app@sha256:0000000000000000000000000000000000000000000000000000000000000000',
   dbSecretArn: rdsStackProduction.secret.secretArn,
   dbSecurityGroup: rdsStackProduction.securityGroup,
   migrationCommand: ['npm', 'run', 'migrate'],

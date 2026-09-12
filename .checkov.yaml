@@ -1,0 +1,17 @@
+# Checkov reads this automatically when run from the repository root, which is
+# where CI runs it.
+#
+# `policy/fixtures/` holds inputs for the Conftest policy gate, not
+# infrastructure. `deny-canary.json` is a CloudFormation-shaped document whose
+# entire purpose is to violate every rule in `policy/cloudformation/` exactly
+# once, so the gate can prove it is still evaluating them (see
+# docs/policy-as-code.md §4). Nothing deploys it. Left in scope it would report
+# a dozen findings that are the fixture doing its job, and the only way to quiet
+# them would be to add them to `.checkov.baseline` — which is where real
+# findings go, and which nobody should learn to skim.
+#
+# The two scans CI runs are directory-scoped to `cdk.out` and
+# `.github/workflows`, so this changes nothing about them. It is here for
+# `checkov -d .`, which is what a contributor runs locally.
+skip-path:
+  - policy/fixtures

@@ -1,0 +1,186 @@
+{
+  "__comment__": [
+    "A synthetic CloudFormation template that violates every rule in",
+    "policy/cloudformation exactly once. `.github/scripts/run-policy-gate.sh`",
+    "runs the gate against it and requires that the reported rule ids match",
+    "policy/canary-expectations.txt exactly.",
+    "",
+    "This is not a test of the rules — policy/cloudformation/*_test.rego covers",
+    "those, and they run under `conftest verify` with no conftest wiring",
+    "involved at all. This is a test of the wiring: the policy path, the",
+    "--namespace flag, the binary that got installed, and the fact that the",
+    "gate's exit code is being read. Every one of those fails silently.",
+    "conftest reports `0 tests, 0 passed` and exits 0 when --namespace names a",
+    "package that does not exist, which is what a typo in the CI command looks",
+    "like from the outside: a green check on a gate that evaluated nothing.",
+    "",
+    "Nothing deploys this. The account id is the reserved example 123456789012."
+  ],
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Deny canary for the CloudFormation policy pack. Not deployable.",
+  "Resources": {
+    "UntaggedRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": []
+        }
+      }
+    },
+    "MapTaggedBucket": {
+      "Type": "AWS::S3::Bucket",
+      "Properties": {
+        "Tags": { "ManagedBy": "CDK", "Stack": "CanaryStack" }
+      }
+    },
+    "MisspeltEnvironmentTopic": {
+      "Type": "AWS::SNS::Topic",
+      "Properties": {
+        "Tags": [
+          { "Key": "ManagedBy", "Value": "CDK" },
+          { "Key": "Stack", "Value": "CanaryStack" },
+          { "Key": "Environment", "Value": "Production" }
+        ]
+      }
+    },
+    "FloatingTagTaskDef": {
+      "Type": "AWS::ECS::TaskDefinition",
+      "Properties": {
+        "ContainerDefinitions": [
+          {
+            "Name": "app",
+            "Image": "123456789012.dkr.ecr.us-east-1.amazonaws.com/app:latest"
+          }
+        ],
+        "Tags": [
+          { "Key": "ManagedBy", "Value": "CDK" },
+          { "Key": "Stack", "Value": "CanaryStack" },
+          { "Key": "Environment", "Value": "staging" }
+        ]
+      }
+    },
+    "IntrinsicImageTaskDef": {
+      "Type": "AWS::ECS::TaskDefinition",
+      "Properties": {
+        "ContainerDefinitions": [
+          {
+            "Name": "app",
+            "Image": { "Fn::Sub": "${Repository}:${ImageTag}" }
+          }
+        ],
+        "Tags": [
+          { "Key": "ManagedBy", "Value": "CDK" },
+          { "Key": "Stack", "Value": "CanaryStack" },
+          { "Key": "Environment", "Value": "staging" }
+        ]
+      }
+    },
+    "UnencryptedDatabase": {
+      "Type": "AWS::RDS::DBInstance",
+      "Properties": {
+        "Engine": "postgres",
+        "StorageEncrypted": false,
+        "Tags": [
+          { "Key": "ManagedBy", "Value": "CDK" },
+          { "Key": "Stack", "Value": "CanaryStack" },
+          { "Key": "Environment", "Value": "staging" }
+        ]
+      }
+    },
+    "FragileProductionDatabase": {
+      "Type": "AWS::RDS::DBInstance",
+      "Properties": {
+        "Engine": "postgres",
+        "StorageEncrypted": true,
+        "MultiAZ": false,
+        "DeletionProtection": false,
+        "BackupRetentionPeriod": 0,
+        "Tags": [
+          { "Key": "ManagedBy", "Value": "CDK" },
+          { "Key": "Stack", "Value": "CanaryStack" },
+          { "Key": "Environment", "Value": "production" }
+        ]
+      }
+    },
+    "WideOpenSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "Canary",
+        "SecurityGroupIngress": [
+          { "IpProtocol": "-1", "CidrIp": "0.0.0.0/0" },
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 22,
+            "ToPort": 22,
+            "CidrIp": "0.0.0.0/0"
+          }
+        ],
+        "Tags": [
+          { "Key": "ManagedBy", "Value": "CDK" },
+          { "Key": "Stack", "Value": "CanaryStack" },
+          { "Key": "Environment", "Value": "staging" }
+        ]
+      }
+    },
+    "ForeverLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "Tags": [
+          { "Key": "ManagedBy", "Value": "CDK" },
+          { "Key": "Stack", "Value": "CanaryStack" },
+          { "Key": "Environment", "Value": "staging" }
+        ]
+      }
+    },
+    "OddRetentionLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "RetentionInDays": 45,
+        "Tags": [
+          { "Key": "ManagedBy", "Value": "CDK" },
+          { "Key": "Stack", "Value": "CanaryStack" },
+          { "Key": "Environment", "Value": "staging" }
+        ]
+      }
+    },
+    "ShortProductionLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "RetentionInDays": 7,
+        "Tags": [
+          { "Key": "ManagedBy", "Value": "CDK" },
+          { "Key": "Stack", "Value": "CanaryStack" },
+          { "Key": "Environment", "Value": "production" }
+        ]
+      }
+    },
+    "DeprecatedRuntimeFunction": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "Runtime": "nodejs18.x",
+        "Handler": "index.handler",
+        "Role": "arn:aws:iam::123456789012:role/canary",
+        "Code": { "ZipFile": "exports.handler = async () => {};" },
+        "Tags": [
+          { "Key": "ManagedBy", "Value": "CDK" },
+          { "Key": "Stack", "Value": "CanaryStack" },
+          { "Key": "Environment", "Value": "staging" }
+        ]
+      }
+    },
+    "RuntimelessFunction": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "Handler": "index.handler",
+        "Role": "arn:aws:iam::123456789012:role/canary",
+        "Code": { "ZipFile": "exports.handler = async () => {};" },
+        "Tags": [
+          { "Key": "ManagedBy", "Value": "CDK" },
+          { "Key": "Stack", "Value": "CanaryStack" },
+          { "Key": "Environment", "Value": "staging" }
+        ]
+      }
+    }
+  }
+}

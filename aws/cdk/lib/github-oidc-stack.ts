@@ -218,6 +218,11 @@ export class GitHubOidcStack extends cdk.Stack {
 
     cdk.Tags.of(this).add('Environment', envName);
     cdk.Tags.of(this).add('ManagedBy', 'GitHubOidcStack');
+    // Every other stack here tags `Stack` with its own id; this one did not,
+    // which left three IAM roles per environment with no tag saying what would
+    // recreate them. Long-lived deploy roles are exactly the resources an
+    // account sweep finds and cannot attribute. See docs/policy-as-code.md.
+    cdk.Tags.of(this).add('Stack', id);
   }
 }
 

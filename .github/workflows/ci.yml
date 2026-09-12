@@ -166,6 +166,16 @@ jobs:
       - name: Synthesize all stacks
         run: npx cdk synth --quiet
 
+      # Checkov asks whether the templates break a rule that is true of
+      # everyone's infrastructure. The Conftest pack next to it asks whether
+      # they break one that is true of *ours*, which is not a question Checkov
+      # can be configured to ask. This step is the review half: a policy that is
+      # never evaluated, never tested, or writes `warn` where it meant `deny` is
+      # a green check over nothing, and all three read as working policy in a
+      # diff. See docs/policy-as-code.md.
+      - name: Audit the policy-as-code gate
+        run: npm run audit:policy
+
       # The Checkov job scans the synthesised CloudFormation rather than the
       # TypeScript, so the templates have to cross the job boundary.
       #
@@ -289,3 +299,45 @@ jobs:
             --framework github_actions \
             --quiet \
             --compact
+
+  # The name is the required-status-check context in
+  # `.github/rulesets/trunk-based-main.json`; renaming the job renames the
+  # check, and `npm run audit:trunk` fails when the two drift apart.
+  policy:
+    name: Policy gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: cdk
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # A release tarball rather than an action, and pinned the way
+      # docs/dependency-pinning.md pins everything else: an exact version plus
+      # the digest of the bytes. A version alone is not a pin — a release asset
+      # can be replaced in place, and this binary decides whether the build is
+      # allowed to merge.
+      - name: Install Conftest
+        env:
+          CONFTEST_VERSION: "0.69.0"
+          CONFTEST_SHA256: "96fc2fbf11f0afde51256647127e6f00a64ce839a4d9a0a1aef2426c0e6f4b3f"
+        run: |
+          curl -fsSL \
+            "https://github.com/open-policy-agent/conftest/releases/download/v${CONFTEST_VERSION}/conftest_${CONFTEST_VERSION}_Linux_x86_64.tar.gz" \
+            -o conftest.tar.gz
+          echo "${CONFTEST_SHA256}  conftest.tar.gz" | sha256sum -c -
+          tar -xzf conftest.tar.gz conftest
+          sudo install -m 0755 conftest /usr/local/bin/conftest
+
+      # The same artifact the Checkov job reads. Both gates run against what
+      # `cdk synth` actually wrote, not against the TypeScript that produced it:
+      # defaults, aspects and escape hatches all resolve in between, so a
+      # template can deploy something the source never said.
+      - name: Download synthesised templates
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: cdk-out
+          path: cdk.out
+
+      - name: Run the policy gate
+        run: .github/scripts/run-policy-gate.sh cdk.out
