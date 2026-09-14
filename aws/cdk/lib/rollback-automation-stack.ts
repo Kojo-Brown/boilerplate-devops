@@ -161,18 +161,47 @@ export class RollbackAutomationStack extends cdk.Stack {
       }),
     );
 
-    // Describe and stop CodeDeploy deployments (CodeDeploy mode rollback)
-    lambdaRole.addToPolicy(
-      new iam.PolicyStatement({
-        sid: 'CodeDeployRollback',
-        actions: [
-          'codedeploy:ListDeployments',
-          'codedeploy:GetDeployment',
-          'codedeploy:StopDeployment',
-        ],
-        resources: ['*'],
-      }),
+    // Describe and stop CodeDeploy deployments (CodeDeploy mode rollback).
+    //
+    // Scoped to the deployment groups this stack was actually given. `"*"` here
+    // meant this Lambda could halt any deployment anywhere in the account —
+    // including one belonging to a service it is not a rollback target for, at
+    // the moment that deployment was shifting traffic. `SloBurnRateRollbackStack`
+    // has scoped the identical three actions since PR #28; this one had not, and
+    // the two are close enough that the difference was invisible in review.
+    //
+    // The deployment id is not in the ARN: it does not exist until the
+    // deployment does, and CodeDeploy authorizes `GetDeployment` and
+    // `StopDeployment` against the group the deployment belongs to.
+    const codeDeployTargets = props.rollbackTargets.filter(
+      (target) =>
+        target.codeDeployApplication !== undefined &&
+        target.codeDeployDeploymentGroup !== undefined,
     );
+
+    if (codeDeployTargets.length > 0) {
+      lambdaRole.addToPolicy(
+        new iam.PolicyStatement({
+          sid: 'CodeDeployRollback',
+          actions: [
+            'codedeploy:ListDeployments',
+            'codedeploy:GetDeployment',
+            'codedeploy:StopDeployment',
+          ],
+          resources: codeDeployTargets.map((target) =>
+            // CodeDeploy deployment-group ARNs separate the resource type from
+            // the name with a colon, not a slash:
+            //   arn:aws:codedeploy:<region>:<account>:deploymentgroup:<app>/<group>
+            cdk.Stack.of(this).formatArn({
+              service: 'codedeploy',
+              resource: 'deploymentgroup',
+              resourceName: `${target.codeDeployApplication}/${target.codeDeployDeploymentGroup}`,
+              arnFormat: cdk.ArnFormat.COLON_RESOURCE_NAME,
+            }),
+          ),
+        }),
+      );
+    }
 
     // Publish to the SNS notification topic
     this.notificationTopic.grantPublish(lambdaRole);

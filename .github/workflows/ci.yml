@@ -166,6 +166,20 @@ jobs:
       - name: Synthesize all stacks
         run: npx cdk synth --quiet
 
+      # Runs after synth because it reads the templates synth wrote — defaults,
+      # aspects and grants all resolve in between, so a role can end up holding
+      # something the TypeScript never said. This is the blocking half of the
+      # IAM gate and is deliberately a curated subset: the exhaustive answer
+      # needs AWS's own authorization model, which means an account, which a
+      # fork's pull request cannot have. `iam-access-analyzer.yml` is that half.
+      # The near miss it was written for was two statements apart in our own
+      # deploy role — `iam:PassRole` on `"*"` with an `iam:PassedToService`
+      # condition, which narrows which service receives the role and not which
+      # role is handed over, next to `ecs:RegisterTaskDefinition`. See
+      # docs/iam-least-privilege.md.
+      - name: Audit IAM least privilege
+        run: npm run audit:iam
+
       # Checkov asks whether the templates break a rule that is true of
       # everyone's infrastructure. The Conftest pack next to it asks whether
       # they break one that is true of *ours*, which is not a question Checkov

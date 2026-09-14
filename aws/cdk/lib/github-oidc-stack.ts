@@ -51,9 +51,58 @@ export interface GitHubRole {
   readonly maxSessionDuration?: cdk.Duration;
 }
 
+/**
+ * The resources the default `Deploy` and `CI` roles are allowed to touch.
+ *
+ * Every field defaults to the name the corresponding stack in this repository
+ * creates, so the default roles are scoped out of the box rather than scoped
+ * "once you get around to it". Override them when your resources are named
+ * something else; `passableRoleArns` is the one worth reading twice.
+ */
+export interface GitHubDeploymentScope {
+  /**
+   * ECR repositories the Deploy role may push to.
+   * Defaults to the repository `EcrStack` creates: `{envName}-app`.
+   */
+  readonly ecrRepositoryNames?: string[];
+  /**
+   * ECS cluster holding the services the Deploy role may update.
+   * Defaults to the cluster `EcsStack` creates: `{envName}-cluster`.
+   */
+  readonly ecsClusterName?: string;
+  /**
+   * ECS services the Deploy role may update.
+   * Defaults to the service `EcsStack` creates: `{envName}-service`.
+   */
+  readonly ecsServiceNames?: string[];
+  /**
+   * Task-definition family prefix the Deploy role may deregister and describe.
+   * Defaults to `{envName}-`, which covers every family this repository names.
+   */
+  readonly taskDefinitionFamilyPrefix?: string;
+  /**
+   * Roles the Deploy role may hand to ECS with `iam:PassRole`.
+   *
+   * This is the list that decides how far a compromised workflow reaches. An
+   * `iam:PassedToService` condition is not a substitute: it constrains which
+   * service receives the role, not which role is handed over, so with
+   * `ecs:RegisterTaskDefinition` alongside it, `Resource: "*"` here means the
+   * workflow can run a task as the most privileged role in the account that
+   * ECS tasks can assume.
+   *
+   * Defaults to the two roles `EcsStack` creates for the task itself.
+   */
+  readonly passableRoleArns?: string[];
+}
+
 export interface GitHubOidcStackProps extends cdk.StackProps {
   /** Environment tag applied to all resources. Defaults to "shared". */
   readonly envName?: string;
+  /**
+   * Resources the default roles are scoped to. Ignored when `roles` is given,
+   * since those statements are yours.
+   */
+  readonly deploymentScope?: GitHubDeploymentScope;
   /**
    * Thumbprint list for the GitHub OIDC provider.
    * GitHub rotates its OIDC CA periodically; the thumbprint below is current as
@@ -236,6 +285,28 @@ function defaultRoles(props: GitHubOidcStackProps): GitHubRole[] {
   const owner = 'YOUR_ORG';
   const repo = 'YOUR_REPO';
   const envName = props.envName ?? 'shared';
+  const deploymentScope = props.deploymentScope ?? {};
+
+  // Defaults track the names the other stacks in this repository create, so
+  // that "the default roles" and "scoped to the resources that exist" are the
+  // same thing. Region and account are left as `*` because these roles are
+  // created once and used from every region the application deploys to.
+  const ecrRepositoryArns = (deploymentScope.ecrRepositoryNames ?? [`${envName}-app`]).map(
+    (name) => `arn:aws:ecr:*:*:repository/${name}`,
+  );
+  const clusterName = deploymentScope.ecsClusterName ?? `${envName}-cluster`;
+  const serviceArns = (deploymentScope.ecsServiceNames ?? [`${envName}-service`]).map(
+    (name) => `arn:aws:ecs:*:*:service/${clusterName}/${name}`,
+  );
+  const taskDefinitionArn =
+    `arn:aws:ecs:*:*:task-definition/${deploymentScope.taskDefinitionFamilyPrefix ?? `${envName}-`}*`;
+  const passableRoleArns = deploymentScope.passableRoleArns ?? [
+    // The two roles EcsStack creates for the task itself. Anything else the
+    // workflow needs to pass has to be named here, which is the point: this
+    // list is the ceiling on what a compromised workflow can become.
+    `arn:aws:iam::*:role/${envName}-ecs-execution-role`,
+    `arn:aws:iam::*:role/${envName}-ecs-task-role`,
+  ];
 
   return [
     {
@@ -249,15 +320,24 @@ function defaultRoles(props: GitHubOidcStackProps): GitHubRole[] {
         },
       ],
       inlineStatements: [
+        // `ecr:GetAuthorizationToken` is an account-level call — it takes no
+        // resource at all, so IAM accepts nothing but `*` for it. Keeping it in
+        // its own statement is what lets the actions that *do* take a
+        // repository ARN be scoped to one, and makes the remaining wildcard the
+        // documented exception rather than the shape of the whole statement.
+        new iam.PolicyStatement({
+          sid: 'ECRAuthToken',
+          actions: ['ecr:GetAuthorizationToken'],
+          resources: ['*'],
+        }),
         new iam.PolicyStatement({
           sid: 'ECRReadOnly',
           actions: [
-            'ecr:GetAuthorizationToken',
             'ecr:BatchGetImage',
             'ecr:GetDownloadUrlForLayer',
             'ecr:DescribeRepositories',
           ],
-          resources: ['*'],
+          resources: ecrRepositoryArns,
         }),
         new iam.PolicyStatement({
           sid: 'SSMReadOnly',
@@ -278,10 +358,15 @@ function defaultRoles(props: GitHubOidcStackProps): GitHubRole[] {
       ],
       maxSessionDuration: cdk.Duration.hours(2),
       inlineStatements: [
+        // Same split as the CI role, for the same reason.
+        new iam.PolicyStatement({
+          sid: 'ECRAuthToken',
+          actions: ['ecr:GetAuthorizationToken'],
+          resources: ['*'],
+        }),
         new iam.PolicyStatement({
           sid: 'ECRPush',
           actions: [
-            'ecr:GetAuthorizationToken',
             'ecr:BatchCheckLayerAvailability',
             'ecr:GetDownloadUrlForLayer',
             'ecr:BatchGetImage',
@@ -290,23 +375,39 @@ function defaultRoles(props: GitHubOidcStackProps): GitHubRole[] {
             'ecr:CompleteLayerUpload',
             'ecr:PutImage',
           ],
+          resources: ecrRepositoryArns,
+        }),
+        // `ecs:RegisterTaskDefinition` and `ecs:DescribeTaskDefinition` are
+        // account-level: a task definition that does not exist yet has no ARN
+        // to authorize against, and IAM accepts only `*` for both. Split for
+        // the same reason as the ECR token call — the two actions that take a
+        // resource are the ones that matter here, and they are scoped.
+        new iam.PolicyStatement({
+          sid: 'ECSRegisterTaskDefinition',
+          actions: ['ecs:RegisterTaskDefinition', 'ecs:DescribeTaskDefinition'],
           resources: ['*'],
+        }),
+        new iam.PolicyStatement({
+          sid: 'ECSDeregisterTaskDefinition',
+          actions: ['ecs:DeregisterTaskDefinition'],
+          resources: [taskDefinitionArn],
         }),
         new iam.PolicyStatement({
           sid: 'ECSUpdate',
-          actions: [
-            'ecs:UpdateService',
-            'ecs:DescribeServices',
-            'ecs:RegisterTaskDefinition',
-            'ecs:DeregisterTaskDefinition',
-            'ecs:DescribeTaskDefinition',
-          ],
-          resources: ['*'],
+          actions: ['ecs:UpdateService', 'ecs:DescribeServices'],
+          resources: serviceArns,
         }),
+        // `iam:PassedToService` was the only thing narrowing this and it is not
+        // a scope: it says the role must end up at ECS, not which role may go
+        // there. With `ecs:RegisterTaskDefinition` two statements up, `"*"`
+        // here let this workflow run a task as any role in the account that
+        // ECS tasks can assume — including roles belonging to services this
+        // pipeline has nothing to do with. The condition stays because it is
+        // still worth having; the resource list is what makes it a scope.
         new iam.PolicyStatement({
           sid: 'PassRoleToECS',
           actions: ['iam:PassRole'],
-          resources: ['*'],
+          resources: passableRoleArns,
           conditions: {
             StringEquals: { 'iam:PassedToService': 'ecs-tasks.amazonaws.com' },
           },
@@ -325,7 +426,7 @@ function defaultRoles(props: GitHubOidcStackProps): GitHubRole[] {
     },
     {
       name: 'ReadOnly',
-      description: 'Read-only access for audit, cost analysis, or dashboards',
+      description: 'Metadata-only access for audit, cost analysis, or dashboards',
       conditions: [
         {
           owner,
@@ -333,7 +434,15 @@ function defaultRoles(props: GitHubOidcStackProps): GitHubRole[] {
           filter: 'ref:refs/heads/main',
         },
       ],
-      managedPolicies: ['ReadOnlyAccess'],
+      // `ViewOnlyAccess`, not `ReadOnlyAccess`. The names differ by a word and
+      // the policies differ by the data plane: `ReadOnlyAccess` grants
+      // `s3:GetObject`, `dynamodb:GetItem`, `sqs:ReceiveMessage`,
+      // `ssm:GetParameter` and `lambda:GetFunction` — whose response carries
+      // the function's environment variables — across the entire account. On a
+      // role any workflow on `main` can assume, that made every object in the
+      // account readable by anyone who could get a job to run. Dashboards and
+      // cost analysis want the metadata, which is what `ViewOnlyAccess` is.
+      managedPolicies: ['job-function/ViewOnlyAccess'],
     },
   ];
 }
