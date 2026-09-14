@@ -157,7 +157,15 @@ describe('GitHubOidcStack', () => {
       });
     });
 
-    it('ReadOnly role has the ReadOnlyAccess managed policy', () => {
+    // `ViewOnlyAccess`, not `ReadOnlyAccess`. The two names differ by a word
+    // and the policies differ by the entire data plane: `ReadOnlyAccess` grants
+    // `s3:GetObject`, `dynamodb:GetItem`, `ssm:GetParameter` and
+    // `lambda:GetFunction` — whose response carries the function's environment
+    // variables — across the whole account, on a role any workflow on `main`
+    // can assume. Both halves are asserted, because attaching the right policy
+    // and also leaving the wrong one on would pass a check for either alone.
+    // See docs/iam-least-privilege.md §2.
+    it('ReadOnly role has ViewOnlyAccess and not ReadOnlyAccess', () => {
       const { template } = makeStack();
       const readOnly = githubActionsRoles(template).find((r) =>
         r.RoleName.endsWith('-readonly'),
@@ -165,8 +173,110 @@ describe('GitHubOidcStack', () => {
       expect(readOnly).toBeDefined();
       const managedPolicies = (readOnly!.ManagedPolicyArns ?? []).map(flattenIntrinsic);
       expect(managedPolicies).toContainEqual(
+        expect.stringContaining(':iam::aws:policy/job-function/ViewOnlyAccess'),
+      );
+      expect(managedPolicies).not.toContainEqual(
         expect.stringContaining(':iam::aws:policy/ReadOnlyAccess'),
       );
+    });
+  });
+
+  /**
+   * The default roles are scoped out of the box, not scoped once somebody gets
+   * around to it. See docs/iam-least-privilege.md §2 for what each of these
+   * looked like before, and why the PassRole one is the dangerous member.
+   */
+  describe('Default role scoping', () => {
+    const deployStatements = (
+      template: Template,
+    ): { Sid?: string; Action: unknown; Resource: unknown }[] => {
+      const policies = Object.values(template.findResources('AWS::IAM::Policy')).filter((p) =>
+        JSON.stringify(p).includes('PassRoleToECS'),
+      );
+      expect(policies).toHaveLength(1);
+      return (policies[0].Properties as { PolicyDocument: { Statement: never[] } }).PolicyDocument
+        .Statement;
+    };
+
+    const statement = (template: Template, sid: string) => {
+      const found = deployStatements(template).find((s) => s.Sid === sid);
+      expect(found).toBeDefined();
+      return found!;
+    };
+
+    /**
+     * The `Resource` of a statement, always as a list.
+     *
+     * CDK renders a one-element resource list as a bare string and a longer one
+     * as an array — the same shape difference `policyActions` normalizes for
+     * actions elsewhere in these tests.
+     */
+    const resourcesOf = (template: Template, sid: string): unknown[] => {
+      const { Resource } = statement(template, sid);
+      return Array.isArray(Resource) ? Resource : [Resource];
+    };
+
+    // `iam:PassedToService` constrains which service receives the role, not
+    // which role is handed over. With `ecs:RegisterTaskDefinition` in the same
+    // policy, `Resource: "*"` here was a privilege escalation to the most
+    // privileged role in the account that ECS tasks can assume.
+    it('passes only the two ECS task roles, never "*"', () => {
+      const { template } = makeStack({ envName: 'staging' });
+      expect(resourcesOf(template, 'PassRoleToECS')).toEqual([
+        'arn:aws:iam::*:role/staging-ecs-execution-role',
+        'arn:aws:iam::*:role/staging-ecs-task-role',
+      ]);
+    });
+
+    it('scopes ECR pushes to the repository EcrStack creates', () => {
+      const { template } = makeStack({ envName: 'staging' });
+      expect(resourcesOf(template, 'ECRPush')).toEqual([
+        'arn:aws:ecr:*:*:repository/staging-app',
+      ]);
+    });
+
+    it('scopes service updates to the service EcsStack creates', () => {
+      const { template } = makeStack({ envName: 'staging' });
+      expect(resourcesOf(template, 'ECSUpdate')).toEqual([
+        'arn:aws:ecs:*:*:service/staging-cluster/staging-service',
+      ]);
+    });
+
+    // These two accept no resource at all — a task definition that does not
+    // exist yet has no ARN to authorize against — so IAM takes nothing but
+    // `*`. They are split into their own statements so the wildcard is the
+    // documented exception rather than the shape of the whole grant.
+    it.each(['ECRAuthToken', 'ECSRegisterTaskDefinition'])(
+      'keeps %s on "*" alone, since the actions take no resource',
+      (sid) => {
+        const { template } = makeStack();
+        const found = statement(template, sid);
+        expect(found.Resource).toBe('*');
+        expect(Array.isArray(found.Action) ? found.Action : [found.Action]).not.toContain(
+          'ecs:UpdateService',
+        );
+      },
+    );
+
+    it('honours an overridden deployment scope', () => {
+      const { template } = makeStack({
+        envName: 'staging',
+        deploymentScope: {
+          ecrRepositoryNames: ['custom-repo'],
+          ecsClusterName: 'custom-cluster',
+          ecsServiceNames: ['custom-service'],
+          passableRoleArns: ['arn:aws:iam::*:role/custom-task-role'],
+        },
+      });
+      expect(resourcesOf(template, 'ECRPush')).toEqual([
+        'arn:aws:ecr:*:*:repository/custom-repo',
+      ]);
+      expect(resourcesOf(template, 'ECSUpdate')).toEqual([
+        'arn:aws:ecs:*:*:service/custom-cluster/custom-service',
+      ]);
+      expect(resourcesOf(template, 'PassRoleToECS')).toEqual([
+        'arn:aws:iam::*:role/custom-task-role',
+      ]);
     });
   });
 

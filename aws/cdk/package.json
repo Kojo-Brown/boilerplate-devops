@@ -19,6 +19,7 @@
     "audit:pins": "ts-node tools/audit-dependency-pins.ts",
     "audit:vulns": "ts-node tools/audit-vulnerability-scanning.ts",
     "audit:policy": "ts-node tools/audit-policy-gate.ts",
+    "audit:iam": "ts-node tools/audit-iam-least-privilege.ts",
     "cdk": "cdk"
   },
   "devDependencies": {

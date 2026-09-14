@@ -4,7 +4,7 @@ import {
   RollbackAutomationStack,
   RollbackAutomationStackProps,
 } from '../lib/rollback-automation-stack';
-import { managedPolicyArns, resourceProps } from './support/cfn';
+import { flattenIntrinsic, managedPolicyArns, resourceProps } from './support/cfn';
 
 const ALARM_ARN_1 =
   'arn:aws:cloudwatch:us-east-1:123456789012:alarm:production-alb-5xx-elb';
@@ -215,8 +215,16 @@ describe('RollbackAutomationStack', () => {
       });
     });
 
-    it('grants CodeDeploy rollback actions', () => {
-      const { template } = makeStack();
+    // Scoped to the deployment groups this stack was given. `"*"` here let the
+    // Lambda halt any deployment anywhere in the account — including one
+    // belonging to a service it is not a rollback target for, at the moment
+    // that deployment was shifting traffic. `SloBurnRateRollbackStack` has
+    // scoped the identical three actions since PR #28. See
+    // docs/iam-least-privilege.md §2.
+    it('grants CodeDeploy rollback actions on the target deployment groups', () => {
+      const { template } = makeStack({
+        rollbackTargets: [ROLLING_TARGET, CODEDEPLOY_TARGET],
+      });
       template.hasResourceProperties('AWS::IAM::Policy', {
         PolicyDocument: Match.objectLike({
           Statement: Match.arrayWith([
@@ -231,6 +239,31 @@ describe('RollbackAutomationStack', () => {
           ]),
         }),
       });
+
+      // The resource is built from `stack.partition`, so it synthesizes to an
+      // Fn::Join rather than a literal — asserting the obvious string form here
+      // would silently never match. See test/support/cfn.ts.
+      const statement = resourceProps(template, 'AWS::IAM::Policy')
+        .flatMap(
+          (policy) =>
+            (policy.PolicyDocument as { Statement: { Sid?: string; Resource?: unknown }[] })
+              .Statement,
+        )
+        .find((s) => s.Sid === 'CodeDeployRollback');
+      expect(statement).toBeDefined();
+      const resources = Array.isArray(statement!.Resource)
+        ? statement!.Resource
+        : [statement!.Resource];
+      expect(resources.map(flattenIntrinsic)).toEqual([
+        'arn:<token>:codedeploy:us-east-1:123456789012:deploymentgroup:production-ecs-app/production-ecs-dg',
+      ]);
+    });
+
+    // The deployment id is not in the ARN: it does not exist until the
+    // deployment does, and CodeDeploy authorizes both calls against the group.
+    it('grants no CodeDeploy access at all when no target uses CodeDeploy', () => {
+      const { template } = makeStack({ rollbackTargets: [ROLLING_TARGET] });
+      expect(policyActions(template)).not.toContain('codedeploy:StopDeployment');
     });
 
     it('grants SNS publish permission to the notification topic', () => {

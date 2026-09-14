@@ -1,0 +1,191 @@
+name: IAM Access Analyzer
+
+# The exhaustive half of the IAM least-privilege gate.
+#
+# `npm run audit:iam` runs on every pull request, needs no AWS account, and is
+# deliberately a curated subset: it reports what is a defect in this
+# repository's source and fixable in this repository's source. It cannot tell
+# you whether `ecs:DescribeServices` accepts a resource ARN, because that is a
+# property of AWS's authorization model and a hand-maintained table of it goes
+# stale in the direction that reports work nobody can do.
+#
+# IAM Access Analyzer has the model. `cfn-policy-validator` parses the
+# synthesised CloudFormation, resolves its intrinsics, and sends each policy to
+# the `ValidatePolicy` and `CheckAccessNotGranted` APIs. That is the authority,
+# and this is where it runs.
+#
+# **Why this is not a required check.** `cfn-policy-validator` calls
+# `sts:GetCallerIdentity` before it does anything else and exits 1 without
+# credentials, so it needs a role. A pull request from a fork gets no
+# `id-token: write`, so it cannot assume one. Making this required would block
+# every fork contribution on a check that cannot pass — so the blocking gate is
+# the offline one, and this runs wherever credentials exist: same-repository
+# pull requests, pushes to main, and weekly.
+#
+# Weekly matters on its own. Access Analyzer's findings are not a pure function
+# of the template: AWS adds checks, and a policy that was clean in March can be
+# reported in June without anybody touching it. A gate that only runs on a diff
+# never notices that.
+#
+# **Setup.** Two repository variables, neither of them a secret:
+#
+#   IAM_ACCESS_ANALYZER_ROLE_ARN  a role trusting this repository's OIDC subject
+#                                 with `access-analyzer:ValidatePolicy`,
+#                                 `access-analyzer:CheckAccessNotGranted` and
+#                                 `iam:GetPolicy`/`iam:GetPolicyVersion`.
+#                                 Unset, every job here skips.
+#   AWS_REGION                    optional; defaults to us-east-1.
+#
+# The job is skipped rather than silently passing when the variable is unset,
+# and the `report` job says which of the two happened in the run summary — see
+# docs/iam-least-privilege.md §5.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  schedule:
+    # Wednesday 04:17 UTC. Off the hour because everything else in the world
+    # runs at :00 and a scheduled run that is late is a scheduled run that is
+    # skipped.
+    - cron: "17 4 * * 3"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: iam-access-analyzer-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "22"
+  PYTHON_VERSION: "3.12"
+  # This binary decides whether the report is green, so it is pinned exactly,
+  # for the same reason checkov and conftest are. Enforced by
+  # `npm run audit:iam`. See docs/dependency-pinning.md.
+  VALIDATOR_VERSION: "0.0.37"
+
+jobs:
+  analyze:
+    name: Access Analyzer report
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # A fork PR has no `id-token: write`, and an unconfigured repository has no
+    # role. Both skip; neither pretends to have run.
+    if: >-
+      vars.IAM_ACCESS_ANALYZER_ROLE_ARN != '' &&
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository)
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: aws/cdk/package-lock.json
+
+      - name: Install dependencies
+        working-directory: aws/cdk
+        run: npm ci
+
+      # Synthesised here rather than downloaded from the CI workflow's
+      # artifact: this also runs on a schedule, where there is no CI run to take
+      # an artifact from, and a stale artifact is exactly the input that makes a
+      # scheduled re-check meaningless.
+      - name: Synthesize all stacks
+        working-directory: aws/cdk
+        run: npx cdk synth --quiet
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install the IAM policy validator
+        run: |
+          pip install --disable-pip-version-check \
+            "cfn-policy-validator==${VALIDATOR_VERSION}"
+
+      - name: Assume the audit role
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ vars.IAM_ACCESS_ANALYZER_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          role-session-name: iam-access-analyzer-${{ github.run_id }}
+
+      # `--treat-finding-type-as-blocking` is passed explicitly at its default.
+      # It reads like tightening and is the one place the gate is switched off
+      # by narrowing — dropping SECURITY_WARNING is where
+      # PASS_ROLE_WITH_STAR_IN_RESOURCE goes — so `npm run audit:iam` checks
+      # that both types are still listed.
+      #
+      # No `|| true`, no `--ignore-finding`: the loop keeps going so that one
+      # bad template does not hide the other forty-six, and remembers that it
+      # failed.
+      - name: Validate every synthesised template
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+        run: .github/scripts/run-iam-access-analyzer.sh aws/cdk/cdk.out iam-report
+
+      - name: Upload the Access Analyzer report
+        # The report is most wanted on the run that failed.
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: iam-access-analyzer-report
+          path: iam-report/
+          retention-days: 30
+          if-no-files-found: warn
+
+  # Runs whatever `analyze` did, including when it was skipped, so that "the
+  # analyzer has not looked at this in three weeks" is visible in the run rather
+  # than being the absence of a job nobody notices.
+  report:
+    name: Access Analyzer status
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: analyze
+    if: always()
+    steps:
+      - name: Write the status to the run summary
+        env:
+          RESULT: ${{ needs.analyze.result }}
+          CONFIGURED: ${{ vars.IAM_ACCESS_ANALYZER_ROLE_ARN != '' }}
+        run: |
+          {
+            echo "### IAM Access Analyzer"
+            echo
+            case "${RESULT}" in
+              success)
+                echo "Reported no blocking findings across the synthesised templates."
+                ;;
+              failure)
+                echo "**Blocking findings.** Download the \`iam-access-analyzer-report\`"
+                echo "artifact for the per-template JSON."
+                ;;
+              skipped)
+                if [ "${CONFIGURED}" = "true" ]; then
+                  echo "Skipped: a pull request from a fork cannot request an OIDC token,"
+                  echo "so there are no credentials to call Access Analyzer with. The"
+                  echo "offline gate (\`npm run audit:iam\`) ran on this pull request and"
+                  echo "is the one that blocks."
+                else
+                  echo "Skipped: \`IAM_ACCESS_ANALYZER_ROLE_ARN\` is not set, so nothing"
+                  echo "has asked Access Analyzer about these policies. The offline gate"
+                  echo "(\`npm run audit:iam\`) is running and blocking; it is a curated"
+                  echo "subset. See docs/iam-least-privilege.md §5."
+                fi
+                ;;
+              *)
+                echo "Ended as \`${RESULT}\`."
+                ;;
+            esac
+          } >> "${GITHUB_STEP_SUMMARY}"

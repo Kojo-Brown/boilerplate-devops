@@ -420,6 +420,7 @@ the two mistakes that survive a copy:
 | `npm run audit:sbom` | A workflow that publishes a release artifact without inventorying it; an SBOM in SPDX (the generator's default) rather than CycloneDX; a container image inventoried from the source tree instead of the image; a scan that runs after the push and so gates nothing; an image SBOM kept only in a workflow artifact that expires; an unpinned scanner; an SBOM nothing verifies, so `"components": []` ships unnoticed | `aws/cdk/tools/audit-sbom.ts` |
 | `npm run audit:signing` | An image published without a signature, or signed over a mutable tag; a signature made before the push, or one nothing verifies before the image ships; keyless signing in a workflow with no `id-token: write`; signing with a long-lived key; a deploy that never verifies, one that verifies `--certificate-identity-regexp '.*'` — "signed by anyone" — and one that verifies a digest and then deploys a tag; an unpinned cosign | `aws/cdk/tools/audit-image-signing.ts` |
 | `npm run audit:vulns` | An artifact published without ever being scanned for known vulnerabilities; a scan that cannot fail the build, which is what both scanners do by default; a scan that runs after the push, or reads the source tree while shipping an image; a threshold left to the tool, or set below HIGH and CRITICAL; a gate that blocks on findings no build can fix, and so gets disabled; an unpinned scanner; the plain-text `.trivyignore`, and a YAML exception with no id, reason, or expiry — or with a typo'd key Trivy silently ignores | `aws/cdk/tools/audit-vulnerability-scanning.ts` |
+| `npm run audit:iam` | A policy granting `Action: "*"` or `s3:*`, or written as `NotAction`/`NotResource` so every action AWS ships next is included; `iam:PassRole` on `"*"` — which an `iam:PassedToService` condition does not scope, since it constrains which service receives the role and not which role is handed over; `AdministratorAccess`/`PowerUserAccess` under any name, and `ReadOnlyAccess` where `ViewOnlyAccess` was meant; `Resource: "*"` with no condition on an action that reads data, changes what runs, or grants access; a wildcard principal with nothing narrowing it; a GitHub OIDC trust with no `aud` check or a `sub` not pinned to one repository; and an Access Analyzer report that is missing, unpinned, or cannot fail | `aws/cdk/tools/audit-iam-least-privilege.ts` |
 | `npm run audit:provenance` | An image published with no record of how it was built; an attestation over a path on the runner rather than the pushed digest, or one that never reaches the registry and so cannot be found from the digest; an attestation that is not provenance, because `sbom-path` or `predicate-type` quietly switched the mode; an attesting job with no `attestations: write`; an attestation nothing verifies, one verified with a catch-all identity, and one verified over a tag; an unpinned attesting action | `aws/cdk/tools/audit-provenance.ts` |
 
 Placeholders must use one of the AWS documentation account IDs
@@ -602,6 +603,54 @@ exact version or no checksum.
 
 See [docs/policy-as-code.md](./docs/policy-as-code.md) for the rule table, how
 to add one, and what is enforced in the pipeline rather than at the account.
+
+## IAM least privilege
+
+Every other gate here reasons about an artifact. This one reasons about what the
+account lets the pipeline *do*, which is the blast radius of all of them: an
+attacker who gets a step to run arbitrary code inherits the job's role, and what
+happens next is decided entirely by that role's policy.
+
+It is two gates, and the split is forced rather than chosen.
+`cfn-policy-validator` calls `sts:GetCallerIdentity` before it does anything
+else, so the IAM Access Analyzer report needs an account — and a pull request
+from a fork gets no `id-token: write` and cannot assume one. So the blocking
+gate is `npm run audit:iam`, which reads the synthesised CloudFormation offline
+and runs on every pull request, and
+[`iam-access-analyzer.yml`](./.github/workflows/iam-access-analyzer.yml) runs the
+exhaustive check wherever credentials exist: same-repository pull requests,
+pushes to `main`, and weekly — weekly because AWS adds checks, so a policy clean
+in March can be reported in June with nobody having touched it.
+
+Being the blocking half offline makes the offline half deliberately *curated*.
+45 statements here use `Resource: "*"` and most of them have to:
+`cloudwatch:GetMetricData`, `ec2:DescribeSubnets`, `ecr:GetAuthorizationToken`
+and `ecs:RegisterTaskDefinition` take no resource at all. A gate reporting all
+45 would have a baseline file within a week with the real findings inside it, so
+`Resource: "*"` is a finding only for a curated privileged set, and the model
+questions go to Access Analyzer, which has the model.
+
+The first run found ten, all fixed rather than baselined. The one worth reading
+twice had a condition and a sid that said what it was for:
+
+```ts
+new iam.PolicyStatement({
+  sid: 'PassRoleToECS',
+  actions: ['iam:PassRole'],
+  resources: ['*'],
+  conditions: { StringEquals: { 'iam:PassedToService': 'ecs-tasks.amazonaws.com' } },
+})
+```
+
+`iam:PassedToService` constrains which service receives the role, not which role
+is handed over. Two statements above it the same role held
+`ecs:RegisterTaskDefinition`, so anything reaching those credentials could
+register a task definition naming any role in the account that ECS tasks can
+assume, and run it.
+
+See [docs/iam-least-privilege.md](./docs/iam-least-privilege.md) for the rule
+table, the two carve-outs and why each is narrow, and the three flags that turn
+the analyzer report green without touching a policy.
 
 ## Trunk-based development
 
