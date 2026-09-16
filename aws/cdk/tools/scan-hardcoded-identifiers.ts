@@ -88,7 +88,39 @@ interface Rule {
    * while a credential in a generated file is still a credential.
    */
   readonly skipFile?: (relativePath: string) => boolean;
+  /**
+   * Rewrite a line before matching, to blank out regions where this rule's
+   * pattern cannot mean what it matches.
+   *
+   * Must preserve length, so reported column positions stay true. Only the
+   * account-ID rule uses one — see {@link maskContentDigests}.
+   */
+  readonly mask?: (line: string) => string;
 }
+
+/**
+ * Replace the body of a `sha256:` content digest with non-digits.
+ *
+ * A digest is 64 hex characters, so roughly one in twenty contains a run of
+ * twelve digits bounded by non-digits — which is exactly the account-ID
+ * pattern. `docs/dependency-pinning.md` requires every third-party image to be
+ * named by digest, so this scanner and that rule collide by construction, at a
+ * rate that makes it look like bad luck rather than a defect.
+ *
+ * It matters because of what the collision costs. The obvious remedy is
+ * `scan-allow: aws-account-id` on the line, and a suppression is per line and
+ * per rule, not per match: the line it silences is a line naming a registry,
+ * a repository and an account-shaped string, which is precisely where a real
+ * account ID would sit in an ECR reference. So the workaround for the false
+ * positive disables the check for the true one.
+ *
+ * Masking instead of suppressing keeps the rest of the line live. The
+ * replacement is the same length as what it replaces, so a finding elsewhere on
+ * the line still reports the right column, and nothing outside the 64 hex
+ * characters of a digest is touched — an account ID cannot be inside one.
+ */
+export const maskContentDigests = (line: string): string =>
+  line.replace(/sha256:[0-9a-f]{64}/gi, (digest) => 'x'.repeat(digest.length));
 
 /** Lockfiles and scanner baselines: machine-generated, digit-dense, reviewed by tooling. */
 const isGeneratedManifest = (relativePath: string): boolean => {
@@ -114,6 +146,7 @@ export const RULES: readonly Rule[] = [
       'token, or one of the reserved example IDs',
     isExample: (match) => RESERVED_EXAMPLE_ACCOUNT_IDS.includes(match),
     skipFile: isGeneratedManifest,
+    mask: maskContentDigests,
   },
   {
     id: 'aws-access-key-id',
@@ -165,7 +198,12 @@ export const scanContent = (relativePath: string, content: string): Finding[] =>
   for (const rule of RULES) {
     if (rule.skipFile?.(relativePath)) continue;
 
-    lines.forEach((line, index) => {
+    lines.forEach((rawLine, index) => {
+      // Matched against the masked line, suppressed against the raw one: the
+      // mask exists to stop a pattern matching text that cannot mean what it
+      // matches, and an inline `scan-allow:` is part of the source either way.
+      const line = rule.mask ? rule.mask(rawLine) : rawLine;
+
       rule.pattern.lastIndex = 0;
       let match: RegExpExecArray | null;
 
@@ -181,7 +219,7 @@ export const scanContent = (relativePath: string, content: string): Finding[] =>
         }
 
         if (rule.isExample?.(value)) continue;
-        if (suppressionFor(line, rule.id)) continue;
+        if (suppressionFor(rawLine, rule.id)) continue;
 
         findings.push({
           file: relativePath,
