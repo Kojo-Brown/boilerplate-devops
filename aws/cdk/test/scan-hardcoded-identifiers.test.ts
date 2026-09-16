@@ -32,6 +32,12 @@ const fakeSecretAccessKey = 'fakeAwsSecretKeyForTestingOnly'.padEnd(40, '0');
 const realLookingAccountId = ['4091', '8372', '6554'].join('');
 const secondAccountId = ['3084', '7261', '9354'].join('');
 
+// 64 hex characters with a twelve-digit run bounded by non-digits in the
+// middle, which is the account-ID pattern appearing inside a content digest by
+// chance. Assembled rather than written out so no line here is a complete
+// account-shaped literal, for the reason given above.
+const digestWithAccountShapedRun = ['ab', realLookingAccountId, 'cd'].join('').padEnd(64, 'e');
+
 describe('scanContent', () => {
   describe('aws-account-id', () => {
     it('flags an account ID that is not a reserved example', () => {
@@ -97,6 +103,40 @@ describe('scanContent', () => {
 
       expect(scanContent('aws/cdk/package-lock.json', content)).toEqual([]);
       expect(scanContent('.checkov.baseline', content)).toEqual([]);
+    });
+
+    // A digest is 64 hex characters, so about one in twenty contains a
+    // digit run that is exactly the account-ID shape. `lib/base-images.ts`
+    // is required to hold digests, so this scanner and that rule collide by
+    // construction — ADOT_COLLECTOR_IMAGE's digest is the collision that
+    // found it.
+    it('does not read a digit run inside a content digest as an account ID', () => {
+      const digest = `sha256:${digestWithAccountShapedRun}`;
+      const content = `  reference: 'public.ecr.aws/example/image@${digest}',`;
+
+      expect(digestWithAccountShapedRun).toMatch(/(?<!\d)\d{12}(?!\d)/);
+      expect(scanContent('lib/base-images.ts', content)).toEqual([]);
+    });
+
+    // The mask is not the same thing as skipping the line. An ECR reference
+    // carries an account ID in the registry host, on the same line as the
+    // digest, which is exactly what a per-line suppression would have hidden.
+    it('still reports an account ID on the same line as a digest', () => {
+      const digest = `sha256:${digestWithAccountShapedRun}`;
+      const content =
+        `image: '${realLookingAccountId}.dkr.ecr.eu-west-1.amazonaws.com/app@${digest}',`;
+
+      const findings = scanContent('lib/example-stack.ts', content);
+      expect(findings.map((f) => f.match)).toEqual([realLookingAccountId]);
+    });
+
+    it('leaves an inline suppression working on a masked line', () => {
+      const digest = `sha256:${digestWithAccountShapedRun}`;
+      const content =
+        `image: '${realLookingAccountId}.dkr.ecr.eu-west-1.amazonaws.com/app@${digest}', ` +
+        `// scan-allow: aws-account-id documented example registry`;
+
+      expect(scanContent('lib/example-stack.ts', content)).toEqual([]);
     });
   });
 

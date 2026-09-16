@@ -30,6 +30,8 @@ import { PreviewPrStack } from '../lib/preview-pr-stack';
 import { NGINX_PLACEHOLDER_IMAGE } from '../lib/base-images';
 import { DoraMetricsStack } from '../lib/dora-metrics-stack';
 import { EksStack } from '../lib/eks-stack';
+import { OtelCollectorStack } from '../lib/otel-collector-stack';
+import { DEFAULT_TAIL_SAMPLING } from '../lib/otel-collector-config';
 
 const app = new cdk.App();
 
@@ -1456,5 +1458,66 @@ new EksStack(app, 'EksStack-Production', {
     region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
   },
   description: 'Production EKS cluster — managed node group + IRSA',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+// ── OpenTelemetry Collector with tail-based sampling ──────────────────────────
+// A tail-sampling collector tier per environment, plus the agent sidecar an
+// application task adds to feed it. Head sampling — which is what the SDKs and
+// `XRayStack`'s sampling rule do — decides at the root span, before the request
+// has failed or been slow; tail sampling decides once the trace is complete, at
+// the cost of a hard constraint: every span of a trace must reach the same
+// collector instance. That is what the two tiers are for, and it is why the
+// sampler tier deliberately does not auto-scale. See docs/otel-collector.md.
+//
+// `clientSecurityGroups` is the one required wiring: the sampler's OTLP port is
+// unauthenticated, so it admits the application task security group and nothing
+// else. Adding the sidecar to an application task is a separate, explicit step:
+//
+//   const agent = OtelCollectorStack.addAgentSidecar(
+//     taskDefinition,
+//     otelCollectorStaging.agentSidecarOptions,
+//   );
+//   appContainer.addContainerDependencies({
+//     container: agent,
+//     condition: ecs.ContainerDependencyCondition.HEALTHY,
+//   });
+//
+// and the application container needs OtelCollectorStack.appEnvironment(...),
+// whose OTEL_TRACES_SAMPLER=parentbased_always_on is what stops the SDK
+// discarding 95% of the traces before the collector can judge any of them.
+new OtelCollectorStack(app, 'OtelCollectorStack-Staging', {
+  vpc: vpcStackStaging.vpc,
+  envName: 'staging',
+  clientSecurityGroups: [ecsStackStaging.taskSecurityGroup],
+  desiredCount: 2,
+  // Staging sees a fraction of production's traffic, so a higher baseline is
+  // both affordable and more useful: it is the environment where you are
+  // looking for a trace you can reproduce rather than one you cannot.
+  sampling: {
+    ...DEFAULT_TAIL_SAMPLING,
+    expectedNewTracesPerSec: 200,
+    numTraces: 50_000,
+    baselinePercentage: 25,
+  },
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Staging OpenTelemetry collector — agent sidecar + tail-sampling tier',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+new OtelCollectorStack(app, 'OtelCollectorStack-Production', {
+  vpc: vpcStackProduction.vpc,
+  envName: 'production',
+  clientSecurityGroups: [ecsStackProduction.taskSecurityGroup],
+  desiredCount: 3,
+  sampling: DEFAULT_TAIL_SAMPLING,
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Production OpenTelemetry collector — agent sidecar + tail-sampling tier',
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });

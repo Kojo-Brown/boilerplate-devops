@@ -85,9 +85,39 @@ export const POSTGRES_CLIENT_IMAGE: PinnedImage = {
   version: '16-alpine',
 };
 
+/**
+ * The AWS Distro for OpenTelemetry collector, run by `OtelCollectorStack` both
+ * as the per-task agent sidecar and as the tail-sampling service.
+ *
+ * Also not a placeholder, and the one where a moving tag would be hardest to
+ * notice: the two tiers must agree about what OTLP means and about how the
+ * `load_balancing` exporter hashes a trace ID. They are separate task
+ * definitions, so `:latest` on both would let a sampler task placed on Tuesday
+ * and an agent task placed on Thursday run different collector builds, and the
+ * symptom — a share of traces decided on a fraction of their spans — is
+ * indistinguishable from the tier simply being undersized.
+ *
+ * Resolved from `public.ecr.aws/aws-observability/aws-otel-collector:v0.50.0`
+ * on 2026-09-16, by index digest rather than per-platform: ECS picks the
+ * `linux/amd64` manifest out of it, and pinning the platform manifest instead
+ * would break the moment a task definition asks for `ARM64` under Graviton.
+ *
+ * This release vendors opentelemetry-collector-contrib v0.158.0, which is what
+ * fixes the component names the config in `otel-collector-config.ts` uses:
+ * `load_balancing` (renamed from `loadbalancing` upstream, which survives only
+ * as a deprecated alias) and the tail-sampling `drop` policy, which replaced
+ * the deprecated `invert_match` decision.
+ */
+export const ADOT_COLLECTOR_IMAGE: PinnedImage = {
+  reference:
+    'public.ecr.aws/aws-observability/aws-otel-collector@sha256:7968fb60db6a2390a47ba6a2df029745638486e285c9b2487da1b722d0855a3e',
+  version: 'v0.50.0',
+};
+
 /** Every pin in this file, for the audit and for `docs/dependency-pinning.md`. */
 export const PINNED_IMAGES: readonly PinnedImage[] = [
   NGINX_PLACEHOLDER_IMAGE,
   XRAY_DAEMON_IMAGE,
   POSTGRES_CLIENT_IMAGE,
+  ADOT_COLLECTOR_IMAGE,
 ];

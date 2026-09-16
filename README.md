@@ -672,5 +672,50 @@ See [docs/trunk-based-development.md](./docs/trunk-based-development.md) for the
 apply commands, the reasoning behind each rule, and what to do when a branch
 fails the size or age limit.
 
+## Tracing with tail-based sampling
+
+`OtelCollectorStack` deploys an OpenTelemetry collector tier that decides which
+traces to keep **after** the trace is complete. Head sampling — which is what
+every SDK default and `XRayStack`'s sampling rule do — decides at the root span,
+before the request has failed or been slow, so a 5% head sample keeps 5% of
+errors and keeps them by accident.
+
+The price is a constraint the processor's own README states and that a load
+balancer breaks by construction: every span of a trace must reach the same
+collector instance. So it is two tiers — an agent sidecar in each application
+task, forwarding with a `load_balancing` exporter keyed by trace ID, in front of
+a sampler service whose instances are that hash ring's backends.
+
+```ts
+const agent = OtelCollectorStack.addAgentSidecar(
+  taskDefinition,
+  otelCollectorStack.agentSidecarOptions,
+);
+appContainer.addContainerDependencies({
+  container: agent,
+  condition: ecs.ContainerDependencyCondition.HEALTHY,
+});
+```
+
+The application container also needs `OtelCollectorStack.appEnvironment(...)`,
+whose `OTEL_TRACES_SAMPLER=parentbased_always_on` is the setting everything else
+depends on: leave the SDK head-sampling and the collector can only choose among
+the traces that survived it.
+
+Three numbers decide whether the tier works, and two are checked at synth time —
+`decision_wait` must exceed the latency policy's threshold, or the slow traces
+that policy exists to catch are the ones it never observes; and `num_traces`
+must hold a decision window of arrivals, or the buffer evicts traces before
+deciding them. Both produce a config the collector starts on and a stream of
+silently dropped traces, which is why they fail the build instead.
+
+The sampler tier deliberately does not auto-scale: scaling reshapes the hash
+ring, and the traces in flight across that window are split between two owners
+and decided on fragments.
+
+See [docs/otel-collector.md](./docs/otel-collector.md) for the policy table, the
+Cloud Map resolver settings that fail silently when wrong, the five alarms and
+what each one means, and the known gaps.
+
 ## Spec Progress
 See [SPEC.md](./SPEC.md).
