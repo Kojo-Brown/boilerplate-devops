@@ -157,6 +157,18 @@ describe('SloBurnRateRollbackStack', () => {
       expect(returnedExpression(template, 'test-slo-burn-rate-fast-long')).toContain('/ 0.005,');
     });
 
+    it('cleans up the noise on a five-nines objective too', () => {
+      // The case the old local helper missed: `1 - 0.99999` at twelve significant
+      // figures is 0.00000999999999995, so the objective where the noise is most
+      // visible was the one that kept it. The budget is now rounded to the
+      // objective's own precision — see `errorBudgetFor` in lib/slo-definitions.ts,
+      // which this stack and the catalogue share.
+      const { template } = makeStack({ slo: { target: 0.99999 } });
+      const expression = returnedExpression(template, 'test-slo-burn-rate-fast-long');
+      expect(expression).toContain('/ 0.00001,');
+      expect(expression).not.toContain('0.00000999999999995');
+    });
+
     it('floors the burn rate at zero below the minimum request count', () => {
       const { template } = makeStack({ slo: { target: 0.999, minimumRequestsPerWindow: 250 } });
       expect(returnedExpression(template, 'test-slo-burn-rate-fast-short')).toContain(

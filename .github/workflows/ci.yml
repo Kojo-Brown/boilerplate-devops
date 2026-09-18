@@ -190,6 +190,19 @@ jobs:
       - name: Audit the policy-as-code gate
         run: npm run audit:policy
 
+      # An objective nobody wired is the failure this catches, and it is a silent
+      # one: the catalogue holds it, docs/slo.md describes it, a quarterly review
+      # reads it off a dashboard that was never created, and no alarm ever
+      # existed. Two more are arithmetic that reads correct — a burn-rate
+      # threshold above `1 / error budget` can never fire, so the alarm stays
+      # green through a total outage, and a traffic floor below
+      # `1 / (burn rate x budget)` pages on one failed request but only at the
+      # traffic floor, which is where the floor was supposed to protect it. This
+      # also validates `proposed` objectives, which no stack synthesises and so
+      # `cdk synth` never checks. See docs/slo.md.
+      - name: Audit SLO definitions and their wiring
+        run: npm run audit:slo
+
       # The Checkov job scans the synthesised CloudFormation rather than the
       # TypeScript, so the templates have to cross the job boundary.
       #

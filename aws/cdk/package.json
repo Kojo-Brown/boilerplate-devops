@@ -20,6 +20,7 @@
     "audit:vulns": "ts-node tools/audit-vulnerability-scanning.ts",
     "audit:policy": "ts-node tools/audit-policy-gate.ts",
     "audit:iam": "ts-node tools/audit-iam-least-privilege.ts",
+    "audit:slo": "ts-node tools/audit-slo-definitions.ts",
     "cdk": "cdk"
   },
   "devDependencies": {
