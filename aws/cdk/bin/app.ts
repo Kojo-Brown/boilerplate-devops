@@ -21,6 +21,8 @@ import { FeatureFlagLifecycleStack } from '../lib/feature-flag-lifecycle-stack';
 import { DbMigrationStack } from '../lib/db-migration-stack';
 import { RollbackAutomationStack } from '../lib/rollback-automation-stack';
 import { SloBurnRateRollbackStack } from '../lib/slo-burn-rate-rollback-stack';
+import { SloStack } from '../lib/slo-stack';
+import { requireSlo, significanceFloorEvents } from '../lib/slo-definitions';
 import { CostAnomalyStack } from '../lib/cost-anomaly-stack';
 import { SecurityHubStack } from '../lib/security-hub-stack';
 import { WafStack } from '../lib/waf-stack';
@@ -829,6 +831,88 @@ new RollbackAutomationStack(app, 'RollbackAutomationStack-Production', {
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
 
+// ── Service Level Objectives ──────────────────────────────────────────────────
+// The objectives themselves live in `lib/slo-definitions.ts`, as data with no
+// CDK tokens in it — which is what makes them reviewable in a diff and readable
+// by `npm run audit:slo`. Everything here only supplies the metrics that measure
+// them in this account, and the two stacks below take their numbers from the
+// same entries rather than restating them.
+//
+// `SloStack` builds three signals per objective, because each is blind to what
+// the others see: multi-window burn-rate alarms (fast, and structurally unable
+// to see slow drift), an error-budget reporter republishing the 30-day window as
+// a metric an alarm *can* evaluate — a CloudWatch alarm period stops at 24 hours
+// — and a no-data alarm, because every other signal here degrades quietly to
+// green when the SLI stops arriving.
+//
+// After deployment:
+//   - Confirm the SNS email subscriptions on `<env>-slo-page` and
+//     `<env>-slo-ticket`, and point the paging topic at the rota rather than at a
+//     mailbox nobody reads at 04:00.
+//   - Watch the `production-slo` dashboard for a week before trusting the budget
+//     number. `minimumEventsPerMinute` in the catalogue is the setting most
+//     likely to need tuning to real traffic, and it is what decides whether a
+//     quiet hour reads as zero burn or as an incident.
+//   - `production-api-latency` is `proposed` and deliberately not wired: ALB
+//     publishes no count of requests under a latency threshold. docs/slo.md §5
+//     has the EMF contract the application has to emit before it can be made
+//     active.
+
+const stagingAvailabilitySlo = requireSlo('staging-api-availability');
+const productionAvailabilitySlo = requireSlo('production-api-availability');
+
+new SloStack(app, 'SloStack-Staging', {
+  envName: 'staging',
+  slos: [
+    {
+      sloId: 'staging-api-availability',
+      source: {
+        kind: 'alb',
+        loadBalancerFullName: ecsStackStaging.alb.loadBalancerFullName,
+        targetGroupFullName: ecsStackStaging.targetGroup.targetGroupFullName,
+      },
+    },
+  ],
+  // Staging evaluates the same policies as production and wakes nobody, so a
+  // change to them is exercised before it reaches the rota.
+  downgradePagesToTickets: true,
+  ticketEmails: process.env.STAGING_SLO_NOTIFY_EMAIL
+    ? [process.env.STAGING_SLO_NOTIFY_EMAIL]
+    : [],
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Staging SLOs — burn-rate alarms, error-budget reporting, and a dashboard',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+new SloStack(app, 'SloStack-Production', {
+  envName: 'production',
+  slos: [
+    {
+      sloId: 'production-api-availability',
+      source: {
+        kind: 'alb',
+        loadBalancerFullName: ecsStackProduction.alb.loadBalancerFullName,
+        targetGroupFullName: ecsStackProduction.targetGroup.targetGroupFullName,
+      },
+    },
+  ],
+  pageEmails: process.env.PRODUCTION_SLO_PAGE_EMAIL
+    ? [process.env.PRODUCTION_SLO_PAGE_EMAIL]
+    : [],
+  ticketEmails: process.env.PRODUCTION_SLO_TICKET_EMAIL
+    ? [process.env.PRODUCTION_SLO_TICKET_EMAIL]
+    : [],
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Production SLOs — burn-rate alarms, error-budget reporting, and a dashboard',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
 // ── SLO Burn-Rate Rollback ────────────────────────────────────────────────────
 // The companion to RollbackAutomationStack above, not a replacement for it.
 // That stack answers "is a threshold crossed right now"; this one answers "is
@@ -859,7 +943,15 @@ new SloBurnRateRollbackStack(app, 'SloBurnRateRollbackStack-Staging', {
   envName: 'staging',
   loadBalancerFullName: ecsStackStaging.alb.loadBalancerFullName,
   targetGroupFullName: ecsStackStaging.targetGroup.targetGroupFullName,
-  slo: { target: 0.995, windowDays: 30, minimumRequestsPerWindow: 30 },
+  slo: {
+    target: stagingAvailabilitySlo.objective,
+    windowDays: stagingAvailabilitySlo.windowDays,
+    // The conservative floor, not the SLI's own: this stack mutates production
+    // traffic, and `significanceFloorEvents` is the count at which a single
+    // failed request cannot cross the tightest policy on its own. See
+    // docs/slo.md §6.
+    minimumRequestsPerWindow: significanceFloorEvents(stagingAvailabilitySlo),
+  },
   rollbackTargets: [
     {
       clusterName: ecsStackStaging.cluster.clusterName,
@@ -881,7 +973,11 @@ new SloBurnRateRollbackStack(app, 'SloBurnRateRollbackStack-Production', {
   envName: 'production',
   loadBalancerFullName: ecsStackProduction.alb.loadBalancerFullName,
   targetGroupFullName: ecsStackProduction.targetGroup.targetGroupFullName,
-  slo: { target: 0.999, windowDays: 30, minimumRequestsPerWindow: 60 },
+  slo: {
+    target: productionAvailabilitySlo.objective,
+    windowDays: productionAvailabilitySlo.windowDays,
+    minimumRequestsPerWindow: significanceFloorEvents(productionAvailabilitySlo),
+  },
   rollbackTargets: [
     {
       clusterName: ecsStackProduction.cluster.clusterName,

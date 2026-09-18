@@ -10,6 +10,7 @@ import * as sns from 'aws-cdk-lib/aws-sns';
 import * as sns_sub from 'aws-cdk-lib/aws-sns-subscriptions';
 import { Construct } from 'constructs';
 import { RollbackTarget } from './rollback-automation-stack';
+import { errorBudgetFor } from './slo-definitions';
 
 /**
  * A multi-window burn-rate policy, in the shape the Google SRE workbook
@@ -270,12 +271,11 @@ export class SloBurnRateRollbackStack extends cdk.Stack {
       }
     }
 
-    // `1 - 0.999` is 0.0010000000000000009 in binary floating point, and that
-    // is what would be written into the alarm expression and read by whoever
-    // opens it. Twelve significant figures is far more precision than any
-    // objective carries and enough to keep an unusual one (0.9995, 0.99999)
-    // intact.
-    const errorBudget = Number((1 - props.slo.target).toPrecision(12));
+    // Shared with the catalogue rather than computed here: two implementations of
+    // "1 - target without the float noise" is how one of them ends up rounding
+    // differently from the other, and the number lands in an alarm expression
+    // somebody reads during an incident. See `errorBudgetFor`.
+    const errorBudget = errorBudgetFor(props.slo.target);
 
     // ── Encryption key for logs and Lambda configuration ────────────────────────
     // The rollback log records which revision was pulled out of production and

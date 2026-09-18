@@ -717,5 +717,50 @@ See [docs/otel-collector.md](./docs/otel-collector.md) for the policy table, the
 Cloud Map resolver settings that fail silently when wrong, the five alarms and
 what each one means, and the known gaps.
 
+## Service level objectives
+
+This repository had burn-rate alarms before it had SLOs. The objective they
+burned against was a literal in `bin/app.ts` — enough to drive an actuator, not
+enough to be an objective: nothing recorded who owned the number, what it was
+measured on, or what happens when the budget runs out.
+
+The objectives now live in
+[`aws/cdk/lib/slo-definitions.ts`](./aws/cdk/lib/slo-definitions.ts) as data with
+no CDK tokens in it, which is what makes them reviewable in a diff and readable
+by `npm run audit:slo`. `SloStack` turns each one into three signals, because
+each is blind to what the others see:
+
+- **Burn-rate alarms** — multi-window (long decides significance, short decides
+  currency), at 14.4x/1h, 6x/6h and 1x/24h. Fast, and structurally unable to see
+  slow drift.
+- **An error-budget reporter** — a CloudWatch alarm evaluates at most a 24-hour
+  period, so a 30-day window cannot be alarmed on directly. A Lambda reads the
+  window with `GetMetricData` every 15 minutes and republishes it as
+  `ErrorBudgetRemainingPercent`, which can be. That is the only signal that sees
+  a month of small regressions, none of them crossing a burn threshold, spending
+  the whole budget.
+- **A no-data alarm** — the only one here that treats missing data as breaching.
+  Every other signal degrades quietly to green when the SLI stops arriving: a
+  burn rate over zero requests is zero, and an unspent budget is a full one.
+
+Two things are checked at synth time because both look correct in review. A
+burn-rate threshold above `1 / error budget` can **never fire** — 14.4x against a
+90% objective needs a 144% error ratio — so the alarm deploys, evaluates, and
+stays green through a total outage. And a traffic floor below
+`1 / (burn rate × error budget)` pages on a *single* failed request, but only at
+the traffic floor, which is exactly where the floor was meant to protect it. The
+floor is therefore declared as a rate rather than a count: one number applied to
+a 5-minute window and a 24-hour window is wrong for one of them by construction.
+
+A latency SLO is deliberately **not** shipped active. An SLI is a ratio of good
+events to valid events, ALB publishes no count of requests under a threshold, and
+CloudWatch cannot aggregate a `TargetResponseTime` percentile into one — so
+`SloStack` rejects an `alb` source on a latency SLI rather than approximating it
+with an alarm that reads like an SLO and produces no burn rate.
+
+See [docs/slo.md](./docs/slo.md) for the catalogue, the arithmetic, the EMF
+contract a latency SLI needs, the on-call procedure the alarms link to, and the
+known gaps.
+
 ## Spec Progress
 See [SPEC.md](./SPEC.md).
