@@ -14,6 +14,7 @@ import { GitHubOidcStack } from '../lib/github-oidc-stack';
 import { CloudWatchDashboardStack } from '../lib/cloudwatch-dashboard-stack';
 import { CloudWatchAlarmsStack } from '../lib/cloudwatch-alarms-stack';
 import { LogInsightsStack } from '../lib/log-insights-stack';
+import { LogPipelineStack } from '../lib/log-pipeline-stack';
 import { BlueGreenDeployStack } from '../lib/blue-green-deploy-stack';
 import { CanaryDeployStack } from '../lib/canary-deploy-stack';
 import { AppConfigStack } from '../lib/appconfig-stack';
@@ -478,6 +479,43 @@ new LogInsightsStack(app, 'LogInsightsStack-Production', {
     region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
   },
   description: 'Production CloudWatch Logs Insights saved queries for error analysis',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+// ── Structured log pipeline with PII scrubbing ────────────────────────────────
+// Application logs leave CloudWatch Logs through a subscription filter, are
+// rewritten by a Firehose transform that redacts and tokenises PII, and land in
+// S3 as line-delimited JSON. The transit log groups are the short-lived copy;
+// the archive is the one that is kept and queried.
+//
+// The account-wide data protection policy is owned by the production stack
+// alone. It is account- and region-scoped, so two stacks declaring one either
+// fight over the same name on every deploy or both apply — doubling the audit
+// findings and the per-byte cost — and neither failure surfaces as an error.
+
+new LogPipelineStack(app, 'LogPipelineStack-Staging', {
+  envName: 'staging',
+  sourceLogGroupNames: [`/ecs/staging/${ecsStackStaging.service.serviceName}`],
+  // Shorter than production's: staging's archive exists to prove the pipeline
+  // works, not to answer a question about last quarter.
+  archiveRetentionDays: 90,
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Staging structured log pipeline — PII scrubbed before the archive ingests it',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+new LogPipelineStack(app, 'LogPipelineStack-Production', {
+  envName: 'production',
+  sourceLogGroupNames: [`/ecs/production/${ecsStackProduction.service.serviceName}`],
+  manageAccountDataProtectionPolicy: true,
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Production structured log pipeline — PII scrubbed before the archive ingests it',
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
 

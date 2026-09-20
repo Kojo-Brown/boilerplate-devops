@@ -203,6 +203,19 @@ jobs:
       - name: Audit SLO definitions and their wiring
         run: npm run audit:slo
 
+      # Every gate above reasons about the artifact or the account. This one is
+      # about the data, and a scrubbing pipeline fails in exactly one direction
+      # that nobody sees: the records still arrive, the delivery metrics stay
+      # perfect, and what landed in S3 has an email address in it. The near
+      # misses are one line each — a destination with no processor, which is the
+      # default shape of every Firehose example; `S3BackupMode: Enabled`, which
+      # archives the *untransformed* records under a prefix called `backup`; an
+      # error prefix inside the archive prefix, which puts the records Firehose
+      # could not transform in the dataset the archive's readers were given. See
+      # docs/log-pipeline.md.
+      - name: Audit the log-scrubbing pipeline
+        run: npm run audit:logs
+
       # The Checkov job scans the synthesised CloudFormation rather than the
       # TypeScript, so the templates have to cross the job boundary.
       #
