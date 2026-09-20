@@ -25,6 +25,7 @@ Reusable CI/CD workflows and AWS infrastructure templates.
 | Helm chart — per-environment values, schema-validated | `k8s/charts/app/` |
 | Default-deny NetworkPolicy + allowlist, enforced by the CNI | `k8s/charts/app/templates/networkpolicy.yaml` |
 | GitOps delivery — app-of-apps, sync waves, drift detection | `k8s/argocd/` |
+| Log pipeline — PII scrubbed before the archive ingests it | `aws/cdk/lib/log-pipeline-stack.ts`, `aws/cdk/lib/log-scrubbing.ts` |
 
 ## Usage
 
@@ -761,6 +762,65 @@ with an alarm that reads like an SLO and produces no burn rate.
 See [docs/slo.md](./docs/slo.md) for the catalogue, the arithmetic, the EMF
 contract a latency SLI needs, the on-call procedure the alarms link to, and the
 known gaps.
+
+## Structured logs with PII scrubbing
+
+An application logs an email address by accident roughly once per feature — not
+in a field called `email`, which gets reviewed, but interpolated into a message
+while somebody was debugging a support ticket. The line is correct, the deploy is
+green, and the address is now in a store that is backed up, indexed and kept for
+a year.
+
+`LogPipelineStack` stops that at the last point where stopping it is possible:
+CloudWatch Logs → subscription filter → Firehose → a Lambda transform that
+redacts and tokenises → S3. The CloudWatch copy is transit and expires in weeks;
+the archive is what is kept, and nothing reaches it without passing through the
+transform.
+
+**"Before ingest" has to name an ingest.** The `awslogs` driver's write *is* the
+ingest, so nothing can scrub before it — what CloudWatch offers there is an
+account-wide data protection policy, which masks managed identifiers at ingest
+for every reader without `logs:Unmask` and records a finding. That is an access
+control over data the account still holds, which is why the transit groups are
+short-lived and the real scrubbing happens before S3.
+
+**The transform never returns `ProcessingFailed`.** Firehose's three outcomes are
+`Ok`, `Dropped`, and `ProcessingFailed` — and the third retries and then writes
+**the original record** to the error prefix. That is what every transform
+blueprint returns for a record it could not handle, and in a scrubbing pipeline
+it is the leak: the record that defeated the scrubber is the one that lands
+unscrubbed. Anything unreadable is dropped, counted and alarmed on instead.
+Losing a log line is recoverable; writing it unscrubbed is not.
+
+Three more things that are one line each and invisible in review:
+
+- **`S3BackupMode: Enabled`** writes the *untransformed* records to S3 beside
+  the transformed ones, under a prefix called `backup`.
+- **An error prefix inside the archive prefix** puts the records Firehose could
+  not transform in the dataset the archive's readers were given. Here
+  `quarantine/` is a separate top level, denied by bucket policy to everyone not
+  named, alarmed on, and expiring in seven days.
+- **Firehose adds no separator between records.** A transform returning bare
+  JSON produces objects that are one unparseable line, which Athena reports as
+  zero rows rather than as an error.
+
+Identifiers are tokenised rather than masked — `tkn:email:9f2c…`, stable per
+subject — so "what did this user do before the error?" still has an answer. That
+is pseudonymisation, not anonymisation: the domain of an email address is small
+enough to enumerate, so the archive is personal data with the values removed. If
+the HMAC key cannot be read, tokenisation degrades to masking rather than to
+passing the value through, and an alarm says so.
+
+The ruleset is data with a synth-time validator, because every way of getting it
+wrong deploys cleanly: a pattern that does not compile throws at cold start and
+delivers the batch raw, a pattern matching the empty string turns every line into
+markers, a `g` flag gives the shared RegExp a `lastIndex` that survives between
+records, and a key that is both masked and tokenised is masked — killing the
+correlation silently. `npm run audit:logs` is the review gate over the
+synthesised templates.
+
+See [docs/log-pipeline.md](./docs/log-pipeline.md) for the rules, the quarantine
+policy, the Athena layout and the known gaps.
 
 ## Spec Progress
 See [SPEC.md](./SPEC.md).
