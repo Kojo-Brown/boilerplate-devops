@@ -216,6 +216,22 @@ jobs:
       - name: Audit the log-scrubbing pipeline
         run: npm run audit:logs
 
+      # The gate above is about what the telemetry contains. This one is about
+      # whether it joins up across a queue, which is the one boundary where
+      # broken tracing is indistinguishable from working tracing: the API is
+      # instrumented, the worker is instrumented, both emit spans and appear in
+      # the service map, and the only thing missing is the edge between them.
+      # Nobody notices until an incident, because the thing you look at in an
+      # incident is the trace of the request that failed — and it ends at the
+      # 202. The near misses are each one line: a receive call that does not
+      # name AWSTraceHeader, which ReceiveMessage then simply omits; an SNS
+      # subscription without RawMessageDelivery, which moves the publisher's
+      # message attributes inside the notification envelope; and a consumer
+      # sampler that is not parent-based, which makes producer and consumer
+      # decide the same trace independently. See docs/queue-tracing.md.
+      - name: Audit queue trace-context propagation
+        run: npm run audit:tracing
+
       # The Checkov job scans the synthesised CloudFormation rather than the
       # TypeScript, so the templates have to cross the job boundary.
       #
