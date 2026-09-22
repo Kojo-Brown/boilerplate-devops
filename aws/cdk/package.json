@@ -22,6 +22,7 @@
     "audit:iam": "ts-node tools/audit-iam-least-privilege.ts",
     "audit:slo": "ts-node tools/audit-slo-definitions.ts",
     "audit:logs": "ts-node tools/audit-log-scrubbing.ts",
+    "audit:tracing": "ts-node tools/audit-queue-tracing.ts",
     "cdk": "cdk"
   },
   "devDependencies": {

@@ -26,6 +26,7 @@ Reusable CI/CD workflows and AWS infrastructure templates.
 | Default-deny NetworkPolicy + allowlist, enforced by the CNI | `k8s/charts/app/templates/networkpolicy.yaml` |
 | GitOps delivery — app-of-apps, sync waves, drift detection | `k8s/argocd/` |
 | Log pipeline — PII scrubbed before the archive ingests it | `aws/cdk/lib/log-pipeline-stack.ts`, `aws/cdk/lib/log-scrubbing.ts` |
+| Trace context across a queue — API → queue → worker | `aws/cdk/lib/queue-trace-context.ts`, `aws/cdk/lib/traced-queue-stack.ts` |
 
 ## Usage
 
@@ -821,6 +822,47 @@ synthesised templates.
 
 See [docs/log-pipeline.md](./docs/log-pipeline.md) for the rules, the quarantine
 policy, the Athena layout and the known gaps.
+
+## Tracing across a queue
+
+A queue is the one boundary where broken tracing and working tracing look
+identical. The API is instrumented, the worker is instrumented, both emit spans
+and both appear in the service map — and the only thing missing is the edge
+between them. There is no error, no failed call and no metric that differs from
+the working case, and the thing you look at during an incident is the trace of
+the request that failed, which ends at the 202.
+
+`queue-trace-context.ts` is the contract and `TracedQueueStack` is the queue that
+implements it. Four things it is arranged around:
+
+- **The body never carries trace context.** FIFO content-based deduplication
+  hashes the body, so a trace id in there makes two sends of an identical
+  message two distinct messages — deduplication stops deduplicating with no
+  error, and the symptom is duplicate work. W3C context goes in message
+  attributes; X-Ray goes in the `AWSTraceHeader` system attribute.
+- **`ReceiveMessage` returns system attributes only when the call names them.**
+  Omit `MessageSystemAttributeNames` and the field is simply absent from every
+  message: no error, no warning, a new trace per message forever. Nothing in IAM
+  can catch it, so the name is deployed in the worker's task definition and
+  `npm run audit:tracing` checks it is still there.
+- **A worker span is not always a child.** The tail sampler decides a trace
+  `decisionWaitSeconds` after its first span and exports it; spans arriving
+  later are dropped as late arrivals. Past that window — and on any redelivery,
+  and under an unsampled parent — the worker starts a new trace **linked** to
+  the producer's rather than a child of a trace that is already closed.
+- **SQS allows ten message attributes and enforces it at `SendMessage`.**
+  Injection is budget-aware: `baggage` goes first, then `tracestate`, never
+  `traceparent`, and what was given up is logged and alarmed on.
+
+Both propagation failures are reported by the worker, because nothing else can
+see them: a worker that found no context does exactly what a worker at the start
+of a trace does. The stack puts metric filters on those two log events and alarms
+on them, alongside a queue-dwell alarm set *below* the collector's decision
+window — at or past it, it would be describing traces already lost.
+
+See [docs/queue-tracing.md](./docs/queue-tracing.md) for the carriers, the
+parent-or-link table, the producer and worker snippets, the eleven gate rules and
+the known gaps.
 
 ## Spec Progress
 See [SPEC.md](./SPEC.md).

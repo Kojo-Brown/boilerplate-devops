@@ -34,6 +34,7 @@ import { NGINX_PLACEHOLDER_IMAGE } from '../lib/base-images';
 import { DoraMetricsStack } from '../lib/dora-metrics-stack';
 import { EksStack } from '../lib/eks-stack';
 import { OtelCollectorStack } from '../lib/otel-collector-stack';
+import { TracedQueueStack } from '../lib/traced-queue-stack';
 import { DEFAULT_TAIL_SAMPLING } from '../lib/otel-collector-config';
 
 const app = new cdk.App();
@@ -1653,5 +1654,68 @@ new OtelCollectorStack(app, 'OtelCollectorStack-Production', {
     region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
   },
   description: 'Production OpenTelemetry collector — agent sidecar + tail-sampling tier',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+// ── Distributed tracing across API → queue → worker ───────────────────────────
+// `OtelCollectorStack` above traces a request while it is a request. The moment
+// it becomes a message the trace ends: the producer's span closes when the API
+// returns 202 and the worker opens a span with no parent, so the backend holds
+// two unrelated traces and nothing says they are the same piece of work.
+//
+// `TracedQueueStack` is the queue that keeps them joined — the carriers, the
+// parent-or-link boundary and the two alarms that say when propagation stopped.
+// `lib/queue-trace-context.ts` is the contract the producer and the worker
+// implement; `npm run audit:tracing` checks that what synth wrote still
+// satisfies it. See docs/queue-tracing.md.
+//
+// `decisionWaitSeconds` is passed explicitly rather than defaulted. It is the
+// collector's tail-sampling window, and the parent-or-link boundary and the
+// dwell alarm are both derived from it — so if an environment's `sampling` is
+// changed above and this is left behind, the queue is measured against a window
+// that no longer exists, and nothing reports it.
+new TracedQueueStack(app, 'TracedQueueStack-Staging', {
+  envName: 'staging',
+  queueName: 'orders',
+  decisionWaitSeconds: 30,
+  propagation: {
+    format: 'both',
+    consumer: 'ecs-poller',
+    // The reference producer sends an order id, a tenant and a schema version.
+    // Stated here because SQS enforces its limit of ten *per message*: the
+    // shape carrying the most attributes is the one SendMessage rejects, and it
+    // is never the shape a test sends.
+    businessAttributeCount: 3,
+    attributeNames: ['orderId', 'tenant', 'schemaVersion'],
+  },
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Staging traced work queue — trace context survives API → queue → worker',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+new TracedQueueStack(app, 'TracedQueueStack-Production', {
+  envName: 'production',
+  queueName: 'orders',
+  decisionWaitSeconds: DEFAULT_TAIL_SAMPLING.decisionWaitSeconds,
+  // Production keeps failed messages longer before dead-lettering, because a
+  // redrive here is a message whose original trace is long decided — it links
+  // rather than parents, and the message body is then the only record of what
+  // it was doing.
+  maxReceiveCount: 5,
+  retentionDays: 7,
+  propagation: {
+    format: 'both',
+    consumer: 'ecs-poller',
+    businessAttributeCount: 3,
+    attributeNames: ['orderId', 'tenant', 'schemaVersion'],
+  },
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Production traced work queue — trace context survives API → queue → worker',
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
