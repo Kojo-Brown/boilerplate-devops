@@ -36,6 +36,11 @@ import { EksStack } from '../lib/eks-stack';
 import { OtelCollectorStack } from '../lib/otel-collector-stack';
 import { TracedQueueStack } from '../lib/traced-queue-stack';
 import { DEFAULT_TAIL_SAMPLING } from '../lib/otel-collector-config';
+import {
+  SyntheticCanaryQuorumStack,
+  SyntheticCanaryStack,
+} from '../lib/synthetic-canary-stack';
+import { SyntheticCanaryFleet } from '../lib/synthetic-canary-probes';
 
 const app = new cdk.App();
 
@@ -1717,5 +1722,148 @@ new TracedQueueStack(app, 'TracedQueueStack-Production', {
     region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
   },
   description: 'Production traced work queue — trace context survives API → queue → worker',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+// ── Synthetic canaries from multiple regions ──────────────────────────────────
+// Every alarm above this line is measured from inside the system, and they all
+// share one blind spot: when the request never reaches the load balancer, they
+// do not go red, they go quiet. An expired certificate, a DNS record pointing
+// at a deleted distribution, a WAF rule matching everything — each is total
+// user-facing failure and an empty `RequestCount`, and CloudWatch does not
+// breach a threshold on a metric with no data points.
+//
+// The canaries probe from outside the account, which is the only vantage point
+// that sees any of those. They probe from several regions because one region
+// cannot distinguish "the application is down" from "this probe's region is
+// having a bad morning" — and because N independent regional alarms are not a
+// comparison, `SyntheticCanaryQuorumStack` is what turns them into one:
+// `quorum` regions agreeing pages, a single region disagreeing tickets.
+//
+// `aggregationRegion` is where the verdicts are republished and where the
+// quorum alarm lives, since a CloudWatch alarm cannot read a metric from
+// another region. It defaults to a region the application does not itself run
+// in: an aggregation region that goes down with the application takes the
+// quorum alarm with it, leaving only the per-region local alarms.
+//
+// The URLs are placeholders in the reserved `example.com` domain, like the ACM
+// certificate ARNs at the top of this file. A canary pointed at a host that
+// does not resolve fails every run from every region, which is the loudest
+// possible reminder to set them — see docs/synthetic-canaries.md §7.
+const canaryProbeRegions = parseList(
+  (app.node.tryGetContext('canaryProbeRegions') as string | undefined) ??
+    process.env.CANARY_PROBE_REGIONS,
+);
+const productionCanaryRegions =
+  canaryProbeRegions.length > 0
+    ? canaryProbeRegions
+    : ['us-east-1', 'eu-west-1', 'ap-southeast-1'];
+const stagingCanaryRegions = productionCanaryRegions.slice(0, 2);
+
+const canaryAggregationRegion =
+  (app.node.tryGetContext('canaryAggregationRegion') as string | undefined) ??
+  process.env.CANARY_AGGREGATION_REGION ??
+  'eu-west-1';
+
+const stagingCanaryBaseUrl =
+  (app.node.tryGetContext('stagingCanaryBaseUrl') as string | undefined) ??
+  process.env.STAGING_CANARY_BASE_URL ??
+  'https://staging.example.com';
+
+const productionCanaryBaseUrl =
+  (app.node.tryGetContext('productionCanaryBaseUrl') as string | undefined) ??
+  process.env.PRODUCTION_CANARY_BASE_URL ??
+  'https://www.example.com';
+
+const canaryFleet = (options: {
+  readonly envName: string;
+  readonly baseUrl: string;
+  readonly regions: readonly string[];
+  readonly quorum: number;
+  readonly scheduleMinutes: number;
+  readonly maxDetectionMinutes: number;
+}): SyntheticCanaryFleet => ({
+  envName: options.envName,
+  regions: options.regions,
+  aggregationRegion: canaryAggregationRegion,
+  quorum: options.quorum,
+  maxDetectionMinutes: options.maxDetectionMinutes,
+  probes: [
+    {
+      // The API's own health endpoint: the shortest path through the edge, the
+      // load balancer and the application, with a body the application only
+      // produces when its dependencies answered.
+      name: 'health',
+      url: `${options.baseUrl}/healthz`,
+      bodyMarker: '"status":"ok"',
+      latencyBudgetMs: 2_000,
+      scheduleMinutes: options.scheduleMinutes,
+    },
+    {
+      // The landing page, which is the CDN's cache, the certificate and the
+      // application shell rather than the API. A marker from the rendered page
+      // rather than a tag every error page also carries.
+      name: 'home',
+      url: `${options.baseUrl}/`,
+      bodyMarker: 'data-app-shell="ready"',
+      latencyBudgetMs: 3_000,
+      scheduleMinutes: options.scheduleMinutes,
+    },
+  ],
+});
+
+const stagingCanaryFleet = canaryFleet({
+  envName: 'staging',
+  baseUrl: stagingCanaryBaseUrl,
+  regions: stagingCanaryRegions,
+  // Two regions, so quorum is both of them: a fleet this size has no majority
+  // short of unanimity, and one of two regions failing is exactly the case the
+  // per-region ticket alarm is for.
+  quorum: 2,
+  // Staging is probed less often. It is not paged on, and the reason it is
+  // probed at all is to find a broken probe — a wrong marker, a stale URL, an
+  // IAM change — before production is the place that finds it.
+  scheduleMinutes: 15,
+  maxDetectionMinutes: 30,
+});
+
+const productionCanaryFleet = canaryFleet({
+  envName: 'production',
+  baseUrl: productionCanaryBaseUrl,
+  regions: productionCanaryRegions,
+  quorum: 2,
+  scheduleMinutes: 5,
+  maxDetectionMinutes: 10,
+});
+
+for (const region of stagingCanaryRegions) {
+  new SyntheticCanaryStack(app, `SyntheticCanaryStack-Staging-${region}`, {
+    fleet: stagingCanaryFleet,
+    env: { account: process.env.CDK_DEFAULT_ACCOUNT, region },
+    description: `Staging synthetic canaries probing from ${region}`,
+    tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+  });
+}
+
+for (const region of productionCanaryRegions) {
+  new SyntheticCanaryStack(app, `SyntheticCanaryStack-Production-${region}`, {
+    fleet: productionCanaryFleet,
+    env: { account: process.env.CDK_DEFAULT_ACCOUNT, region },
+    description: `Production synthetic canaries probing from ${region}`,
+    tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+  });
+}
+
+new SyntheticCanaryQuorumStack(app, 'SyntheticCanaryQuorumStack-Staging', {
+  fleet: stagingCanaryFleet,
+  env: { account: process.env.CDK_DEFAULT_ACCOUNT, region: canaryAggregationRegion },
+  description: 'Staging synthetic canary quorum — compares the probe regions',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+new SyntheticCanaryQuorumStack(app, 'SyntheticCanaryQuorumStack-Production', {
+  fleet: productionCanaryFleet,
+  env: { account: process.env.CDK_DEFAULT_ACCOUNT, region: canaryAggregationRegion },
+  description: 'Production synthetic canary quorum — compares the probe regions',
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });

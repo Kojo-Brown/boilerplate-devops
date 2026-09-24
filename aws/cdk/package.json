@@ -23,6 +23,7 @@
     "audit:slo": "ts-node tools/audit-slo-definitions.ts",
     "audit:logs": "ts-node tools/audit-log-scrubbing.ts",
     "audit:tracing": "ts-node tools/audit-queue-tracing.ts",
+    "audit:canaries": "ts-node tools/audit-synthetic-canaries.ts",
     "cdk": "cdk"
   },
   "devDependencies": {

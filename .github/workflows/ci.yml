@@ -232,6 +232,24 @@ jobs:
       - name: Audit queue trace-context propagation
         run: npm run audit:tracing
 
+      # Every gate above reasons about telemetry the system emits about itself,
+      # and they share one blind spot: when a request never reaches the load
+      # balancer, none of them goes red — they go quiet, and CloudWatch does not
+      # breach a threshold on a metric with no data points. The canaries probe
+      # from outside the account, which is the only vantage point that sees an
+      # expired certificate or a DNS record pointing at nothing. This checks the
+      # seam between the canaries and the alarms comparing them, which lives in
+      # different stacks in different regions joined only by a namespace and
+      # three dimension values. The near misses are each one property: a canary
+      # inside the VPC, which reaches the application over the network it
+      # already trusts; the generated canary role, whose PutMetricData grant is
+      # conditioned on the CloudWatchSynthetics namespace and so denies the
+      # republish the quorum alarm reads; and a quorum expression whose terms
+      # are not FILL()ed, where one silent region removes the data point for
+      # every other region. See docs/synthetic-canaries.md.
+      - name: Audit the synthetic canary fleet
+        run: npm run audit:canaries
+
       # The Checkov job scans the synthesised CloudFormation rather than the
       # TypeScript, so the templates have to cross the job boundary.
       #

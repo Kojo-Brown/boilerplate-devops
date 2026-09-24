@@ -864,5 +864,46 @@ See [docs/queue-tracing.md](./docs/queue-tracing.md) for the carriers, the
 parent-or-link table, the producer and worker snippets, the eleven gate rules and
 the known gaps.
 
+## Synthetic canaries from multiple regions
+
+Every alarm above this one is measured from inside the system, and they share a
+blind spot: when a request never reaches the load balancer they do not go red,
+they go quiet — and CloudWatch does not breach a threshold on a metric with no
+data points. An expired certificate, a DNS record pointing at a deleted
+distribution, a WAF rule matching everything: total user-facing failure, and an
+empty `RequestCount`.
+
+`SyntheticCanaryStack` probes from outside the account, from several regions,
+and `SyntheticCanaryQuorumStack` compares them. Four things it is arranged
+around:
+
+- **One region cannot tell an outage from a bad morning in its own region.** So
+  the fleet pages on a quorum — `quorum` regions agreeing — and tickets when a
+  single region disagrees, because one region disagreeing is a statement about
+  reachability from that region. N independent regional alarms are not a
+  comparison: one outage pages N times and one flaky region pages the same way.
+- **CloudWatch alarms are regional.** An alarm cannot read a metric from another
+  region, so each canary republishes its verdict into the aggregation region
+  with `PutMetricData` and the quorum is metric math over those series. The
+  generated canary role allows `PutMetricData` only in the `CloudWatchSynthetics`
+  namespace, which is exactly the call the handler makes — the added statement
+  is what stops every run being denied at the republish.
+- **A canary that stopped running looks exactly like one that is passing.** It
+  publishes nothing, and nothing is what every threshold on failures reads as
+  health. Each region gets a heartbeat alarm whose whole subject is the absence
+  of data, and the quorum's terms are `FILL()`ed so one silent region does not
+  blind the alarm for every other region at once.
+- **`200 OK` is what a maintenance page returns.** Every probe asserts on a body
+  marker and a latency budget as well as the status, and the handler refuses to
+  run if any of the three is missing rather than quietly checking less.
+
+The canaries are deliberately outside any VPC: on the application's own network
+a probe reaches the load balancer directly and stops seeing the DNS record, the
+certificate and the WAF, which is most of what it is for.
+
+See [docs/synthetic-canaries.md](./docs/synthetic-canaries.md) for the quorum
+arithmetic, the three ways silence is handled, the URLs and markers you have to
+set, the cost model, the fifteen gate rules and the known gaps.
+
 ## Spec Progress
 See [SPEC.md](./SPEC.md).
