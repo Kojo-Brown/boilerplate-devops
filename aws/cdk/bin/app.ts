@@ -41,6 +41,7 @@ import {
   SyntheticCanaryStack,
 } from '../lib/synthetic-canary-stack';
 import { SyntheticCanaryFleet } from '../lib/synthetic-canary-probes';
+import { RunbookStack } from '../lib/runbook-stack';
 
 const app = new cdk.App();
 
@@ -415,7 +416,7 @@ const productionPagerDutyUrl =
   (app.node.tryGetContext('productionPagerDutyUrl') as string | undefined) ??
   process.env.PRODUCTION_PAGERDUTY_URL;
 
-new CloudWatchAlarmsStack(app, 'CloudWatchAlarmsStack-Staging', {
+const cloudWatchAlarmsStackStaging = new CloudWatchAlarmsStack(app, 'CloudWatchAlarmsStack-Staging', {
   envName: 'staging',
   clusterName: ecsStackStaging.cluster.clusterName,
   serviceName: ecsStackStaging.service.serviceName,
@@ -435,7 +436,7 @@ new CloudWatchAlarmsStack(app, 'CloudWatchAlarmsStack-Staging', {
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
 
-new CloudWatchAlarmsStack(app, 'CloudWatchAlarmsStack-Production', {
+const cloudWatchAlarmsStackProduction = new CloudWatchAlarmsStack(app, 'CloudWatchAlarmsStack-Production', {
   envName: 'production',
   clusterName: ecsStackProduction.cluster.clusterName,
   serviceName: ecsStackProduction.service.serviceName,
@@ -499,7 +500,7 @@ new LogInsightsStack(app, 'LogInsightsStack-Production', {
 // fight over the same name on every deploy or both apply — doubling the audit
 // findings and the per-byte cost — and neither failure surfaces as an error.
 
-new LogPipelineStack(app, 'LogPipelineStack-Staging', {
+const logPipelineStackStaging = new LogPipelineStack(app, 'LogPipelineStack-Staging', {
   envName: 'staging',
   sourceLogGroupNames: [`/ecs/staging/${ecsStackStaging.service.serviceName}`],
   // Shorter than production's: staging's archive exists to prove the pipeline
@@ -513,7 +514,7 @@ new LogPipelineStack(app, 'LogPipelineStack-Staging', {
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
 
-new LogPipelineStack(app, 'LogPipelineStack-Production', {
+const logPipelineStackProduction = new LogPipelineStack(app, 'LogPipelineStack-Production', {
   envName: 'production',
   sourceLogGroupNames: [`/ecs/production/${ecsStackProduction.service.serviceName}`],
   manageAccountDataProtectionPolicy: true,
@@ -598,7 +599,7 @@ new BlueGreenDeployStack(app, 'BlueGreenDeployStack-Production', {
 // flight — the listener weights are runtime state the state machine owns, and
 // a deploy resets them to 100/0 underneath it.
 
-new CanaryDeployStack(app, 'CanaryDeployStack-Staging', {
+const canaryDeployStackStaging = new CanaryDeployStack(app, 'CanaryDeployStack-Staging', {
   vpc: vpcStackStaging.vpc,
   envName: 'staging',
   certificateArn: stagingCertArn,
@@ -628,7 +629,7 @@ new CanaryDeployStack(app, 'CanaryDeployStack-Staging', {
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
 
-new CanaryDeployStack(app, 'CanaryDeployStack-Production', {
+const canaryDeployStackProduction = new CanaryDeployStack(app, 'CanaryDeployStack-Production', {
   vpc: vpcStackProduction.vpc,
   envName: 'production',
   certificateArn: productionCertArn,
@@ -712,7 +713,7 @@ const appConfigStack = new AppConfigStack(app, 'AppConfigStack', {
 //
 // `githubTokenSecretArn` is optional: without it the sweep still measures and
 // notifies, it just cannot turn a measurement into somebody's work.
-new FeatureFlagLifecycleStack(app, 'FeatureFlagLifecycleStack', {
+const featureFlagLifecycleStack = new FeatureFlagLifecycleStack(app, 'FeatureFlagLifecycleStack', {
   application: appConfigStack.application,
   configurationProfileId: appConfigStack.featureFlagsConfig.configurationProfileId,
   environments: Object.entries(appConfigStack.environments).map(([name, environment]) => ({
@@ -905,7 +906,7 @@ new RollbackAutomationStack(app, 'RollbackAutomationStack-Production', {
 const stagingAvailabilitySlo = requireSlo('staging-api-availability');
 const productionAvailabilitySlo = requireSlo('production-api-availability');
 
-new SloStack(app, 'SloStack-Staging', {
+const sloStackStaging = new SloStack(app, 'SloStack-Staging', {
   envName: 'staging',
   slos: [
     {
@@ -931,7 +932,7 @@ new SloStack(app, 'SloStack-Staging', {
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
 
-new SloStack(app, 'SloStack-Production', {
+const sloStackProduction = new SloStack(app, 'SloStack-Production', {
   envName: 'production',
   slos: [
     {
@@ -983,7 +984,7 @@ new SloStack(app, 'SloStack-Production', {
 //     the fast policy roll back unattended; the traffic floor is the setting
 //     most likely to need tuning to your request volume.
 
-new SloBurnRateRollbackStack(app, 'SloBurnRateRollbackStack-Staging', {
+const sloBurnRateRollbackStackStaging = new SloBurnRateRollbackStack(app, 'SloBurnRateRollbackStack-Staging', {
   envName: 'staging',
   loadBalancerFullName: ecsStackStaging.alb.loadBalancerFullName,
   targetGroupFullName: ecsStackStaging.targetGroup.targetGroupFullName,
@@ -1013,7 +1014,7 @@ new SloBurnRateRollbackStack(app, 'SloBurnRateRollbackStack-Staging', {
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
 
-new SloBurnRateRollbackStack(app, 'SloBurnRateRollbackStack-Production', {
+const sloBurnRateRollbackStackProduction = new SloBurnRateRollbackStack(app, 'SloBurnRateRollbackStack-Production', {
   envName: 'production',
   loadBalancerFullName: ecsStackProduction.alb.loadBalancerFullName,
   targetGroupFullName: ecsStackProduction.targetGroup.targetGroupFullName,
@@ -1211,7 +1212,7 @@ const productionWafEmails = process.env.PRODUCTION_WAF_EMAIL
   ? [process.env.PRODUCTION_WAF_EMAIL]
   : [];
 
-new WafStack(app, 'WafStack-Staging', {
+const wafStackStaging = new WafStack(app, 'WafStack-Staging', {
   envName: 'staging',
   scope: 'REGIONAL',
   enableCoreRuleSet: true,
@@ -1233,7 +1234,7 @@ new WafStack(app, 'WafStack-Staging', {
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
 
-new WafStack(app, 'WafStack-Production', {
+const wafStackProduction = new WafStack(app, 'WafStack-Production', {
   envName: 'production',
   scope: 'REGIONAL',
   enableCoreRuleSet: true,
@@ -1471,7 +1472,7 @@ new PreviewPrStack(app, `PreviewPrStack-${previewPrNumber}`, {
 // parsed, because "production-alb-5xx-elb" parses to a service called "alb"
 // that no deployment ever writes — see docs/dora-metrics.md.
 
-new DoraMetricsStack(app, 'DoraMetricsStack', {
+const doraMetricsStack = new DoraMetricsStack(app, 'DoraMetricsStack', {
   services: [
     { environment: 'staging', service: 'api' },
     { environment: 'production', service: 'api' },
@@ -1854,16 +1855,102 @@ for (const region of productionCanaryRegions) {
   });
 }
 
-new SyntheticCanaryQuorumStack(app, 'SyntheticCanaryQuorumStack-Staging', {
+const syntheticCanaryQuorumStackStaging = new SyntheticCanaryQuorumStack(app, 'SyntheticCanaryQuorumStack-Staging', {
   fleet: stagingCanaryFleet,
   env: { account: process.env.CDK_DEFAULT_ACCOUNT, region: canaryAggregationRegion },
   description: 'Staging synthetic canary quorum — compares the probe regions',
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
 
-new SyntheticCanaryQuorumStack(app, 'SyntheticCanaryQuorumStack-Production', {
+const syntheticCanaryQuorumStackProduction = new SyntheticCanaryQuorumStack(app, 'SyntheticCanaryQuorumStack-Production', {
   fleet: productionCanaryFleet,
   env: { account: process.env.CDK_DEFAULT_ACCOUNT, region: canaryAggregationRegion },
   description: 'Production synthetic canary quorum — compares the probe regions',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+// ── Runbook Automation ────────────────────────────────────────────────────────
+// Every alarm above reaches a topic; until now, what arrived on that topic was
+// an alarm name, a threshold and — for the SLO alarms only — a link to a
+// document whose first instruction is "open the dashboard". `RunbookStack`
+// subscribes an enricher to those topics, matches the alarm name against
+// `lib/runbooks.ts`, starts the runbook's first step (a read-only SSM
+// Automation), and republishes the alert with the runbook link and the running
+// execution attached. The original subscribers keep receiving the original
+// notification: enrichment is a better second copy, never the delivery path, so
+// a broken enricher costs a link and never a page.
+//
+// The topics listed here and the exemptions in `lib/runbooks.ts` are held
+// against the synthesised templates by `npm run audit:runbooks`, so an alarm
+// routed to a topic nobody subscribed the enricher to fails the build rather
+// than paging someone with nothing attached.
+//
+// After deployment:
+//   - Subscribe the rota to `<env>-runbook-alerts` and leave the existing
+//     subscriptions in place until the enriched copy has been seen working.
+//   - Watch `<env>-runbook-enricher-dlq`. It is empty in normal operation, and
+//     anything in it is a notification that reached nobody.
+//   - `<env>-runbook-enricher-errors` publishes to `<env>-runbook-alerts`
+//     directly, unenriched, because the component that would enrich it is the
+//     one that failed.
+
+// An SNS topic can only deliver to a Lambda in its own region, so the canary
+// quorum topics are subscribable only when the fleet aggregates where this
+// stack lives. They default to eu-west-1, which is why `ENRICHMENT_EXEMPTIONS`
+// does not cover them and this list is conditional: with the default
+// configuration there is nothing to subscribe, and with an aggregation region
+// of us-east-1 there is.
+const primaryRegion = process.env.CDK_DEFAULT_REGION ?? 'us-east-1';
+const canaryQuorumTopicsIn = (stack: SyntheticCanaryQuorumStack) =>
+  canaryAggregationRegion === primaryRegion ? [stack.pageTopic, stack.ticketTopic] : [];
+
+new RunbookStack(app, 'RunbookStack-Staging', {
+  envName: 'staging',
+  alarmTopics: [
+    cloudWatchAlarmsStackStaging.alarmTopic,
+    logPipelineStackStaging.alarmTopic,
+    wafStackStaging.alertTopic,
+    canaryDeployStackStaging.notificationTopic,
+    sloStackStaging.pageTopic,
+    sloStackStaging.ticketTopic,
+    sloBurnRateRollbackStackStaging.notificationTopic,
+    ...canaryQuorumTopicsIn(syntheticCanaryQuorumStackStaging),
+  ],
+  service: { clusterName: 'staging-cluster', serviceName: 'staging-service' },
+  databaseInstanceIdentifier: 'staging-postgres',
+  logDeliveryStreamName: 'staging-log-pipeline',
+  notificationEmails: process.env.STAGING_RUNBOOK_NOTIFY_EMAIL
+    ? [process.env.STAGING_RUNBOOK_NOTIFY_EMAIL]
+    : [],
+  env: { account: process.env.CDK_DEFAULT_ACCOUNT, region: primaryRegion },
+  description: 'Staging runbook automation — alarm → runbook → read-only first step',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+new RunbookStack(app, 'RunbookStack-Production', {
+  envName: 'production',
+  alarmTopics: [
+    cloudWatchAlarmsStackProduction.alarmTopic,
+    logPipelineStackProduction.alarmTopic,
+    wafStackProduction.alertTopic,
+    canaryDeployStackProduction.notificationTopic,
+    sloStackProduction.pageTopic,
+    sloStackProduction.ticketTopic,
+    sloBurnRateRollbackStackProduction.notificationTopic,
+    // The two account-wide stacks have one instance between both environments
+    // and their alarms are tickets about the platform's own tooling, so they
+    // are enriched once, here, rather than by both enrichers.
+    doraMetricsStack.notificationTopic,
+    featureFlagLifecycleStack.notificationTopic,
+    ...canaryQuorumTopicsIn(syntheticCanaryQuorumStackProduction),
+  ],
+  service: { clusterName: 'production-cluster', serviceName: 'production-service' },
+  databaseInstanceIdentifier: 'production-postgres',
+  logDeliveryStreamName: 'production-log-pipeline',
+  notificationEmails: process.env.PRODUCTION_RUNBOOK_NOTIFY_EMAIL
+    ? [process.env.PRODUCTION_RUNBOOK_NOTIFY_EMAIL]
+    : [],
+  env: { account: process.env.CDK_DEFAULT_ACCOUNT, region: primaryRegion },
+  description: 'Production runbook automation — alarm → runbook → read-only first step',
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });

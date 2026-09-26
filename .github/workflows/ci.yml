@@ -250,6 +250,21 @@ jobs:
       - name: Audit the synthetic canary fleet
         run: npm run audit:canaries
 
+      # Every gate above asks whether a signal exists and is trustworthy. This
+      # one asks what happens to the person it wakes. Before RunbookStack, the
+      # SLO alarms carried a link to a document whose first instruction is "open
+      # the dashboard" and every other alarm carried nothing — and neither shows
+      # up as a failure anywhere, because an alert with no runbook on it is a
+      # perfectly healthy alert. The near misses are each one property: a
+      # renamed heading, which GitHub answers 200 for and lands the reader at the
+      # top of the page; an alarm on a topic nobody subscribed the enricher to,
+      # where both halves work and nothing connects them; a first-step parameter
+      # with no default, which turns a step into a form; and a verb that is not a
+      # Describe, which is one-click remediation attached to a page. See
+      # docs/runbooks.md.
+      - name: Audit runbook coverage and the first steps
+        run: npm run audit:runbooks
+
       # The Checkov job scans the synthesised CloudFormation rather than the
       # TypeScript, so the templates have to cross the job boundary.
       #

@@ -905,5 +905,42 @@ See [docs/synthetic-canaries.md](./docs/synthetic-canaries.md) for the quorum
 arithmetic, the three ways silence is handled, the URLs and markers you have to
 set, the cost model, the fifteen gate rules and the known gaps.
 
+## Runbook automation
+
+Every alarm above reaches a topic. What arrived on that topic was an alarm name,
+a threshold and a state — and for the SLO alarms only, a link to a document
+whose first instruction is "open the `<env>-slo` dashboard". At 04:00 that is
+not a step, it is a prerequisite: an account, a region, console access and
+knowing which of the nine dashboards is meant.
+
+`RunbookStack` subscribes an enricher to those topics, matches the alarm name
+against the catalogue in `aws/cdk/lib/runbooks.ts`, **starts** the runbook's
+first step, and republishes the alert with the runbook link and the running
+execution attached. Three things it is arranged around:
+
+- **Enrichment is never the delivery path.** The enricher is subscribed
+  alongside the existing subscribers rather than in front of them, so the raw
+  notification still arrives wherever it always arrived. An enricher that is
+  broken, throttled or mid-deployment costs a link, never a page — which also
+  makes adopting it additive rather than a cutover.
+- **The first step has already run.** Each runbook names a single read-only SSM
+  Automation document whose parameters are all either defaulted at synth time or
+  filled from the notification, so there is nothing to look up and nothing to
+  type. The alert carries the execution id.
+- **The first step cannot change anything.** Every document is one
+  `aws:executeAwsApi` call on a `Describe`/`Get`/`List`, under a role holding
+  only those reads, and `npm run audit:runbooks` rejects any other verb. A
+  one-click "restart the service" attached to a page is how a degraded service
+  becomes an outage. Remediation stays behind a decision — that is what
+  `RollbackAutomationStack` and `SloBurnRateRollbackStack` are.
+
+The gate holds the catalogue against the synthesised templates: every alarm that
+notifies a topic matches exactly one runbook, every runbook anchor resolves in
+the markdown (a renamed heading is a 200 that lands at the top of the page), and
+every alarm topic is either subscribed or exempted with a reason.
+
+See [docs/runbooks.md](./docs/runbooks.md) for the eight runbooks, what each
+first step reads, the twelve gate rules and the known gaps.
+
 ## Spec Progress
 See [SPEC.md](./SPEC.md).
