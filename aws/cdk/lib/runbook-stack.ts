@@ -411,6 +411,15 @@ export class RunbookStack extends cdk.Stack {
       bind: () => ({ alarmActionArn: this.alertTopic.topicArn }),
     });
 
+    // ── Tags ──────────────────────────────────────────────────────────────────
+    // `policy/cloudformation/required-tags.rego` is the gate: a resource with
+    // neither is unattributable in an account sweep and invisible to cost
+    // allocation. Stack-level, so it reaches the roles, the key and the queue —
+    // the `tags` stack prop does not.
+    cdk.Tags.of(this).add('Environment', envName);
+    cdk.Tags.of(this).add('ManagedBy', 'CDK');
+    cdk.Tags.of(this).add('Stack', id);
+
     new cdk.CfnOutput(this, 'RunbookAlertTopicArn', {
       value: this.alertTopic.topicArn,
       description: 'Enriched alerts — subscribe the rota here',

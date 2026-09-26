@@ -274,6 +274,29 @@ describe('the enriched topic', () => {
   });
 });
 
+describe('tags', () => {
+  it('tags every resource, which policy/cloudformation/required-tags.rego enforces', () => {
+    const { template } = synth();
+    // The roles, the key and the queue are the ones the `tags` stack prop does
+    // not reach, and an untagged resource is unattributable in an account sweep.
+    for (const type of [
+      'AWS::IAM::Role',
+      'AWS::KMS::Key',
+      'AWS::SQS::Queue',
+      'AWS::SNS::Topic',
+      'AWS::Lambda::Function',
+      'AWS::Logs::LogGroup',
+    ]) {
+      for (const props of resourceProps(template, type)) {
+        const tags = (props.Tags as { Key: string; Value: string }[]) ?? [];
+        expect(tags.map((tag) => tag.Key)).toEqual(
+          expect.arrayContaining(['Environment', 'ManagedBy', 'Stack']),
+        );
+      }
+    }
+  });
+});
+
 describe('what the stack refuses to build', () => {
   it('rejects a catalogue whose first step names a document it does not create', () => {
     expect(() =>
