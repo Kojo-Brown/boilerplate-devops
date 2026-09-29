@@ -25,6 +25,7 @@
     "audit:tracing": "ts-node tools/audit-queue-tracing.ts",
     "audit:canaries": "ts-node tools/audit-synthetic-canaries.ts",
     "audit:runbooks": "ts-node tools/audit-runbooks.ts",
+    "audit:postmortems": "ts-node tools/audit-postmortems.ts",
     "cdk": "cdk"
   },
   "devDependencies": {

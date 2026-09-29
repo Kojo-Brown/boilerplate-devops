@@ -242,7 +242,29 @@ stale data or none, which is why they are alarmed on at all.
 
 ---
 
-## 10. Adding a runbook
+## 10. When the incident ends
+
+A runbook's job finishes when the page clears. The next runbook being better
+than this one is a separate piece of work, and it happens on Thursday afternoon
+or not at all.
+
+Which incidents owe a write-up is a fact about the incident rather than a
+judgement made at the end of a long night —
+[docs/postmortem.md#2-which-incidents-owe-one](./postmortem.md#2-which-incidents-owe-one)
+is the trigger table. Every runbook above is named in one of its severity rows —
+`npm run audit:postmortems` fails on one that is not — so an alarm that reached
+you through this document has already been classified by the time it clears.
+
+Two of the review's ten questions are about this file specifically: whether the
+runbook worked, and whether it has been corrected. The gap between what the
+runbook said and what actually helped is free to collect for a few days after an
+incident and impossible afterwards, so the correction goes into
+`lib/runbooks.ts` and this document while the incident is still fresh —
+[docs/postmortem.md#7-the-blameless-review-checklist](./postmortem.md#7-the-blameless-review-checklist).
+
+---
+
+## 11. Adding a runbook
 
 1. Add a section to this file. The heading's GitHub slug is the anchor.
 2. Add an entry to `RUNBOOK_CATALOGUE` in `lib/runbooks.ts` with that anchor and
@@ -256,7 +278,7 @@ stale data or none, which is why they are alarmed on at all.
 
 ---
 
-## 11. The failures, and what each one looks like
+## 12. The failures, and what each one looks like
 
 | Rule | What it catches | What it looks like without the gate |
 | --- | --- | --- |
@@ -275,7 +297,7 @@ stale data or none, which is why they are alarmed on at all.
 
 ---
 
-## 12. Known gaps
+## 13. Known gaps
 
 - **Nothing here has been deployed.** No automation in this repository has run
   against a real account, so the documents are checked for shape — a single

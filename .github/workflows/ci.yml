@@ -265,6 +265,24 @@ jobs:
       - name: Audit runbook coverage and the first steps
         run: npm run audit:runbooks
 
+      # The gate above asks what happens to the person the alert wakes. This one
+      # asks what happens after they go back to bed, and it is the only gate here
+      # whose subject is a document — which is exactly why it exists. The process
+      # lives in docs/postmortem.md, the thing people fill in is an issue form,
+      # and the review reads off a checklist; nothing in GitHub reconciles the
+      # three. A section added to the process and not to the form is a section
+      # nobody is asked for, and a postmortem missing it reads complete. The near
+      # misses are each one line: a required section whose field is optional,
+      # which holds until the first write-up typed at 23:00; a severity dropdown
+      # that has drifted from the trigger table, so an incident is filed at a
+      # severity the process has no row for; "what was the root cause" arriving
+      # in a well-meant edit, which asks for one cause and stops the analysis;
+      # and a budget trigger keyed to an objective that is still `proposed`, so
+      # it can never fire while reading exactly like one that can. See
+      # docs/postmortem.md.
+      - name: Audit the postmortem process
+        run: npm run audit:postmortems
+
       # The Checkov job scans the synthesised CloudFormation rather than the
       # TypeScript, so the templates have to cross the job boundary.
       #

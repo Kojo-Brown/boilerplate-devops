@@ -1,0 +1,233 @@
+# The postmortem template.
+#
+# An issue form rather than a markdown template, because a markdown template is
+# a set of headings the author is free to delete and the ones deleted under time
+# pressure are reliably "What went well" and "Where we got lucky". A form can
+# mark a field required, which is the only mechanism in reach that stops a
+# postmortem being filed without a timeline.
+#
+# Every field id, every dropdown option and every checklist line here is
+# declared in aws/cdk/lib/postmortems.ts and held against this file by
+# `npm run audit:postmortems` — in both directions. A section added to the
+# process and not to this form is a section nobody is asked for; a field here
+# that the process never describes is a box people guess at. Neither looks wrong
+# on its own, which is why the gate exists.
+#
+# See docs/postmortem.md.
+name: Incident postmortem
+description: Record an incident and the review of it. Blameless by construction — see docs/postmortem.md.
+title: "Postmortem: "
+labels:
+  - postmortem
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This document is read by the people it describes. It asks what the
+        system made easy and what it made invisible, and it never asks who.
+
+        Before filing, check `docs/postmortem.md#2-which-incidents-owe-one` for
+        whether this incident owes a write-up or only a record, and
+        `docs/postmortem.md#7-the-blameless-review-checklist` for what the
+        review will ask of it.
+
+  - type: input
+    id: incident-id
+    attributes:
+      label: Incident id
+      description: However the incident was referred to while it was running — the alert thread, the channel, the ticket.
+      placeholder: INC-2026-014
+    validations:
+      required: true
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      description: From the trigger table in docs/postmortem.md — a fact about the incident, not an impression of it.
+      options:
+        - Sev1
+        - Sev2
+        - Sev3
+    validations:
+      required: true
+
+  - type: input
+    id: owning-team
+    attributes:
+      label: Team running this review
+      description: A team, never an individual. The review outlives anyone's time on a rota.
+      placeholder: platform-team
+    validations:
+      required: true
+
+  - type: input
+    id: started-at
+    attributes:
+      label: Impact started (UTC)
+      description: When users were first affected, which is usually earlier than when a signal fired.
+      placeholder: 2026-09-14T02:11Z
+    validations:
+      required: true
+
+  - type: input
+    id: resolved-at
+    attributes:
+      label: Impact ended (UTC)
+      description: When users stopped being affected, not when the ticket was closed.
+      placeholder: 2026-09-14T03:04Z
+    validations:
+      required: true
+
+  - type: dropdown
+    id: detection-source
+    attributes:
+      label: How we found out
+      description: The first thing that told anyone. "A customer told us" is a finding, and it is the one that changes what gets built next.
+      options:
+        - A synthetic canary alarm
+        - An SLO burn-rate or error-budget alarm
+        - Another CloudWatch alarm
+        - A deployment gate or an automated rollback
+        - A customer told us
+        - A colleague noticed something
+        - Found while looking at something else
+    validations:
+      required: true
+
+  - type: input
+    id: time-to-detect
+    attributes:
+      label: Minutes from impact starting to the first signal
+      description: A number, read off an alarm history rather than remembered. This is what every alarm, canary and burn-rate policy in this repository exists to move.
+      placeholder: "18"
+    validations:
+      required: true
+
+  - type: input
+    id: budget-spent
+    attributes:
+      label: Error budget spent, as a percentage of the objective window
+      description: From the ErrorBudgetRemainingPercent metric before and after — see docs/slo.md. Leave blank if no objective covers the affected path.
+      placeholder: "31"
+    validations:
+      required: false
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What broke, for whom, for how long, and what has changed since. Three sentences, written for somebody who was not there and has thirty seconds.
+      placeholder: |
+        For 53 minutes, roughly a third of API requests returned 503. The
+        canaries in two regions agreed, which is what paged. Connection limits
+        on the writer are now derived from the instance class rather than set by
+        hand, and a burn-rate alarm covers the path that had none.
+    validations:
+      required: true
+
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact
+      description: What users could not do, measured in requests, sessions or error-budget minutes rather than in CPU percent. If a number is unknown, say that it is unknown and why.
+    validations:
+      required: true
+
+  - type: textarea
+    id: detection
+    attributes:
+      label: Detection
+      description: Which signal fired first, how long after the impact started, and what the alert carried. If a runbook was reached, whether its first step answered the question it exists to answer.
+    validations:
+      required: true
+
+  - type: textarea
+    id: timeline
+    attributes:
+      label: Timeline
+      description: One line per observable event, in UTC — what happened, what a signal showed, what was known, and what was believed. Keep the beliefs that turned out to be wrong.
+      placeholder: |
+        02:11Z  Writer connection count crosses 90% of the instance limit. No alarm covers this.
+        02:19Z  First 503s at the load balancer. Target 5xx alarm is in ALARM.
+        02:23Z  Page delivered. The alert carries the api-5xx runbook and an ECS service read that has already run; it shows every task healthy, which is true and misleading.
+        02:41Z  Connection count read directly. The belief up to this point is that the afternoon's deploy explains it; that deploy finished eighteen hours earlier.
+        03:04Z  Pool size lowered on the two busiest services. 503s stop within a minute.
+    validations:
+      required: true
+
+  - type: textarea
+    id: contributing-factors
+    attributes:
+      label: Contributing factors
+      description: Each condition without which this incident would not have happened, and for each one, what made the wrong thing look correct at the time. Expect several.
+      placeholder: |
+        - Pool sizes were set per service, by hand, against an instance class
+          that had been resized twice since. Each value was reasonable when it
+          was written and no single change made the total exceed the limit.
+        - Nothing alarmed on connection count, so the first signal was the
+          symptom rather than the cause. The RDS dashboard shows the metric,
+          which is why it reads as covered.
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-went-well
+    attributes:
+      label: What went well
+      description: Which safeguard, signal or habit shortened this. Required, because these are the things a cost review removes when nobody has written down what they bought.
+    validations:
+      required: true
+
+  - type: textarea
+    id: where-we-got-lucky
+    attributes:
+      label: Where we got lucky
+      description: What would have made this materially worse and did not happen this time. Every incident has one; a blank answer means nobody looked.
+    validations:
+      required: true
+
+  - type: textarea
+    id: action-items
+    attributes:
+      label: Action items
+      description: One line each — [class] owning team — what changes — tracking issue. Class is prevent, detect, mitigate or process, and at least one has to be a detect.
+      placeholder: |
+        - [detect] platform-team — alarm on RDS connection count at 80% of the
+          class limit, derived from the class — #412
+        - [prevent] platform-team — pool size computed from the instance class
+          in one place rather than set per service — #413
+        - [process] platform-team — api-5xx runbook's first step also reads the
+          database connection count, since healthy tasks were true and
+          misleading — #414
+    validations:
+      required: true
+
+  - type: textarea
+    id: related-incidents
+    attributes:
+      label: Related incidents
+      description: Earlier postmortems sharing a contributing factor with this one, by issue number. Leave blank if this is the first of its kind.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: blameless-review
+    attributes:
+      label: Blameless review checklist
+      description: |
+        Answered in the review, against the document above. Each line is
+        explained in docs/postmortem.md#7-the-blameless-review-checklist — tick
+        it once it has been applied, not once it has been read. Every line is
+        worded so that a tick is the good answer.
+      options:
+        - label: Is the document free of individual names outside the attendee list?
+        - label: Is the document free of counterfactuals — "if only X had checked", "they should have noticed"?
+        - label: Are there at least two contributing factors, each with what made it look correct?
+        - label: Is time-to-detection a number, and does it come from a signal rather than a memory?
+        - label: Is there something concrete in "Where we got lucky"?
+        - label: Does every action item name an owning team, a class, and a tracking issue?
+        - label: Is at least one action item a detect?
+        - label: Is every action item a change to the system, rather than "be more careful" or "add training"?
+        - label: If a runbook was used, did it work — and has it been corrected?
+        - label: Did every alarm that fired deserve to, and did every one that should have fire?

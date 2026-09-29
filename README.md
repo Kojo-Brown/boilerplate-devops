@@ -942,5 +942,49 @@ every alarm topic is either subscribed or exempted with a reason.
 See [docs/runbooks.md](./docs/runbooks.md) for the eight runbooks, what each
 first step reads, the twelve gate rules and the known gaps.
 
+## Incident postmortems
+
+Every gate above makes a failure visible or puts a procedure in the responder's
+hand. None of it changes anything afterwards: the page clears, and three weeks
+later the same contributing factors produce the same incident — which nothing
+reports, because an incident nobody wrote up and an incident that taught us
+nothing are the same empty table.
+
+`aws/cdk/lib/postmortems.ts` is the process as data: three severities with the
+triggers that put an incident in each, nine template sections, eight structured
+fields, and the ten questions the review asks. The thing people fill in is
+[`.github/ISSUE_TEMPLATE/postmortem.yml`](./.github/ISSUE_TEMPLATE/postmortem.yml).
+Three things it is arranged around:
+
+- **The trigger is a fact, not a judgement.** "Was that bad enough to write up?"
+  gets decided at the end of a long night by the person least able to judge it,
+  and the answer trends to no. A canary quorum page, 25% of an error budget in
+  one incident, a recovery nobody had rehearsed — each is checkable afterwards
+  from something already recorded. Sev3 owes no narrative and still owes a
+  record, because "is this the third time this month?" is otherwise
+  unanswerable.
+- **Blameless is a property of the document.** Not a promise made at the start
+  of the meeting. There is no field for who; the timeline asks what was known
+  and what was believed, the analysis asks for contributing factors rather than
+  a root cause, and six phrases are refused outright in the prompts and in the
+  form. The detection dropdown has "a customer told us" on it, because a form
+  whose options are all machines makes the true answer unselectable and the one
+  number worth having comes out wrong in the reassuring direction.
+- **An issue form, not a markdown template.** A template is a set of headings
+  the author is free to delete, and the ones deleted under time pressure are
+  reliably "What went well" and "Where we got lucky". A form can mark a field
+  required.
+
+`npm run audit:postmortems` holds the three copies together, in both directions:
+a section added to the process and not to the form is a section nobody is asked
+for, a field in the form nothing declares is a box people fill with a guess, a
+required section whose field is optional holds until the first write-up typed at
+23:00, and a severity keyed to a renamed runbook or to a `proposed` objective
+stops classifying anything while reading exactly like one that works.
+
+See [docs/postmortem.md](./docs/postmortem.md) for the trigger table, the nine
+sections, the ten checklist questions with the reason for each, the sixteen gate
+rules and the known gaps.
+
 ## Spec Progress
 See [SPEC.md](./SPEC.md).
