@@ -283,6 +283,22 @@ jobs:
       - name: Audit the postmortem process
         run: npm run audit:postmortems
 
+      # Every gate above is about a signal or a procedure. This one is about a
+      # number: `multiAz: true` is one line and it was this repository's whole
+      # disaster-recovery story, and it is a claim about what AWS does rather
+      # than about what happens here. The failure is not a wrong RTO — it is
+      # that there was no RTO, because "60 seconds" came off a product page and
+      # nobody had watched it happen. The near misses are each one property and
+      # each leaves a green build: `RebootDBInstance` without `ForceFailover`,
+      # which is a reboot with an outage and no promotion; a probe at standard
+      # resolution, which measures a two-minute event with a sixty-second ruler;
+      # a status wait placed before the settle period, which is satisfied before
+      # anything has happened; a step with no `onFailure`, which ends the
+      # exercise with no record; and a restore-point threshold set at the
+      # objective, which is red every afternoon. See docs/game-days.md.
+      - name: Audit the recovery objectives and the failover game day
+        run: npm run audit:gamedays
+
       # The Checkov job scans the synthesised CloudFormation rather than the
       # TypeScript, so the templates have to cross the job boundary.
       #

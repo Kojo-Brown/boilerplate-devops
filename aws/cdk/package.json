@@ -26,6 +26,7 @@
     "audit:canaries": "ts-node tools/audit-synthetic-canaries.ts",
     "audit:runbooks": "ts-node tools/audit-runbooks.ts",
     "audit:postmortems": "ts-node tools/audit-postmortems.ts",
+    "audit:gamedays": "ts-node tools/audit-game-days.ts",
     "cdk": "cdk"
   },
   "devDependencies": {

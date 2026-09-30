@@ -299,6 +299,13 @@ export const RUNBOOK_CATALOGUE: readonly RunbookDefinition[] = [
       '*lead-time-unmeasurable',
       '*expired-feature-flags',
       '*unreadable-flag-manifest',
+      // The game-day signals belong here rather than in their own runbook: a
+      // probe that has stopped reporting and a rehearsal that is overdue are
+      // both "something that measures the platform has failed", and both mean a
+      // number quoted elsewhere is now stale. The two that are about the
+      // database itself are §10.
+      '*-game-day-*',
+      '*-rehearsal-overdue-*',
     ],
     summary:
       'Something that measures the platform has failed, rather than the platform itself. ' +
@@ -310,6 +317,25 @@ export const RUNBOOK_CATALOGUE: readonly RunbookDefinition[] = [
         'reads this alarm\'s own state transitions, so the answer to "how long has this been ' +
         'broken" comes before the answer to "what broke"',
       alarmFilledParameters: ['AlarmName'],
+    },
+  },
+  {
+    id: 'db-recovery',
+    title: 'The database is unreachable, or its restore point has stopped advancing',
+    owner: 'platform-team',
+    anchor: '#10-the-database-is-unreachable-or-its-restore-point-has-stopped-advancing',
+    alarmNamePatterns: ['*-db-connect-failing', '*-restore-point-stale'],
+    summary:
+      'Either nothing in the VPC can open a socket to the database endpoint, or the data a ' +
+      'point-in-time restore could recover has stopped getting any fresher. The first is what a ' +
+      'Multi-AZ failover looks like from a caller — including during a game day, which is the ' +
+      'first thing to rule out — and the second goes wrong with nothing failing at all.',
+    firstStep: {
+      documentKey: 'rds-instance-state',
+      summary:
+        'reads the RDS instance: whether it is mid-failover, whether it is back to available ' +
+        'while the probe is still failing, and whether a modification is pending',
+      alarmFilledParameters: [],
     },
   },
 ];
