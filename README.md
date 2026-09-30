@@ -939,7 +939,7 @@ notifies a topic matches exactly one runbook, every runbook anchor resolves in
 the markdown (a renamed heading is a 200 that lands at the top of the page), and
 every alarm topic is either subscribed or exempted with a reason.
 
-See [docs/runbooks.md](./docs/runbooks.md) for the eight runbooks, what each
+See [docs/runbooks.md](./docs/runbooks.md) for the nine runbooks, what each
 first step reads, the twelve gate rules and the known gaps.
 
 ## Incident postmortems
@@ -985,6 +985,58 @@ stops classifying anything while reading exactly like one that works.
 See [docs/postmortem.md](./docs/postmortem.md) for the trigger table, the nine
 sections, the ten checklist questions with the reason for each, the sixteen gate
 rules and the known gaps.
+
+## Multi-AZ failover game days
+
+`multiAz: true` is one line in `RdsStack` and it was the whole of the
+disaster-recovery story here. It is also a claim about what AWS does rather than
+about what happens in your account: AWS promotes the standby, and the number a
+dependent service needs is how long a *caller* waits — which is larger, and is
+dominated by the caller's side of the endpoint. The failure was not a wrong RTO.
+There was no RTO: "60 seconds" comes off a product page, and the first time
+anybody checks it is during the real AZ event.
+
+`aws/cdk/lib/game-days.ts` is the objectives and the scenarios as data plus the
+arithmetic; `FailoverGameDayStack` is the probe that measures them and the
+approval-gated automation that injects the fault. Four things it is arranged
+around:
+
+- **One objective per recovery path, never per system.** A standby promotion
+  loses nothing and takes a minute or two; a point-in-time restore loses
+  whatever has happened since `LatestRestorableTime` and takes tens of minutes.
+  One pair of numbers for "the database" has averaged those, and the pair it
+  carries is reliably the flattering one — so the plan that would be executed
+  during data loss is the one nobody wrote down. An RPO of zero is refused on
+  any path whose basis is not synchronous replication.
+- **The measurement comes from a signal that is always on.** A game day timed on
+  a phone measures the exercise, and the exercise is not the interesting event.
+  The probe connects to the endpoint **by name**, from inside the VPC, six times
+  a minute — EventBridge cannot schedule faster than once a minute, so the
+  samples are taken inside one invocation and published at one-second storage
+  resolution. A two-minute RTO cannot be resolved by a sixty-second ruler.
+- **A measurement carries its own resolution, and refuses more often than it
+  answers.** An empty window, a window that opens or closes on a failure, a hole
+  in the series: each is a case where the obvious implementation returns a
+  plausible RTO, and the plausible answer is always the flattering one.
+- **The exercise starts from a human.** `aws:approve` is step one, the blast
+  radius is enforced by which documents exist rather than by a runtime check,
+  and every step routes its failure to one abort step that writes the record and
+  names the step that refused. An abort never resets the rehearsal clock.
+
+The restore path's RPO is the one DR number that is continuously observable and
+essentially never observed. If the backup pipeline stops,
+`LatestRestorableTime` stops advancing: the instance stays healthy, the backups
+stay "enabled", every RDS metric stays flat, and the data you could get back
+gets older every hour.
+
+`npm run audit:gamedays` holds the catalogue against the synthesised documents
+and alarms: a reboot without `ForceFailover`, a probe at standard resolution, a
+status wait placed before the settle period, a step with no abort path, a
+restore-point threshold that is red every afternoon.
+
+See [docs/game-days.md](./docs/game-days.md) for the two objectives with their
+numbers, how the RTO is measured and when it is refused, how to run an exercise,
+what you have to set, the cost, the twenty gate rules and the known gaps.
 
 ## Spec Progress
 See [SPEC.md](./SPEC.md).

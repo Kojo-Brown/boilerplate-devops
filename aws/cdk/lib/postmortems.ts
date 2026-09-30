@@ -184,7 +184,7 @@ export const POSTMORTEM_SEVERITIES: readonly PostmortemSeverity[] = [
       'The database or the cache was degraded in a way users could measure, even if no ' +
         'objective breached.',
     ],
-    runbookIds: ['ecs-saturation', 'slo-burn-rate', 'rds-connections'],
+    runbookIds: ['ecs-saturation', 'slo-burn-rate', 'rds-connections', 'db-recovery'],
     requiresPostmortem: true,
     requiresRecord: true,
     dueWithinBusinessDays: 10,

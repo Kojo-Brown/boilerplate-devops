@@ -217,7 +217,8 @@ state transitions.
 ## 9. A platform component has stopped reporting
 
 **Alarms:** `*-slo-budget-reporter-errors`, `*-runbook-enricher-errors`,
-`*lead-time-unmeasurable`, `*expired-feature-flags`, `*unreadable-flag-manifest`
+`*lead-time-unmeasurable`, `*expired-feature-flags`, `*unreadable-flag-manifest`,
+`*-game-day-*`, `*-rehearsal-overdue-*`
 **Owner:** platform-team
 **First step (already running):** `<env>-rb-alarm-history`.
 
@@ -239,10 +240,58 @@ stale data or none, which is why they are alarmed on at all.
    alert on that topic with no runbook attached is itself the signal.
 4. **The feature-flag alarms** are described in `docs/feature-flags.md`; an
    unreadable manifest means the sweep is no longer removing anything.
+5. **`*-game-day-probe-silent`** means the recovery objectives have no
+   measurement behind them from now on. Nothing is known to be broken; what has
+   broken is the ability to find out, and a game day run while this is red
+   produces a record from a window with holes in it. `docs/game-days.md` §4.
+6. **`*-rehearsal-overdue-*`** is not an outage and is not urgent this hour. It
+   means an RTO in `lib/game-days.ts` is now a number from the last time
+   somebody checked, and the fix is to schedule the exercise — not to widen the
+   interval, which is the version of this that gets done instead.
+7. **`*-game-day-endpoint-unresolvable`** is the one here that is not a ticket.
+   During a promotion the endpoint record changes and keeps resolving; a name
+   that resolves to nothing is a deleted instance, a deleted hosted zone, or a
+   VPC that has lost DNS resolution, and a failover fixes none of them.
 
 ---
 
-## 10. When the incident ends
+## 10. The database is unreachable, or its restore point has stopped advancing
+
+**Alarms:** `*-db-connect-failing`, `*-restore-point-stale`
+**Owner:** platform-team
+**First step (already running):** `<env>-rb-rds-instance-state` — class, status,
+Multi-AZ, and any pending modification.
+
+**First, is a game day running?** `*-db-connect-failing` is the alarm a
+Multi-AZ exercise is supposed to trip, and it is expected to be red for about
+two minutes during one. Check `<env>-game-day` for an approval or a measurement
+in the last half hour before treating this as an incident —
+`docs/game-days.md` §6.
+
+1. **`*-db-connect-failing` outside an exercise** means nothing in the VPC can
+   open a socket to the endpoint. A status of `failing-over` is a promotion in
+   progress and the right action is to wait: the probe recovers on its own and
+   the measured outage is worth reading afterwards. A status of `available` with
+   the probe still failing is the caller-side failure this whole item exists
+   for — a pool holding connections to the address the endpoint used to resolve
+   to, or a security group that no longer permits the subnet the promoted
+   instance came up in.
+2. **`*-game-day-endpoint-unresolvable` alongside it** narrows it to DNS and
+   takes the database itself out of the picture.
+3. **`*-restore-point-stale` is not an availability problem.** The instance is
+   healthy, the backups are "enabled", and what has changed is that the data a
+   point-in-time restore could recover is getting older. It is the only signal
+   here that goes wrong with nothing failing. Check `BackupRetentionPeriod` is
+   not zero — a retention of zero has no `LatestRestorableTime` at all, and the
+   alarm breaches on the missing datapoint rather than on a large one — then
+   check for a storage-full or a suspended-automated-backups condition.
+4. **Both together** is an instance that is both down and unrestorable. Escalate
+   before diagnosing further; `docs/game-days.md` §3 has the restore path and is
+   explicit that its RTO has never been measured.
+
+---
+
+## 11. When the incident ends
 
 A runbook's job finishes when the page clears. The next runbook being better
 than this one is a separate piece of work, and it happens on Thursday afternoon
@@ -264,7 +313,7 @@ incident and impossible afterwards, so the correction goes into
 
 ---
 
-## 11. Adding a runbook
+## 12. Adding a runbook
 
 1. Add a section to this file. The heading's GitHub slug is the anchor.
 2. Add an entry to `RUNBOOK_CATALOGUE` in `lib/runbooks.ts` with that anchor and
@@ -278,7 +327,7 @@ incident and impossible afterwards, so the correction goes into
 
 ---
 
-## 12. The failures, and what each one looks like
+## 13. The failures, and what each one looks like
 
 | Rule | What it catches | What it looks like without the gate |
 | --- | --- | --- |
@@ -297,7 +346,7 @@ incident and impossible afterwards, so the correction goes into
 
 ---
 
-## 13. Known gaps
+## 14. Known gaps
 
 - **Nothing here has been deployed.** No automation in this repository has run
   against a real account, so the documents are checked for shape — a single

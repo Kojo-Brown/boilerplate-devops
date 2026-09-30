@@ -41,6 +41,7 @@ import {
   SyntheticCanaryStack,
 } from '../lib/synthetic-canary-stack';
 import { SyntheticCanaryFleet } from '../lib/synthetic-canary-probes';
+import { FailoverGameDayStack } from '../lib/failover-game-day-stack';
 import { RunbookStack } from '../lib/runbook-stack';
 
 const app = new cdk.App();
@@ -1869,6 +1870,94 @@ const syntheticCanaryQuorumStackProduction = new SyntheticCanaryQuorumStack(app,
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
 
+// ── Multi-AZ Failover Game Days ───────────────────────────────────────────────
+// `multiAz: true` in `RdsStack` is one line and it is this repository's entire
+// disaster-recovery story. It is also a claim about what AWS does rather than
+// about what happens here: AWS promotes the standby, and nothing has ever
+// measured how long a caller waits afterwards — which is the larger number and
+// is dominated by our side of the endpoint. `FailoverGameDayStack` publishes the
+// signal that makes that measurable (a probe inside the VPC, connecting to the
+// endpoint by name once a minute), publishes the restore path's live RPO from
+// `LatestRestorableTime`, and builds the approval-gated automation that injects
+// a failover on purpose and reads the outage off the probe rather than off a
+// stopwatch.
+//
+// The exercise is the only automation in this repository that deliberately
+// changes production, so it starts from `aws:approve` and never from a schedule.
+// The blast radius is structural: a scenario declares `allowedEnvironments`, and
+// the stack builds a document only where this environment is in that list, so a
+// run somewhere it was not sanctioned is not refused — there is nothing to run.
+//
+// `<env>-db-connect-failing` goes red during an exercise. That is the point: an
+// exercise whose outage signal stays green has measured nothing, and this is the
+// only occasion anybody finds out the signal works. `npm run audit:gamedays`
+// holds the catalogue against the synthesised documents and alarms.
+//
+// After deployment:
+//   - Set `<ENV>_GAME_DAY_APPROVER_ARNS` to the IAM principals who may approve,
+//     comma-separated. The placeholder below is a role *name* and not an ARN, so
+//     an unset variable produces a document that cannot be approved rather than
+//     one anybody can.
+//   - Subscribe the rota to `<env>-game-day`, and expect the first
+//     `<env>-rehearsal-overdue-*` page immediately: an objective that has never
+//     been measured is overdue, which is the whole point of the alarm.
+//   - Run `<env>-gameday-rds-failover` in staging before production. The
+//     preflight refuses when something is already in ALARM, which is the
+//     expected outcome more often than not.
+// Pinned rather than left env-agnostic, and to the same region `RunbookStack`
+// uses below: an SNS topic can only deliver to a Lambda in its own region, so a
+// game-day topic in an unpinned stack would be subscribed from a stack that
+// resolved to `us-east-1` — which synthesises, deploys, and delivers nothing.
+const primaryRegion = process.env.CDK_DEFAULT_REGION ?? 'us-east-1';
+
+const gameDayApprovers = (variable: string): string[] => {
+  const configured = (process.env[variable] ?? '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0);
+  // A role name, deliberately, not an ARN: an account id in this file would be
+  // a hardcoded identifier in copy-paste material, and `npm run
+  // scan:identifiers` would be right to fail on it. SSM accepts either.
+  return configured.length > 0 ? configured : ['platform-team-oncall'];
+};
+
+const failoverGameDayStackStaging = new FailoverGameDayStack(app, 'FailoverGameDayStack-Staging', {
+  envName: 'staging',
+  vpc: vpcStackStaging.vpc,
+  databaseSecurityGroupId: rdsStackStaging.securityGroup.securityGroupId,
+  databaseEndpointAddress: rdsStackStaging.instance.instanceEndpoint.hostname,
+  databaseInstanceIdentifier: 'staging-postgres',
+  service: { clusterName: 'staging-cluster', serviceName: 'staging-service' },
+  approverArns: gameDayApprovers('STAGING_GAME_DAY_APPROVER_ARNS'),
+  notificationEmails: process.env.STAGING_RUNBOOK_NOTIFY_EMAIL
+    ? [process.env.STAGING_RUNBOOK_NOTIFY_EMAIL]
+    : [],
+  env: { account: process.env.CDK_DEFAULT_ACCOUNT, region: primaryRegion },
+  description: 'Staging recovery objectives, the probe that measures them, and the failover game day',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+const failoverGameDayStackProduction = new FailoverGameDayStack(
+  app,
+  'FailoverGameDayStack-Production',
+  {
+    envName: 'production',
+    vpc: vpcStackProduction.vpc,
+    databaseSecurityGroupId: rdsStackProduction.securityGroup.securityGroupId,
+    databaseEndpointAddress: rdsStackProduction.instance.instanceEndpoint.hostname,
+    databaseInstanceIdentifier: 'production-postgres',
+    service: { clusterName: 'production-cluster', serviceName: 'production-service' },
+    approverArns: gameDayApprovers('PRODUCTION_GAME_DAY_APPROVER_ARNS'),
+    notificationEmails: process.env.PRODUCTION_RUNBOOK_NOTIFY_EMAIL
+      ? [process.env.PRODUCTION_RUNBOOK_NOTIFY_EMAIL]
+      : [],
+    env: { account: process.env.CDK_DEFAULT_ACCOUNT, region: primaryRegion },
+    description:
+      'Production recovery objectives, the probe that measures them, and the failover game day',
+    tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+  },
+);
+
 // ── Runbook Automation ────────────────────────────────────────────────────────
 // Every alarm above reaches a topic; until now, what arrived on that topic was
 // an alarm name, a threshold and — for the SLO alarms only — a link to a
@@ -1900,7 +1989,6 @@ const syntheticCanaryQuorumStackProduction = new SyntheticCanaryQuorumStack(app,
 // does not cover them and this list is conditional: with the default
 // configuration there is nothing to subscribe, and with an aggregation region
 // of us-east-1 there is.
-const primaryRegion = process.env.CDK_DEFAULT_REGION ?? 'us-east-1';
 const canaryQuorumTopicsIn = (stack: SyntheticCanaryQuorumStack) =>
   canaryAggregationRegion === primaryRegion ? [stack.pageTopic, stack.ticketTopic] : [];
 
@@ -1914,6 +2002,7 @@ new RunbookStack(app, 'RunbookStack-Staging', {
     sloStackStaging.pageTopic,
     sloStackStaging.ticketTopic,
     sloBurnRateRollbackStackStaging.notificationTopic,
+    failoverGameDayStackStaging.notificationTopic,
     ...canaryQuorumTopicsIn(syntheticCanaryQuorumStackStaging),
   ],
   service: { clusterName: 'staging-cluster', serviceName: 'staging-service' },
@@ -1937,6 +2026,7 @@ new RunbookStack(app, 'RunbookStack-Production', {
     sloStackProduction.pageTopic,
     sloStackProduction.ticketTopic,
     sloBurnRateRollbackStackProduction.notificationTopic,
+    failoverGameDayStackProduction.notificationTopic,
     // The two account-wide stacks have one instance between both environments
     // and their alarms are tickets about the platform's own tooling, so they
     // are enriched once, here, rather than by both enrichers.
