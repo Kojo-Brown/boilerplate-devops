@@ -1,10 +1,13 @@
 import {
+  DRILL_POLL_INTERVAL_SECONDS,
   GAME_DAY_METRICS,
   GAME_DAY_SCENARIOS,
   GameDayScenario,
+  MAX_DRILL_INSTANCE_AGE_SECONDS,
   MAX_RESOLUTION_SECONDS,
   MAX_REHEARSAL_INTERVAL_DAYS,
   METRIC_CONNECT_SUCCESS,
+  METRIC_MEASURED_RESTORE_SECONDS,
   METRIC_RESTORE_POINT_LAG,
   MIN_REHEARSAL_INTERVAL_DAYS,
   MIN_RTO_PERIODS,
@@ -14,19 +17,30 @@ import {
   ProbeDatapoint,
   RECORDER_INTERVAL_SECONDS,
   RECOVERY_OBJECTIVES,
+  RESTORED_BYTES_FLOOR,
+  RESTORED_BYTES_TOLERANCE,
+  RESTORE_VERIFICATION_CHECKS,
   RecoveryObjective,
   RehearsalRecord,
+  RestoreVerificationCheck,
   assertValidGameDayCatalogue,
+  drillInstanceIdentifier,
   gameDayDocumentName,
   lastMeasuredAt,
+  measureRestore,
   measureRto,
+  measurementResolutionSeconds,
   mergeRehearsalLog,
   objectiveFor,
   parseRehearsalLog,
   rehearsalFreshness,
   rehearsalParameterName,
   restorePointAlarmThresholdSeconds,
+  restorePointIsFresh,
   restorePointLag,
+  restorePointStaleAfterSeconds,
+  restoreVerdict,
+  restoredBytesMatch,
   scenariosFor,
   validateGameDayCatalogue,
   verdictFor,
@@ -63,8 +77,8 @@ const scenario = (overrides: Partial<GameDayScenario> = {}): GameDayScenario => 
   title: 'Break the thing',
   objectiveId: 'test-objective',
   fault: 'rds-force-failover',
+  trigger: 'approval',
   allowedEnvironments: ['staging'],
-  approvalRequired: true,
   preflight: ['multi-az-enabled', 'probe-reporting'],
   abortIf: ['operator-abort'],
   expectedDurationMinutes: 20,
@@ -275,12 +289,106 @@ describe('validateGameDayCatalogue', () => {
     ).toContain('scenario-allowed-environment-wildcard');
   });
 
-  it('refuses a scenario nobody has to approve', () => {
+  it('refuses a destructive scenario nobody has to approve', () => {
     const findings = validateGameDayCatalogue(
       [objective()],
-      [scenario({ approvalRequired: false as never })],
+      [scenario({ trigger: 'schedule', scheduleIntervalDays: 30 })],
     );
-    expect(rules(findings)).toContain('scenario-without-approval');
+    // Both halves: the approval that is missing, and the schedule that is
+    // there. A reader removing the schedule and a reader adding the approval
+    // are fixing the same thing from opposite ends, and each should see that
+    // the other finding agreed.
+    expect(rules(findings)).toContain('destructive-scenario-without-approval');
+    expect(rules(findings)).toContain('destructive-scenario-scheduled');
+  });
+
+  it('refuses a scheduled scenario with no cadence, and an approved one that declares one', () => {
+    const drillObjective = objective({
+      id: 'restore-objective',
+      anchor: '#restore-objective',
+      path: 'point-in-time-restore',
+      rpoBasis: 'latest-restorable-time',
+      rpoSeconds: 300,
+      rtoSeconds: 1800,
+      measuredBy: METRIC_MEASURED_RESTORE_SECONDS,
+      rehearsalIntervalDays: 30,
+    });
+    const drill = scenario({
+      id: 'restore-drill',
+      objectiveId: 'restore-objective',
+      fault: 'rds-point-in-time-restore',
+      trigger: 'schedule',
+      preflight: ['restore-point-available', 'no-drill-instance-present'],
+      abortIf: ['operator-abort', 'verification-failed', 'restore-not-available-in-time'],
+    });
+
+    expect(
+      rules(validateGameDayCatalogue([drillObjective], [drill])),
+    ).toContain('scheduled-scenario-without-interval');
+
+    expect(
+      rules(validateGameDayCatalogue([objective()], [scenario({ scheduleIntervalDays: 30 })])),
+    ).toContain('approval-scenario-with-interval');
+  });
+
+  it('refuses a cadence slower than the objective it is supposed to keep fresh', () => {
+    // 60 days against a 30-day shelf life means the overdue alarm is red for
+    // half of every cycle, with nothing anybody can do but widen the interval
+    // they just chose.
+    const drillObjective = objective({
+      id: 'restore-objective',
+      anchor: '#restore-objective',
+      path: 'point-in-time-restore',
+      rpoBasis: 'latest-restorable-time',
+      rpoSeconds: 300,
+      rtoSeconds: 1800,
+      measuredBy: METRIC_MEASURED_RESTORE_SECONDS,
+      rehearsalIntervalDays: 30,
+    });
+    const findings = validateGameDayCatalogue(
+      [drillObjective],
+      [
+        scenario({
+          id: 'restore-drill',
+          objectiveId: 'restore-objective',
+          fault: 'rds-point-in-time-restore',
+          trigger: 'schedule',
+          scheduleIntervalDays: 60,
+          preflight: ['restore-point-available', 'no-drill-instance-present'],
+          abortIf: ['operator-abort', 'verification-failed', 'restore-not-available-in-time'],
+        }),
+      ],
+    );
+    expect(rules(findings)).toContain('schedule-slower-than-rehearsal-interval');
+  });
+
+  it('refuses a restore drill without its own preflights and abort conditions', () => {
+    const drillObjective = objective({
+      id: 'restore-objective',
+      anchor: '#restore-objective',
+      path: 'point-in-time-restore',
+      rpoBasis: 'latest-restorable-time',
+      rpoSeconds: 300,
+      rtoSeconds: 1800,
+      measuredBy: METRIC_MEASURED_RESTORE_SECONDS,
+      rehearsalIntervalDays: 30,
+    });
+    const findings = validateGameDayCatalogue(
+      [drillObjective],
+      [
+        scenario({
+          id: 'restore-drill',
+          objectiveId: 'restore-objective',
+          fault: 'rds-point-in-time-restore',
+          trigger: 'schedule',
+          scheduleIntervalDays: 30,
+          preflight: [],
+          abortIf: ['operator-abort'],
+        }),
+      ],
+    );
+    expect(rules(findings)).toContain('restore-drill-without-required-preflight');
+    expect(rules(findings)).toContain('restore-drill-without-required-abort');
   });
 
   it('refuses a forced failover with no Multi-AZ preflight — the same call is a reboot', () => {
@@ -291,12 +399,42 @@ describe('validateGameDayCatalogue', () => {
     expect(rules(findings)).toContain('failover-without-multi-az-preflight');
   });
 
-  it('refuses a scenario that does not check the probe is reporting', () => {
+  it('refuses a probe-measured scenario that does not check the probe is reporting', () => {
     const findings = validateGameDayCatalogue(
       [objective()],
       [scenario({ preflight: ['multi-az-enabled'] })],
     );
     expect(rules(findings)).toContain('scenario-without-probe-preflight');
+  });
+
+  it('refuses a probe preflight on a scenario whose measurement never touches the probe', () => {
+    // A check that cannot fail for any reason the exercise cares about is the
+    // kind of green that teaches people to stop reading the others.
+    const drillObjective = objective({
+      id: 'restore-objective',
+      anchor: '#restore-objective',
+      path: 'point-in-time-restore',
+      rpoBasis: 'latest-restorable-time',
+      rpoSeconds: 300,
+      rtoSeconds: 1800,
+      measuredBy: METRIC_MEASURED_RESTORE_SECONDS,
+      rehearsalIntervalDays: 30,
+    });
+    const findings = validateGameDayCatalogue(
+      [drillObjective],
+      [
+        scenario({
+          id: 'restore-drill',
+          objectiveId: 'restore-objective',
+          fault: 'rds-point-in-time-restore',
+          trigger: 'schedule',
+          scheduleIntervalDays: 30,
+          preflight: ['restore-point-available', 'no-drill-instance-present', 'probe-reporting'],
+          abortIf: ['operator-abort', 'verification-failed', 'restore-not-available-in-time'],
+        }),
+      ],
+    );
+    expect(rules(findings)).toContain('scenario-with-irrelevant-probe-preflight');
   });
 
   it('refuses a preflight or an abort condition nothing implements', () => {
@@ -615,5 +753,209 @@ describe('rehearsalFreshness', () => {
     const result = rehearsalFreshness(entry, new Date('2026-01-01T12:00:00.000Z'), now);
     expect(result.overdue).toBe(true);
     expect(result.dueInDays).toBeLessThan(0);
+  });
+});
+
+/* ── The restore drill's arithmetic ───────────────────────────────────────── */
+
+describe('measurementResolutionSeconds', () => {
+  it('is the probe\'s interval for a probe-measured objective and the drill\'s poll for a drill', () => {
+    const promotion = RECOVERY_OBJECTIVES.find((entry) => entry.id === 'rds-multi-az-promotion')!;
+    const restore = RECOVERY_OBJECTIVES.find((entry) => entry.id === 'rds-point-in-time-restore')!;
+    expect(measurementResolutionSeconds(promotion)).toBe(PROBE_SAMPLE_INTERVAL_SECONDS);
+    expect(measurementResolutionSeconds(restore)).toBe(DRILL_POLL_INTERVAL_SECONDS);
+  });
+
+  it('is what the floor rule is written against, so each objective is judged by its own ruler', () => {
+    // The restore objective is 1800s against a 30s poll — fine. It would have
+    // been fine against the probe's 10s too; what matters is that the rule asks
+    // the right question, which a single global constant could not.
+    const restore = RECOVERY_OBJECTIVES.find((entry) => entry.id === 'rds-point-in-time-restore')!;
+    expect(restore.rtoSeconds).toBeGreaterThanOrEqual(
+      MIN_RTO_PERIODS * measurementResolutionSeconds(restore),
+    );
+    const tooShort: RecoveryObjective = { ...restore, rtoSeconds: 120 };
+    expect(
+      validateGameDayCatalogue([tooShort], []).map((finding) => finding.rule),
+    ).toContain('rto-below-measurable-resolution');
+  });
+});
+
+describe('restoreVerdict', () => {
+  const pass = (check: RestoreVerificationCheck) => ({ check, passed: true, detail: 'ok' });
+
+  it('is verified only when every check ran and every check passed', () => {
+    expect(restoreVerdict(RESTORE_VERIFICATION_CHECKS.map(pass))).toBe('verified');
+  });
+
+  it('fails on one failing check, whichever it is', () => {
+    for (const failing of RESTORE_VERIFICATION_CHECKS) {
+      const results = RESTORE_VERIFICATION_CHECKS.map((check) =>
+        check === failing ? { check, passed: false, detail: 'no' } : pass(check),
+      );
+      expect(restoreVerdict(results)).toBe('failed');
+    }
+  });
+
+  it('fails on a check that produced no result, because a pass rate is not a verdict', () => {
+    // The shape a verifier that threw halfway leaves behind. "The verifier
+    // crashed after three checks" has to be as loud as "the data is not there":
+    // from the outside they are the same amount of knowledge.
+    const partial = RESTORE_VERIFICATION_CHECKS.slice(0, 3).map(pass);
+    expect(restoreVerdict(partial)).toBe('failed');
+  });
+});
+
+describe('restoredBytesMatch', () => {
+  const GIB = 1024 * 1024 * 1024;
+  /** 100 GiB allocated, `usedGiB` of it in use. */
+  const usage = (allocatedGiB: number, usedGiB: number) => ({
+    allocatedStorageGiB: allocatedGiB,
+    freeStorageBytes: (allocatedGiB - usedGiB) * GIB,
+  });
+
+  it('matches a copy holding the source\'s bytes', () => {
+    const comparison = restoredBytesMatch(usage(100, 40), usage(100, 40));
+    expect(comparison.matches).toBe(true);
+    expect(comparison.ratio).toBeCloseTo(1);
+  });
+
+  it('catches the restore that completed and brought back an empty volume', () => {
+    // The failure this check exists for, and it is not a near miss: a few
+    // hundred MB of engine files against 40 GiB of data.
+    const comparison = restoredBytesMatch(usage(100, 40), usage(100, 0.3));
+    expect(comparison.matches).toBe(false);
+    expect(comparison).toMatchObject({ reason: 'restored-too-small' });
+  });
+
+  it('computes used bytes per instance, so storage autoscaling is not a mismatch', () => {
+    // maxAllocatedStorage is set on the source, so the two volumes can differ
+    // in size while holding the same data. Comparing free space directly would
+    // report a good restore as a failure the first time the source grew.
+    const comparison = restoredBytesMatch(usage(200, 40), usage(100, 40));
+    expect(comparison.matches).toBe(true);
+  });
+
+  it('refuses to vouch for a source too small to tell an empty restore from a full one', () => {
+    // Reported as a failed check rather than skipped: "this drill cannot tell
+    // whether the data came back" is a finding about the drill.
+    const comparison = restoredBytesMatch(usage(100, 0.5), usage(100, 0.5));
+    expect(comparison.matches).toBe(false);
+    expect(comparison).toMatchObject({ reason: 'source-too-small' });
+    expect(comparison.sourceUsedBytes).toBeLessThan(RESTORED_BYTES_FLOOR);
+  });
+
+  it('is wide enough for WAL and narrow enough for an order of magnitude', () => {
+    const sourceUsed = 40;
+    const justInside = sourceUsed * (1 + RESTORED_BYTES_TOLERANCE * 0.9);
+    const justOutside = sourceUsed * (1 + RESTORED_BYTES_TOLERANCE * 1.1);
+    expect(restoredBytesMatch(usage(100, sourceUsed), usage(100, justInside)).matches).toBe(true);
+    const over = restoredBytesMatch(usage(100, sourceUsed), usage(100, justOutside));
+    expect(over.matches).toBe(false);
+    expect(over).toMatchObject({ reason: 'restored-too-large' });
+  });
+});
+
+describe('restorePointIsFresh', () => {
+  const objective = RECOVERY_OBJECTIVES.find((entry) => entry.id === 'rds-point-in-time-restore')!;
+  const ceiling = restorePointStaleAfterSeconds(objective);
+  const point = new Date('2026-07-01T12:00:00Z');
+  const after = (seconds: number) => new Date(point.getTime() + seconds * 1000);
+
+  it('is two RPOs: one for the mechanism, one for the drill\'s own latency', () => {
+    expect(ceiling).toBe(objective.rpoSeconds * 2);
+  });
+
+  it('accepts a copy created inside the ceiling and refuses one outside it', () => {
+    expect(restorePointIsFresh(point, after(60), ceiling)).toBe(true);
+    expect(restorePointIsFresh(point, after(ceiling), ceiling)).toBe(true);
+    expect(restorePointIsFresh(point, after(ceiling + 1), ceiling)).toBe(false);
+  });
+
+  it('refuses a copy created before the restore point it claims to be from', () => {
+    // The restore came from an older point than the one the preflight read,
+    // which is the failure a point-in-time restore exists to avoid and which
+    // every other check in the drill passes happily.
+    expect(restorePointIsFresh(point, after(-1), ceiling)).toBe(false);
+  });
+});
+
+describe('measureRestore', () => {
+  it('is the span from the copy being created to it being verified', () => {
+    const created = new Date('2026-07-01T12:00:00Z');
+    const verified = new Date('2026-07-01T12:23:20Z');
+    expect(measureRestore(created, verified)).toEqual({
+      restoreSeconds: 1400,
+      resolutionSeconds: DRILL_POLL_INTERVAL_SECONDS,
+    });
+  });
+
+  it('carries the drill\'s poll interval as its uncertainty, which errs long', () => {
+    const created = new Date('2026-07-01T12:00:00Z');
+    const measurement = measureRestore(created, new Date('2026-07-01T12:30:00Z'));
+    expect(measurement.resolutionSeconds).toBe(DRILL_POLL_INTERVAL_SECONDS);
+    const objective = RECOVERY_OBJECTIVES.find(
+      (entry) => entry.id === 'rds-point-in-time-restore',
+    )!;
+    // The same `verdictFor` the failover exercise uses, which is the point: a
+    // restore measurement is an RTO measurement, and a second verdict function
+    // for it would be a second place for the "within measurement error" rule to
+    // drift. 1800s against an 1800s objective is `met`.
+    expect(
+      verdictFor(objective, {
+        conclusive: true,
+        lastHealthyAt: created,
+        outageStartedAt: created,
+        recoveredAt: new Date(created.getTime() + measurement.restoreSeconds * 1000),
+        rtoSeconds: measurement.restoreSeconds,
+        resolutionSeconds: measurement.resolutionSeconds,
+        failedDatapoints: 1,
+      }),
+    ).toBe('met');
+
+    // And one poll interval over the objective is within measurement error
+    // rather than a miss, because the poll is what pushed it there.
+    expect(
+      verdictFor(objective, {
+        conclusive: true,
+        lastHealthyAt: created,
+        outageStartedAt: created,
+        recoveredAt: created,
+        rtoSeconds: objective.rtoSeconds + DRILL_POLL_INTERVAL_SECONDS,
+        resolutionSeconds: DRILL_POLL_INTERVAL_SECONDS,
+        failedDatapoints: 1,
+      }),
+    ).toBe('within-measurement-error');
+  });
+
+  it('refuses a negative span rather than publishing one', () => {
+    // Which happens when the instance described is a copy left over from an
+    // earlier run. A negative RTO on a graph is worse than no datapoint.
+    expect(() =>
+      measureRestore(new Date('2026-07-01T12:30:00Z'), new Date('2026-07-01T12:00:00Z')),
+    ).toThrow(/not about the same restore/);
+  });
+});
+
+describe('the drill\'s names and windows', () => {
+  it('names one copy per environment, as a literal a grant can be scoped to', () => {
+    expect(drillInstanceIdentifier('production')).toBe('production-dr-drill');
+    expect(drillInstanceIdentifier('staging')).toBe('staging-dr-drill');
+  });
+
+  it('leaves a wide margin between a drill and an abandoned copy', () => {
+    const drill = GAME_DAY_SCENARIOS.find((entry) => entry.fault === 'rds-point-in-time-restore')!;
+    // The sweeper deletes what it finds, so the only thing worse than an
+    // orphaned copy is one deleted out from under a drill that was working.
+    expect(MAX_DRILL_INSTANCE_AGE_SECONDS).toBeGreaterThan(
+      drill.expectedDurationMinutes * 60 * 4,
+    );
+  });
+
+  it('measures the restore objective by the metric the drill publishes', () => {
+    const restore = RECOVERY_OBJECTIVES.find((entry) => entry.id === 'rds-point-in-time-restore')!;
+    expect(restore.measuredBy).toBe(METRIC_MEASURED_RESTORE_SECONDS);
+    expect(restore.status).toBe('rehearsed');
+    expect(GAME_DAY_METRICS).toContain(METRIC_MEASURED_RESTORE_SECONDS);
   });
 });

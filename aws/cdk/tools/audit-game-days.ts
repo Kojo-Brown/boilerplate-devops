@@ -21,6 +21,37 @@
  *   approval request nobody is told about and an exercise that times out an hour
  *   later.
  *
+ *   An exercise nothing starts. The restore drill is the opposite case and it
+ *   fails the opposite way: it runs without an approval precisely so that
+ *   nobody has to remember it, so an `aws:approve` step in it is an execution
+ *   that a schedule starts and that then waits forever for somebody who was
+ *   never told — and a missing EventBridge rule is a drill that exists, is
+ *   perfect, and never runs. Both read as working automation.
+ *
+ *   A drill that puts a copy of production on a public endpoint.
+ *   `RestoreDBInstanceToPointInTime` takes `PubliclyAccessible` from the
+ *   request and defaults it from the subnet group, so the flag being absent is
+ *   not a smaller version of the same thing — it is a full copy of the
+ *   database, reachable from the internet, once a month, deleted before anybody
+ *   notices.
+ *
+ *   A copy nothing can delete. The teardown is one grant and one step, and
+ *   without either the drill works exactly as well — it restores, it verifies,
+ *   it measures, it reports — and leaves a full-size instance running. The same
+ *   grant widened to `*` is a role that can delete any database in the account
+ *   and reads identically in a diff.
+ *
+ *   A drill that can write to the instance it is supposed to only read. The
+ *   whole safety argument for running this without an approval is that it
+ *   touches nothing live, and that argument is an IAM policy rather than an
+ *   intention.
+ *
+ *   A verification nobody can see. A drill whose only output is the execution's
+ *   status cannot report "the copy came back and it is not the data": the
+ *   execution has to end green so that the teardown runs. So the verdict is a
+ *   metric with an alarm over it, and without that alarm the one finding this
+ *   whole item exists to produce goes into a log.
+ *
  *   A failover that is a reboot. `ForceFailover` absent is a valid
  *   `RebootDBInstance` call: the instance goes away, comes back, the probe
  *   records an outage, and the exercise reports a measured RTO for a promotion
@@ -83,6 +114,22 @@
  *                                   the account
  *   automation-role-holds-other-writes  the exercise's role can change something
  *                                   other than the one thing it is for
+ *   drill-document-with-approval    a scheduled drill that waits for a human
+ *   drill-schedule-missing          a scheduled drill nothing schedules
+ *   drill-schedule-interval-wrong   a cadence that disagrees with the catalogue
+ *   drill-restore-not-point-in-time a drill that does not restore to a point
+ *   drill-restore-publicly-accessible  a copy of production on a public endpoint
+ *   drill-restore-deletion-protected   a copy the teardown cannot delete
+ *   drill-verification-missing      a drill that checks nothing, or checks after
+ *                                   it has already reported
+ *   drill-teardown-missing          a drill that leaves the copy running
+ *   drill-delete-not-scoped-to-the-copy  nothing can delete the copy, or
+ *                                   something can delete every database
+ *   drill-role-can-write-the-source the drill can change the instance it reads
+ *   restore-unverified-not-alarmed  nothing reports a copy that came back wrong
+ *   drill-orphan-not-alarmed        nothing reports a copy that outlived a drill
+ *   drill-sweeper-missing           nothing removes a copy a cancelled execution
+ *                                   left behind
  *
  * Plus every rule in `validateGameDayCatalogue` — see lib/game-days.ts.
  *
@@ -95,6 +142,7 @@ import {
   GameDayScenario,
   RECOVERY_OBJECTIVES,
   RecoveryObjective,
+  drillInstanceIdentifier,
   gameDayDocumentName,
   validateGameDayCatalogue,
 } from '../lib/game-days';
@@ -132,6 +180,33 @@ export const STATUS_SELECTOR = '$.DBInstances[0].DBInstanceStatus';
 
 /** Suffix of the probe's function name. */
 export const PROBE_FUNCTION_SUFFIX = '-game-day-probe';
+
+/** The API a restore drill restores with, and the one it tears down with. */
+export const RESTORE_API = 'RestoreDBInstanceToPointInTime';
+export const DELETE_API = 'DeleteDBInstance';
+
+/** Suffixes of the restore drill's three function names. */
+export const VERIFIER_FUNCTION_SUFFIX = '-restore-drill-verifier';
+export const CONDUCTOR_FUNCTION_SUFFIX = '-restore-drill-conductor';
+export const SWEEPER_FUNCTION_SUFFIX = '-restore-drill-sweeper';
+
+/** Alarm suffixes the restore drill is required to publish, per environment. */
+export const RESTORE_UNVERIFIED_ALARM_SUFFIX = '-restore-unverified';
+export const DRILL_ORPHAN_ALARM_SUFFIX = '-restore-drill-instance-orphaned';
+
+/**
+ * Non-read IAM actions the *drill's* automation role may hold.
+ *
+ * Three, and conspicuously without a delete. The teardown is the conductor's
+ * and the sweeper's, each scoped to the one copy, because the role that an
+ * EventBridge schedule can hand to SSM unattended is the last place in this
+ * repository that should be able to delete a database.
+ */
+export const PERMITTED_DRILL_AUTOMATION_WRITES = [
+  'rds:RestoreDBInstanceToPointInTime',
+  'rds:AddTagsToResource',
+  'lambda:InvokeFunction',
+] as const;
 
 /** Alarm suffixes this gate requires to exist per environment. */
 export const REQUIRED_ALARM_SUFFIXES = ['-db-connect-failing', '-game-day-probe-silent'] as const;
@@ -217,6 +292,19 @@ export const GAME_DAY_AUDIT_RULES = [
   'rehearsal-alarm-missing',
   'failover-write-unscoped',
   'automation-role-holds-other-writes',
+  'drill-document-with-approval',
+  'drill-schedule-missing',
+  'drill-schedule-interval-wrong',
+  'drill-restore-not-point-in-time',
+  'drill-restore-publicly-accessible',
+  'drill-restore-deletion-protected',
+  'drill-verification-missing',
+  'drill-teardown-missing',
+  'drill-delete-not-scoped-to-the-copy',
+  'drill-role-can-write-the-source',
+  'restore-unverified-not-alarmed',
+  'drill-orphan-not-alarmed',
+  'drill-sweeper-missing',
   'catalogue',
 ] as const;
 
@@ -363,6 +451,74 @@ const readFunctions = (templates: readonly TemplateFile[]): FunctionRecord[] => 
 
 const asList = (value: unknown): unknown[] => (Array.isArray(value) ? value : [value]);
 
+/**
+ * An ARN as text a rule can match on, intrinsics and all.
+ *
+ * Every ARN a CDK stack builds from `this.account` or `this.region`
+ * synthesises as `Fn::Join` over a list containing a `Ref`, so a gate that
+ * compares against plain strings sees only the hardcoded ARNs — which are the
+ * ones least likely to be wrong. The parts are concatenated with each intrinsic
+ * rendered as a placeholder, which leaves the literal tail (`:db:prod-dr-drill`)
+ * exactly where a suffix match can find it.
+ */
+export const arnText = (value: unknown): string => {
+  if (typeof value === 'string') return value;
+  if (!value || typeof value !== 'object') return '';
+  const entry = value as Record<string, unknown>;
+  const join = entry['Fn::Join'];
+  if (Array.isArray(join) && Array.isArray(join[1])) {
+    return (join[1] as unknown[]).map((part) => arnText(part)).join(String(join[0] ?? ''));
+  }
+  if (typeof entry.Ref === 'string') return `\${${entry.Ref}}`;
+  if (entry['Fn::GetAtt'] !== undefined) return '${GetAtt}';
+  if (typeof entry['Fn::Sub'] === 'string') return entry['Fn::Sub'];
+  return '';
+};
+
+interface ScheduleRecord {
+  readonly file: string;
+  readonly logicalId: string;
+  readonly name: string | undefined;
+  readonly scheduleExpression: string | undefined;
+  readonly state: string | undefined;
+  /** Target ARNs, as strings. A target built from `Fn::Join` is left out. */
+  readonly targetArns: readonly string[];
+}
+
+/**
+ * Every EventBridge rule in the templates, with its targets' ARNs.
+ *
+ * The drill's schedule points at an `automation-definition/<name>:$DEFAULT`
+ * ARN, which {@link arnText} flattens out of the `Fn::Join` the account id puts
+ * it in. A target this cannot read at all is dropped rather than guessed at, and
+ * a drill whose schedule became unreadable fails `drill-schedule-missing` —
+ * which is the right direction for a gate to fail in.
+ */
+const readSchedules = (templates: readonly TemplateFile[]): ScheduleRecord[] => {
+  const schedules: ScheduleRecord[] = [];
+  for (const template of templates) {
+    for (const [logicalId, resource] of Object.entries(resourcesOf(template.document))) {
+      if (resource.Type !== 'AWS::Events::Rule') continue;
+      const properties = resource.Properties ?? {};
+      schedules.push({
+        file: template.path,
+        logicalId,
+        name: typeof properties.Name === 'string' ? properties.Name : undefined,
+        scheduleExpression:
+          typeof properties.ScheduleExpression === 'string'
+            ? properties.ScheduleExpression
+            : undefined,
+        state: typeof properties.State === 'string' ? properties.State : undefined,
+        targetArns: asList(properties.Targets)
+          .filter((target): target is Record<string, unknown> => !!target && typeof target === 'object')
+          .map((target) => arnText(target.Arn))
+          .filter((arn) => arn.length > 0),
+      });
+    }
+  }
+  return schedules;
+};
+
 const readStatements = (templates: readonly TemplateFile[]): StatementRecord[] => {
   const statements: StatementRecord[] = [];
   for (const template of templates) {
@@ -413,6 +569,7 @@ export const auditGameDays = (input: AuditInput): AuditResult => {
   const alarms = readAlarms(input.templates);
   const functions = readFunctions(input.templates);
   const statements = readStatements(input.templates);
+  const schedules = readSchedules(input.templates);
 
   // Environments are discovered from what synth wrote rather than passed in: a
   // gate told which environments to expect cannot report one that disappeared.
@@ -422,6 +579,9 @@ export const auditGameDays = (input: AuditInput): AuditResult => {
       ...functions
         .filter((fn) => fn.name.endsWith(PROBE_FUNCTION_SUFFIX))
         .map((fn) => fn.name.slice(0, -PROBE_FUNCTION_SUFFIX.length)),
+      ...functions
+        .filter((fn) => fn.name.endsWith(VERIFIER_FUNCTION_SUFFIX))
+        .map((fn) => fn.name.slice(0, -VERIFIER_FUNCTION_SUFFIX.length)),
     ]),
   ].sort();
 
@@ -498,7 +658,7 @@ export const auditGameDays = (input: AuditInput): AuditResult => {
       );
     }
 
-    auditDocument(document, add);
+    auditDocument(document, scenario, add);
   }
 
   // ── The probe ──────────────────────────────────────────────────────────────
@@ -669,6 +829,227 @@ export const auditGameDays = (input: AuditInput): AuditResult => {
     }
   }
 
+  // ── The drill ──────────────────────────────────────────────────────────────
+  // Everything above is about an exercise a human starts. This is about the one
+  // that nothing has to start, which is a different set of ways to be silently
+  // broken: a schedule that is not there, a copy that is public, a copy nothing
+  // deletes, and a verdict that only ever reaches a log.
+  const drillScenarios = scenarios.filter(
+    (scenario) => scenario.fault === 'rds-point-in-time-restore',
+  );
+
+  for (const scenario of drillScenarios) {
+    for (const envName of scenario.allowedEnvironments) {
+      if (!environments.includes(envName)) continue;
+      const documentName = gameDayDocumentName(envName, scenario.id);
+      // A missing document is `scenario-document-missing` above; here the
+      // subject is whether anything starts the one that exists.
+      if (!documents.some((document) => document.name === documentName)) continue;
+
+      const targeting = schedules.filter((schedule) =>
+        schedule.targetArns.some((arn) => arn.includes(`automation-definition/${documentName}`)),
+      );
+      if (scenario.trigger !== 'schedule') {
+        // Not a rule of its own: `destructive-scenario-scheduled` in the
+        // catalogue covers the dangerous direction, and an approval-triggered
+        // exercise with a schedule attached is caught there too.
+        continue;
+      }
+      if (targeting.length === 0) {
+        add(
+          'drill-schedule-missing',
+          'lib/backup-restore-drill-stack.ts',
+          documentName,
+          `'${scenario.id}' has trigger 'schedule' and no EventBridge rule targets it. The ` +
+            'drill then exists, deploys, passes every other rule here, and never runs — and the ' +
+            'only thing that reports it is the overdue alarm, months later, with nothing to ' +
+            'explain why nobody ran the drill that nobody was supposed to have to run.',
+        );
+      }
+      for (const schedule of targeting) {
+        const expected = `rate(${scenario.scheduleIntervalDays} days)`;
+        if (schedule.scheduleExpression !== expected) {
+          add(
+            'drill-schedule-interval-wrong',
+            schedule.file,
+            schedule.name ?? schedule.logicalId,
+            `its schedule is '${schedule.scheduleExpression ?? '(unset)'}', expected ` +
+              `'${expected}' — the catalogue's scheduleIntervalDays. The cadence and the ` +
+              "objective's shelf life are checked against each other in lib/game-days.ts, so a " +
+              'rule that disagrees with the catalogue is an overdue alarm that is red on a ' +
+              'cycle nobody chose.',
+          );
+        }
+        if (schedule.state !== 'ENABLED') {
+          add(
+            'drill-schedule-missing',
+            schedule.file,
+            schedule.name ?? schedule.logicalId,
+            `its State is '${schedule.state ?? '(unset)'}'. A disabled rule is the same outcome ` +
+              'as a missing one and is harder to see: the rule is in the console, with the right ' +
+              'target and the right cadence, and nothing fires.',
+          );
+        }
+      }
+    }
+  }
+
+  for (const envName of environments) {
+    const drillsHere = drillScenarios.filter((scenario) =>
+      scenario.allowedEnvironments.includes(envName),
+    );
+    if (drillsHere.length === 0) continue;
+
+    const requiredAlarms: readonly (readonly [GameDayAuditRule, string, string])[] = [
+      [
+        'restore-unverified-not-alarmed',
+        RESTORE_UNVERIFIED_ALARM_SUFFIX,
+        'A drill that restores a copy and finds it unusable has to end green so that the ' +
+          'teardown runs, so the execution status cannot be the signal. Without this alarm the ' +
+          'one finding this whole item exists to produce — the backups returned something that ' +
+          'is not the data — reaches a CloudWatch log and nothing else.',
+      ],
+      [
+        'drill-orphan-not-alarmed',
+        DRILL_ORPHAN_ALARM_SUFFIX,
+        'SSM does not run a step\'s onFailure for a *cancelled* execution, so a human stopping ' +
+          'a drill between the restore and the teardown leaves a full-size copy of production ' +
+          'running. Nothing else goes red: it serves no traffic, breaches no threshold, and ' +
+          'looks exactly like a database somebody meant to create.',
+      ],
+    ];
+    for (const [rule, suffix, why] of requiredAlarms) {
+      const expected = `${envName}${suffix}`;
+      if (!alarms.some((alarm) => alarm.name === expected)) {
+        add(rule, 'lib/backup-restore-drill-stack.ts', expected, `no alarm named '${expected}'. ${why}`);
+      }
+    }
+
+    const orphanAlarm = alarms.find(
+      (alarm) => alarm.name === `${envName}${DRILL_ORPHAN_ALARM_SUFFIX}`,
+    );
+    if (orphanAlarm !== undefined && orphanAlarm.treatMissingData !== 'breaching') {
+      add(
+        'freshness-alarm-not-breaching',
+        orphanAlarm.file,
+        orphanAlarm.name,
+        `TreatMissingData is '${orphanAlarm.treatMissingData ?? 'unset'}'. The sweeper publishes ` +
+          'zero when there is no copy, precisely so that missing data means the sweeper has ' +
+          'stopped — and a sweeper that has stopped is the state in which an orphaned copy of ' +
+          'production runs indefinitely with nothing watching it.',
+      );
+    }
+
+    const sweeper = `${envName}${SWEEPER_FUNCTION_SUFFIX}`;
+    if (!functions.some((fn) => fn.name === sweeper)) {
+      add(
+        'drill-sweeper-missing',
+        'lib/backup-restore-drill-stack.ts',
+        sweeper,
+        `no function named '${sweeper}'. The alarm above reports an abandoned copy and nothing ` +
+          'removes it, so the copy runs until a human reads the alert — which is the one failure ' +
+          'in this item that costs money for as long as it goes unnoticed.',
+      );
+    }
+  }
+
+  // ── The drill's grants ─────────────────────────────────────────────────────
+  // The safety argument for running an exercise unattended is that it cannot
+  // touch anything live, and that argument is an IAM policy rather than an
+  // intention. Scoped to the drill stack's own templates: every other role in
+  // this repository is covered by `audit-iam-least-privilege.ts`.
+  const drillStatements = statements.filter((statement) =>
+    statement.file.includes('BackupRestoreDrill'),
+  );
+
+  // One pass over the grants rather than one per environment: a statement in
+  // the staging template scoped to staging's copy is correct, and an
+  // environment loop around this reported every grant as wrong for every other
+  // environment.
+  const deleteGrants = drillStatements.filter((statement) =>
+    statement.actions.includes(`rds:${DELETE_API}`),
+  );
+  const COPY_ARN = /:db:[a-z0-9-]+-dr-drill$/;
+  for (const statement of deleteGrants) {
+    const unscoped = statement.resources
+      .map((resource) => arnText(resource))
+      .filter((resource) => !COPY_ARN.test(resource));
+    if (unscoped.length === 0) continue;
+    add(
+      'drill-delete-not-scoped-to-the-copy',
+      statement.file,
+      `${statement.logicalId}/rds:${DELETE_API}`,
+      `is granted on ${unscoped.map((resource) => JSON.stringify(resource)).join(', ')}, which ` +
+        "is not the drill's own copy. A delete on '*' is a grant to destroy every database in " +
+        'the account, held here by a function an hourly schedule invokes, and it reads in a diff ' +
+        'exactly like the scoped one.',
+    );
+  }
+
+  for (const envName of environments) {
+    if (!drillScenarios.some((scenario) => scenario.allowedEnvironments.includes(envName))) {
+      continue;
+    }
+    const copyArn = `:db:${drillInstanceIdentifier(envName)}`;
+    const canDelete = deleteGrants.some((statement) =>
+      statement.resources.some((resource) => arnText(resource).endsWith(copyArn)),
+    );
+    if (!canDelete) {
+      add(
+        'drill-delete-not-scoped-to-the-copy',
+        'lib/backup-restore-drill-stack.ts',
+        `${envName}${copyArn}`,
+        `nothing holds rds:${DELETE_API} on '${copyArn}'. The drill restores, verifies, ` +
+          'measures and reports exactly as well without it, and leaves a full-size copy of ' +
+          'production running every time it runs.',
+      );
+    }
+  }
+
+  for (const statement of drillStatements) {
+    const writes = statement.actions.filter((action) => {
+      const verb = action.split(':')[1] ?? '';
+      return !READ_ONLY_PREFIXES.some((prefix) => verb.startsWith(prefix));
+    });
+    if (writes.length === 0) continue;
+
+    // A write naming the source instance. Only the restore may, and the restore
+    // has to, because the API authorises against the instance it reads as well
+    // as the one it creates.
+    for (const raw of statement.resources) {
+      const resource = arnText(raw);
+      if (!/:db:/.test(resource)) continue;
+      if (COPY_ARN.test(resource)) continue;
+      const offending = writes.filter((action) => action !== `rds:${RESTORE_API}`);
+      if (offending.length === 0) continue;
+      add(
+        'drill-role-can-write-the-source',
+        statement.file,
+        `${statement.logicalId}/${offending.join(',')}`,
+        `is granted on '${resource}', which is not the drill's copy. The reason this exercise ` +
+          'is allowed to run without an approval is that it cannot change anything live, and ' +
+          `the only write it needs against another instance is rds:${RESTORE_API} — which reads ` +
+          'the source and creates the copy.',
+      );
+    }
+
+    // And the automation role itself, which is the identity an EventBridge
+    // schedule hands to SSM with nobody watching.
+    if (!(statement.roleName ?? '').includes('RestoreDrillAutomationRole')) continue;
+    for (const action of writes) {
+      if ((PERMITTED_DRILL_AUTOMATION_WRITES as readonly string[]).includes(action)) continue;
+      add(
+        'drill-role-can-write-the-source',
+        statement.file,
+        `${statement.logicalId}/${action}`,
+        `is a write the drill's automation role does not need. It is the identity a schedule ` +
+          'hands to SSM unattended, and the three things it is for are ' +
+          `${PERMITTED_DRILL_AUTOMATION_WRITES.join(', ')} — deliberately without a delete, ` +
+          'which belongs to the conductor and the sweeper and is scoped to the one copy.',
+      );
+    }
+  }
+
   // ── The one write ──────────────────────────────────────────────────────────
   for (const statement of statements) {
     const failoverActions = statement.actions.filter((action) => action.endsWith(`:${FAILOVER_API}`));
@@ -718,6 +1099,7 @@ export const auditGameDays = (input: AuditInput): AuditResult => {
 
 export const auditDocument = (
   document: DocumentRecord,
+  scenario: GameDayScenario,
   add: (rule: GameDayAuditRule, file: string, location: string, message: string) => void,
 ): void => {
   const steps: Record<string, any>[] = Array.isArray(document.content.mainSteps)
@@ -729,15 +1111,36 @@ export const auditDocument = (
       : {};
 
   const first = steps[0];
-  if (first === undefined || first.action !== APPROVAL_ACTION) {
+  const approvalStep = steps.find((step) => step.action === APPROVAL_ACTION);
+
+  // The two triggers fail in opposite directions, so the rule is about the
+  // trigger rather than about the action. An approved exercise without an
+  // approval step is an outage a schedule can start; a scheduled drill *with*
+  // one is an execution that starts on a timer and then waits for somebody
+  // nobody told, until it times out an hour later — every month, green-ish, in
+  // a console nobody opens.
+  if (scenario.trigger === 'schedule') {
+    if (approvalStep !== undefined) {
+      add(
+        'drill-document-with-approval',
+        document.file,
+        `${document.name}/${approvalStep.name ?? '(unnamed)'}`,
+        `has an '${APPROVAL_ACTION}' step and its scenario's trigger is 'schedule'. Nothing ` +
+          'tells a human that a scheduled execution is waiting for them, so this is a drill ' +
+          'that starts on time, asks a question into an empty room, and times out — which is ' +
+          'indistinguishable from a drill nobody runs, and it is the state this exercise exists ' +
+          'to get out of.',
+      );
+    }
+  } else if (first === undefined || first.action !== APPROVAL_ACTION) {
     add(
       'document-without-approval',
       document.file,
       document.name,
-      `its first step is '${first?.action ?? '(none)'}' rather than '${APPROVAL_ACTION}'. This ` +
-        'is the only automation here that deliberately breaks production, and the thing that ' +
-        'makes that safe is that a human starts it — a document that begins with the fault can ' +
-        'be started by a schedule, an EventBridge rule or a rollback that meant well.',
+      `its first step is '${first?.action ?? '(none)'}' rather than '${APPROVAL_ACTION}', and ` +
+        `its scenario's trigger is '${scenario.trigger}'. A destructive exercise is safe ` +
+        'because a human starts it — a document that begins with the fault can be started by a ' +
+        'schedule, an EventBridge rule or a rollback that meant well.',
     );
   } else {
     const approvers = first.inputs?.Approvers;
@@ -868,6 +1271,161 @@ export const auditDocument = (
         'executions that vanished is not a finding about anything.',
     );
   }
+
+  if (scenario.fault === 'rds-point-in-time-restore') {
+    auditRestoreDrillDocument(document, steps, add);
+  }
+};
+
+/** Does any step invoke a function whose name ends with this suffix? */
+const invokesFunction = (steps: readonly Record<string, any>[], suffix: string): number =>
+  steps.findIndex(
+    (step) =>
+      step.action === 'aws:invokeLambdaFunction' &&
+      typeof step.inputs?.FunctionName === 'string' &&
+      step.inputs.FunctionName.endsWith(suffix),
+  );
+
+/**
+ * The restore drill's own steps.
+ *
+ * Every rule in here is about a property of the restore call or the shape of the
+ * procedure, and every one of them leaves a drill that works: it restores, it
+ * waits, it reports, and the thing that is wrong is a copy of production on a
+ * public endpoint, or a copy nothing deletes, or a verdict reached after it was
+ * already published.
+ */
+export const auditRestoreDrillDocument = (
+  document: DocumentRecord,
+  steps: readonly Record<string, any>[],
+  add: (rule: GameDayAuditRule, file: string, location: string, message: string) => void,
+): void => {
+  const restoreIndex = steps.findIndex(
+    (step) => step.action === 'aws:executeAwsApi' && step.inputs?.Api === RESTORE_API,
+  );
+  if (restoreIndex === -1) {
+    add(
+      'drill-restore-not-point-in-time',
+      document.file,
+      document.name,
+      `no step calls ${RESTORE_API}. Whatever this document restores from, it is not the ` +
+        'automated backups at a point in time — a snapshot restore answers a different question ' +
+        'and answers it about a moment somebody chose by hand.',
+    );
+  } else {
+    const inputs = steps[restoreIndex].inputs ?? {};
+    const location = `${document.name}/${steps[restoreIndex].name ?? '(unnamed)'}`;
+
+    if (inputs.UseLatestRestorableTime !== true && inputs.RestoreTime === undefined) {
+      add(
+        'drill-restore-not-point-in-time',
+        document.file,
+        location,
+        `calls ${RESTORE_API} with neither UseLatestRestorableTime nor RestoreTime. The API ` +
+          'needs one of them, so this fails at run time — which is loud, and is also a drill ' +
+          'that has never once run in an account where nobody watched the first execution.',
+      );
+    }
+    if (inputs.PubliclyAccessible !== false) {
+      add(
+        'drill-restore-publicly-accessible',
+        document.file,
+        location,
+        `PubliclyAccessible is ${JSON.stringify(inputs.PubliclyAccessible ?? null)}, not false. ` +
+          `${RESTORE_API} does not copy this from the source — it takes it from the request and ` +
+          'defaults it from the subnet group — so an absent flag is not a smaller version of ' +
+          'the same thing. It is a full copy of the database on a public endpoint, once a ' +
+          'month, deleted again before anybody notices.',
+      );
+    }
+    if (inputs.DeletionProtection !== false) {
+      add(
+        'drill-restore-deletion-protected',
+        document.file,
+        location,
+        `DeletionProtection is ${JSON.stringify(inputs.DeletionProtection ?? null)}, not false. ` +
+          'The teardown then fails on every drill, the copy survives, and the only way to clear ' +
+          'it is a console visit — on an instance that is a full-size copy of production and ' +
+          'that nothing else in this repository is watching.',
+      );
+    }
+    if (inputs.MultiAZ !== false) {
+      // Not its own rule: a Multi-AZ copy is correct, merely twice the price,
+      // and a cost decision is not a silent failure. Reported under the
+      // publicly-accessible rule's neighbour so that it is visible rather than
+      // enforced.
+      add(
+        'drill-restore-deletion-protected',
+        document.file,
+        location,
+        `MultiAZ is ${JSON.stringify(inputs.MultiAZ ?? null)}, not false. A standby adds ` +
+          'nothing to a copy that is deleted within the hour and doubles what the drill costs; ' +
+          'a real recovery would enable Multi-AZ after the cutover rather than waiting for it ' +
+          'during the outage.',
+      );
+    }
+  }
+
+  const verifyIndex = invokesFunction(steps, VERIFIER_FUNCTION_SUFFIX);
+  if (verifyIndex === -1) {
+    add(
+      'drill-verification-missing',
+      document.file,
+      document.name,
+      `no step invokes a '*${VERIFIER_FUNCTION_SUFFIX}' function. The drill then reports that ` +
+        'the restore completed, which is what `DBInstanceStatus: available` already said — and ' +
+        'an instance restored from a backup of an empty volume reports exactly that.',
+    );
+  } else if (restoreIndex !== -1 && verifyIndex < restoreIndex) {
+    add(
+      'drill-verification-missing',
+      document.file,
+      document.name,
+      'the verification runs before the restore, so it is checking last month\'s copy or ' +
+        'nothing at all. Both pass more often than the real check does.',
+    );
+  }
+
+  const measureIndex = steps.findIndex(
+    (step) =>
+      step.action === 'aws:invokeLambdaFunction' &&
+      step.inputs?.InputPayload?.operation === 'measure',
+  );
+  if (verifyIndex !== -1 && measureIndex !== -1 && measureIndex < verifyIndex) {
+    add(
+      'drill-verification-missing',
+      document.file,
+      document.name,
+      'the measurement runs before the verification, so the restore time is recorded and the ' +
+        'rehearsal clock reset before anybody has established that the copy is the data. A ' +
+        'drill that cannot refuse to reset its own clock is a drill that always looks rehearsed.',
+    );
+  }
+
+  const teardownIndex = steps.findIndex(
+    (step) =>
+      step.action === 'aws:invokeLambdaFunction' &&
+      step.inputs?.InputPayload?.operation === 'teardown',
+  );
+  if (teardownIndex === -1) {
+    add(
+      'drill-teardown-missing',
+      document.file,
+      document.name,
+      "no step invokes the conductor with operation 'teardown'. The drill works perfectly " +
+        'without it — restores, verifies, measures, reports — and leaves a full-size copy of ' +
+        'production running after every run.',
+    );
+  } else if (measureIndex !== -1 && teardownIndex < measureIndex) {
+    add(
+      'drill-teardown-missing',
+      document.file,
+      document.name,
+      'the teardown runs before the measurement, which reads the copy\'s InstanceCreateTime. ' +
+        'The measurement then fails on an instance that is being deleted, and the drill reports ' +
+        'an abort for a restore that worked.',
+    );
+  }
 };
 
 export const formatViolations = (violations: readonly Violation[]): string =>
@@ -939,10 +1497,12 @@ if (require.main === module) {
   console.log(
     `${RECOVERY_OBJECTIVES.length} recovery objective(s) and ${GAME_DAY_SCENARIOS.length} ` +
       `scenario(s) across ${result.environmentsRead.join(', ')}: every objective is documented, ` +
-      'every RPO of zero is on a synchronous path, every exercise starts from an approval and ' +
-      `asserts Multi-AZ before forcing a failover (${result.documentsRead} document(s)), no step ` +
-      'can end an exercise without a record, the probe samples inside its invocation at ' +
-      `one-second resolution, and every freshness alarm breaches on missing data ` +
+      'every RPO of zero is on a synchronous path, every destructive exercise starts from an ' +
+      'approval and asserts Multi-AZ before forcing a failover while every restore drill starts ' +
+      `from a schedule on its objective's own cadence (${result.documentsRead} document(s)), no ` +
+      'step can end an exercise without a record, every drill restores a private copy it can ' +
+      'delete and verifies it before it measures it, the probe samples inside its invocation at ' +
+      'one-second resolution, and every freshness alarm breaches on missing data ' +
       `(${result.alarmsRead} alarm(s) read).`,
   );
 }

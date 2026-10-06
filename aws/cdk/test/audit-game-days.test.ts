@@ -12,6 +12,7 @@ import {
   restorePointAlarmThresholdSeconds,
 } from '../lib/game-days';
 import { FailoverGameDayStack } from '../lib/failover-game-day-stack';
+import { BackupRestoreDrillStack } from '../lib/backup-restore-drill-stack';
 import { gameDayDocumentName } from '../lib/game-days';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -41,13 +42,21 @@ const VPC_CONTEXT = {
   'availability-zones:account=123456789012:region=us-east-1': ['us-east-1a', 'us-east-1b'],
 };
 
-const baseline = (): Record<string, any> => {
+/**
+ * The two stacks' real templates.
+ *
+ * The catalogue spans them now — the failover scenarios are built in one and the
+ * restore drills in the other — so a mutation has to be applied against one
+ * while the other stays pristine, or every mutation would also trip the rules
+ * about the stack it did not touch.
+ */
+const bothStacks = (): { failover: Record<string, any>; drill: Record<string, any> } => {
   const app = new cdk.App({ context: VPC_CONTEXT });
   const networkStack = new cdk.Stack(app, 'Network', {
     env: { account: '123456789012', region: 'us-east-1' },
   });
   const vpc = new ec2.Vpc(networkStack, 'Vpc', { maxAzs: 2 });
-  const stack = new FailoverGameDayStack(app, 'FailoverGameDayStack-Test', {
+  const failover = new FailoverGameDayStack(app, 'FailoverGameDayStack-Test', {
     envName: 'production',
     vpc,
     databaseSecurityGroupId: 'sg-0123456789abcdef0',
@@ -57,8 +66,20 @@ const baseline = (): Record<string, any> => {
     approverArns: ['platform-team-oncall'],
     env: { account: '123456789012', region: 'us-east-1' },
   });
-  return Template.fromStack(stack).toJSON();
+  const drill = new BackupRestoreDrillStack(app, 'BackupRestoreDrillStack-Test', {
+    envName: 'production',
+    vpc,
+    sourceInstanceIdentifier: 'production-postgres',
+    env: { account: '123456789012', region: 'us-east-1' },
+  });
+  return {
+    failover: Template.fromStack(failover).toJSON(),
+    drill: Template.fromStack(drill).toJSON(),
+  };
 };
+
+const baseline = (): Record<string, any> => bothStacks().failover;
+const drillBaseline = (): Record<string, any> => bothStacks().drill;
 
 const DOC = [
   '## 2. The database loses its writer',
@@ -66,16 +87,59 @@ const DOC = [
   '## 4. How the RTO is measured',
   '## 5. The RPO nobody watches',
   '## 6. The alarm that is supposed to fire',
+  '## 14. What the drill verifies',
+  '## 15. The copy that outlives the drill',
 ].join('\n\n');
 
 const run = (document: Record<string, any>, gameDayDoc = DOC) =>
   auditGameDays({
-    templates: [{ path: 'FailoverGameDayStack-Test.template.json', document }],
+    templates: [
+      { path: 'FailoverGameDayStack-Test.template.json', document },
+      { path: 'BackupRestoreDrillStack-Test.template.json', document: drillBaseline() },
+    ],
     gameDayDoc,
   });
 
 const rulesFrom = (document: Record<string, any>, gameDayDoc = DOC): GameDayAuditRule[] =>
   run(document, gameDayDoc).violations.map((violation) => violation.rule);
+
+/** The same, with the drill template mutated and the failover one pristine. */
+const rulesFromDrill = (document: Record<string, any>, gameDayDoc = DOC): GameDayAuditRule[] =>
+  auditGameDays({
+    templates: [
+      { path: 'FailoverGameDayStack-Test.template.json', document: baseline() },
+      { path: 'BackupRestoreDrillStack-Test.template.json', document },
+    ],
+    gameDayDoc,
+  }).violations.map((violation) => violation.rule);
+
+/** The drill's automation document, by name. */
+const theDrillDocument = (document: Record<string, any>) =>
+  find(document, 'AWS::SSM::Document', (properties) =>
+    typeof properties.Name === 'string' && properties.Name.endsWith('-rds-pitr-drill'),
+  );
+
+const drillSteps = (document: Record<string, any>): Record<string, any>[] =>
+  theDrillDocument(document).Content.mainSteps;
+
+const drillStepNamed = (document: Record<string, any>, name: string) => {
+  const found = drillSteps(document).find((step) => step.name === name);
+  if (found === undefined) throw new Error(`no drill step named ${name}`);
+  return found;
+};
+
+/** The logical id of the one resource of a type whose properties match. */
+const logicalIdOf = (
+  document: Record<string, any>,
+  type: string,
+  matches: (properties: Record<string, any>) => boolean,
+): string => {
+  const entry = Object.entries(document.Resources as Record<string, any>).find(
+    ([, resource]: [string, any]) => resource.Type === type && matches(resource.Properties ?? {}),
+  );
+  if (entry === undefined) throw new Error(`no ${type} matching the predicate`);
+  return entry[0];
+};
 
 /** The one resource of a type whose properties match a predicate. */
 const find = (
@@ -149,7 +213,10 @@ describe('the real stack', () => {
   it('reports nothing', () => {
     const result = run(baseline());
     expect(result.violations).toEqual([]);
-    expect(result.documentsRead).toBe(1);
+    // Both exercises: the failover's and the drill's. `run` pairs the mutated
+    // template with a pristine one from the other stack, because the catalogue
+    // spans the two.
+    expect(result.documentsRead).toBe(2);
     expect(result.alarmsRead).toBeGreaterThan(5);
   });
 
@@ -589,6 +656,126 @@ describe('the rule list', () => {
         gameDayDoc: DOC,
         objectives: [{ ...RECOVERY_OBJECTIVES[0], rpoSeconds: 42 }],
       }).violations.map((violation) => violation.rule),
+
+    /* ── The drill ───────────────────────────────────────────────────────── */
+
+    'drill-document-with-approval': () => {
+      // An approve step in a scheduled drill is an execution that starts on
+      // time, asks a question into an empty room, and times out an hour later.
+      const document = drillBaseline();
+      theDrillDocument(document).Content.mainSteps = [
+        {
+          name: 'approve',
+          action: 'aws:approve',
+          onFailure: 'step:recordAbort',
+          inputs: { NotificationArn: 'arn:aws:sns:us-east-1:123456789012:t', Approvers: ['x'] },
+        },
+        ...drillSteps(document),
+      ];
+      return rulesFromDrill(document);
+    },
+    'drill-schedule-missing': () => {
+      const document = drillBaseline();
+      const key = logicalIdOf(document, 'AWS::Events::Rule', (properties) =>
+        typeof properties.Name === 'string' && properties.Name.endsWith('-rds-pitr-drill-schedule'),
+      );
+      delete (document.Resources as Record<string, any>)[key];
+      return rulesFromDrill(document);
+    },
+    'drill-schedule-interval-wrong': () => {
+      const document = drillBaseline();
+      find(document, 'AWS::Events::Rule', (properties) =>
+        typeof properties.Name === 'string' && properties.Name.endsWith('-rds-pitr-drill-schedule'),
+      ).ScheduleExpression = 'rate(90 days)';
+      return rulesFromDrill(document);
+    },
+    'drill-restore-not-point-in-time': () => {
+      const document = drillBaseline();
+      delete drillStepNamed(document, 'restore').inputs.UseLatestRestorableTime;
+      return rulesFromDrill(document);
+    },
+    'drill-restore-publicly-accessible': () => {
+      const document = drillBaseline();
+      delete drillStepNamed(document, 'restore').inputs.PubliclyAccessible;
+      return rulesFromDrill(document);
+    },
+    'drill-restore-deletion-protected': () => {
+      const document = drillBaseline();
+      drillStepNamed(document, 'restore').inputs.DeletionProtection = true;
+      return rulesFromDrill(document);
+    },
+    'drill-verification-missing': () => {
+      const document = drillBaseline();
+      theDrillDocument(document).Content.mainSteps = drillSteps(document).filter(
+        (step) => step.name !== 'verify',
+      );
+      return rulesFromDrill(document);
+    },
+    'drill-teardown-missing': () => {
+      const document = drillBaseline();
+      theDrillDocument(document).Content.mainSteps = drillSteps(document).filter(
+        (step) => step.name !== 'teardown',
+      );
+      return rulesFromDrill(document);
+    },
+    'drill-delete-not-scoped-to-the-copy': () => {
+      const document = drillBaseline();
+      // The widening that reads in a diff exactly like the scoped version.
+      for (const resource of Object.values(document.Resources as Record<string, any>)) {
+        const statements = (resource as any).Properties?.PolicyDocument?.Statement;
+        if (!Array.isArray(statements)) continue;
+        for (const statement of statements) {
+          const actions = Array.isArray(statement.Action) ? statement.Action : [statement.Action];
+          if (actions.includes('rds:DeleteDBInstance')) statement.Resource = '*';
+        }
+      }
+      return rulesFromDrill(document);
+    },
+    'drill-role-can-write-the-source': () => {
+      const document = drillBaseline();
+      for (const resource of Object.values(document.Resources as Record<string, any>)) {
+        const statements = (resource as any).Properties?.PolicyDocument?.Statement;
+        if (!Array.isArray(statements)) continue;
+        for (const statement of statements) {
+          const actions = Array.isArray(statement.Action) ? statement.Action : [statement.Action];
+          if (!actions.includes('rds:RestoreDBInstanceToPointInTime')) continue;
+          // One extra verb on the statement that already names the source, which
+          // is the whole of the "it cannot change anything live" argument.
+          statement.Action = [...actions, 'rds:ModifyDBInstance'];
+        }
+      }
+      return rulesFromDrill(document);
+    },
+    'restore-unverified-not-alarmed': () => {
+      const document = drillBaseline();
+      const key = logicalIdOf(
+        document,
+        'AWS::CloudWatch::Alarm',
+        (properties) => properties.AlarmName === 'production-restore-unverified',
+      );
+      delete (document.Resources as Record<string, any>)[key];
+      return rulesFromDrill(document);
+    },
+    'drill-orphan-not-alarmed': () => {
+      const document = drillBaseline();
+      const key = logicalIdOf(
+        document,
+        'AWS::CloudWatch::Alarm',
+        (properties) => properties.AlarmName === 'production-restore-drill-instance-orphaned',
+      );
+      delete (document.Resources as Record<string, any>)[key];
+      return rulesFromDrill(document);
+    },
+    'drill-sweeper-missing': () => {
+      const document = drillBaseline();
+      const key = logicalIdOf(
+        document,
+        'AWS::Lambda::Function',
+        (properties) => properties.FunctionName === 'production-restore-drill-sweeper',
+      );
+      delete (document.Resources as Record<string, any>)[key];
+      return rulesFromDrill(document);
+    },
   };
 
   it('has a mutation for every rule, so no rule is a green check over nothing', () => {

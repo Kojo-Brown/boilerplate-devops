@@ -986,7 +986,7 @@ See [docs/postmortem.md](./docs/postmortem.md) for the trigger table, the nine
 sections, the ten checklist questions with the reason for each, the sixteen gate
 rules and the known gaps.
 
-## Multi-AZ failover game days
+## Recovery game days and the backup restore drill
 
 `multiAz: true` is one line in `RdsStack` and it was the whole of the
 disaster-recovery story here. It is also a claim about what AWS does rather than
@@ -1029,14 +1029,46 @@ essentially never observed. If the backup pipeline stops,
 stay "enabled", every RDS metric stays flat, and the data you could get back
 gets older every hour.
 
+The restore path needs a second exercise, because that number is about backups
+being *taken* and not about anything being restorable from them — two claims that
+look identical on a dashboard. `BackupRestoreDrillStack` restores the database
+into `<env>-dr-drill` every thirty days, verifies the copy, publishes how long it
+took, and deletes it. Three things it is arranged around:
+
+- **It runs on a schedule, which is the opposite of the failover above, and for
+  the same reason.** A forced failover breaks a live primary, so a human starts
+  it. A point-in-time restore reads the backups into a second instance and
+  touches nothing live — and a restore drill behind a human gate is a restore
+  drill that runs once, in the week it shipped. The distinction is data:
+  `DESTRUCTIVE_FAULTS` and `GameDayScenario.trigger`, with rules that refuse a
+  destructive fault on a schedule and a cadence slower than its objective's
+  shelf life.
+- **Verification does not run a query, and that is a limitation rather than a
+  shortcut.** There is no PostgreSQL client here — every function ships through
+  `Code.fromInline` and a driver means bundling — so the two checks that would
+  have been queries are replaced by two that reach the same findings from
+  outside the engine: `engine-negotiates-tls` makes the backend answer
+  PostgreSQL's own `SSLRequest`, which a listener with no postmaster behind it
+  cannot do, and `restored-bytes-match-source` compares the two instances'
+  `FreeStorageSpace` — the only check here that can see a restore which
+  completed and brought back an empty volume.
+- **A failed verification is a successful execution.** The drill has to delete
+  its copy whatever it finds, so the execution's status cannot be the signal:
+  `RestoreVerified: 0` and `<env>-restore-unverified` are, and the rehearsal
+  clock is deliberately not reset. The copy that outlives a *cancelled*
+  execution — the one path SSM does not run `onFailure` for — is swept hourly,
+  and every grant that can delete a database is scoped to that one literal ARN.
+
 `npm run audit:gamedays` holds the catalogue against the synthesised documents
 and alarms: a reboot without `ForceFailover`, a probe at standard resolution, a
 status wait placed before the settle period, a step with no abort path, a
-restore-point threshold that is red every afternoon.
+restore-point threshold that is red every afternoon, a drill nothing schedules,
+a restored copy on a public endpoint, and a copy nothing can delete.
 
 See [docs/game-days.md](./docs/game-days.md) for the two objectives with their
-numbers, how the RTO is measured and when it is refused, how to run an exercise,
-what you have to set, the cost, the twenty gate rules and the known gaps.
+numbers, how each is measured and when a measurement is refused, how to run an
+exercise, what the drill does and does not verify, what you have to set, the
+cost, the thirty-three gate rules (plus the catalogue's own) and the known gaps.
 
 ## Spec Progress
 See [SPEC.md](./SPEC.md).

@@ -42,6 +42,7 @@ import {
 } from '../lib/synthetic-canary-stack';
 import { SyntheticCanaryFleet } from '../lib/synthetic-canary-probes';
 import { FailoverGameDayStack } from '../lib/failover-game-day-stack';
+import { BackupRestoreDrillStack } from '../lib/backup-restore-drill-stack';
 import { RunbookStack } from '../lib/runbook-stack';
 
 const app = new cdk.App();
@@ -1958,6 +1959,79 @@ const failoverGameDayStackProduction = new FailoverGameDayStack(
   },
 );
 
+// ── Backup Restore Drills ─────────────────────────────────────────────────────
+// The game days above measure the promotion path. The restore path's RPO has
+// been published continuously since they shipped — `LatestRestorableTime`
+// advancing, which `FailoverGameDayStack`'s recorder reads every five minutes —
+// and that number is evidence that backups are being *taken*. It is not
+// evidence that anything can be restored from them, and the two claims look
+// identical on a dashboard. `BackupRestoreDrillStack` is the other half:
+// restore into a copy, verify the copy, measure how long it took, delete it.
+//
+// It is the one exercise in this repository that runs **without an approval**,
+// and that is the point rather than a convenience. A forced failover breaks a
+// live instance, so it starts from a human; a point-in-time restore reads the
+// backups into a second instance and touches nothing live, so the reasoning
+// inverts — a restore drill behind a human gate is a restore drill that runs
+// once, in the week it shipped. The distinction is data: `DESTRUCTIVE_FAULTS`
+// and `GameDayScenario.trigger` in `lib/game-days.ts`, with rules in
+// `validateGameDayCatalogue` that refuse a destructive fault on a schedule and a
+// scheduled one whose cadence is slower than its objective's shelf life.
+//
+// Verification does not run a query, because there is no PostgreSQL client in
+// this repository and a driver would mean bundling. The two checks that would
+// have been queries are replaced by `engine-negotiates-tls`, which makes the
+// backend answer PostgreSQL's own SSLRequest, and `restored-bytes-match-source`,
+// which compares the two instances' `FreeStorageSpace` and is the only thing
+// here that can see a restore which completed and brought back an empty volume.
+// See docs/game-days.md §14 for all seven and §12 for what is still not covered.
+//
+// After deployment:
+//   - Subscribe the rota to `<env>-restore-drill`. The first drill runs within
+//     thirty days of the deploy; `<env>-rehearsal-overdue-rds-point-in-time-restore`
+//     is red until one of them is verified, which is correct — nothing has
+//     restored these backups yet.
+//   - Watch `<env>-restore-drill-instance-orphaned`. It is the one alarm here
+//     that is about money rather than about recovery: the copy is full-size, and
+//     the path that leaves one running is somebody cancelling an execution
+//     between the restore and the teardown, which SSM does not run `onFailure`
+//     for. The sweeper removes it on the next hour unless a drill is running.
+//   - A failed verification is a *successful* execution that publishes
+//     `RestoreVerified: 0` and does not reset the rehearsal clock. The execution
+//     status is not the signal; `<env>-restore-unverified` is.
+const backupRestoreDrillStackStaging = new BackupRestoreDrillStack(
+  app,
+  'BackupRestoreDrillStack-Staging',
+  {
+    envName: 'staging',
+    vpc: vpcStackStaging.vpc,
+    sourceInstanceIdentifier: 'staging-postgres',
+    notificationEmails: process.env.STAGING_RUNBOOK_NOTIFY_EMAIL
+      ? [process.env.STAGING_RUNBOOK_NOTIFY_EMAIL]
+      : [],
+    env: { account: process.env.CDK_DEFAULT_ACCOUNT, region: primaryRegion },
+    description: 'Staging backup restore drill — restore into a copy, verify it, measure it, delete it',
+    tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+  },
+);
+
+const backupRestoreDrillStackProduction = new BackupRestoreDrillStack(
+  app,
+  'BackupRestoreDrillStack-Production',
+  {
+    envName: 'production',
+    vpc: vpcStackProduction.vpc,
+    sourceInstanceIdentifier: 'production-postgres',
+    notificationEmails: process.env.PRODUCTION_RUNBOOK_NOTIFY_EMAIL
+      ? [process.env.PRODUCTION_RUNBOOK_NOTIFY_EMAIL]
+      : [],
+    env: { account: process.env.CDK_DEFAULT_ACCOUNT, region: primaryRegion },
+    description:
+      'Production backup restore drill — restore into a copy, verify it, measure it, delete it',
+    tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+  },
+);
+
 // ── Runbook Automation ────────────────────────────────────────────────────────
 // Every alarm above reaches a topic; until now, what arrived on that topic was
 // an alarm name, a threshold and — for the SLO alarms only — a link to a
@@ -2003,6 +2077,7 @@ new RunbookStack(app, 'RunbookStack-Staging', {
     sloStackStaging.ticketTopic,
     sloBurnRateRollbackStackStaging.notificationTopic,
     failoverGameDayStackStaging.notificationTopic,
+    backupRestoreDrillStackStaging.notificationTopic,
     ...canaryQuorumTopicsIn(syntheticCanaryQuorumStackStaging),
   ],
   service: { clusterName: 'staging-cluster', serviceName: 'staging-service' },
@@ -2027,6 +2102,7 @@ new RunbookStack(app, 'RunbookStack-Production', {
     sloStackProduction.ticketTopic,
     sloBurnRateRollbackStackProduction.notificationTopic,
     failoverGameDayStackProduction.notificationTopic,
+    backupRestoreDrillStackProduction.notificationTopic,
     // The two account-wide stacks have one instance between both environments
     // and their alarms are tickets about the platform's own tooling, so they
     // are enriched once, here, rather than by both enrichers.

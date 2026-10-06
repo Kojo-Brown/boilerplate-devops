@@ -306,6 +306,15 @@ export const RUNBOOK_CATALOGUE: readonly RunbookDefinition[] = [
       // database itself are §10.
       '*-game-day-*',
       '*-rehearsal-overdue-*',
+      // The restore drill's three functions, for the same reason: a verifier,
+      // conductor or sweeper that is failing means the restore path's RTO is
+      // stale rather than wrong. The drill's two *findings* —
+      // `*-restore-unverified` and `*-restore-drill-instance-orphaned` — are
+      // §11, because one is about the data and the other is about an instance
+      // that is still running.
+      '*-restore-drill-verifier-errors',
+      '*-restore-drill-conductor-errors',
+      '*-restore-drill-sweeper-errors',
     ],
     summary:
       'Something that measures the platform has failed, rather than the platform itself. ' +
@@ -336,6 +345,27 @@ export const RUNBOOK_CATALOGUE: readonly RunbookDefinition[] = [
         'reads the RDS instance: whether it is mid-failover, whether it is back to available ' +
         'while the probe is still failing, and whether a modification is pending',
       alarmFilledParameters: [],
+    },
+  },
+  {
+    id: 'restore-drill',
+    title: 'A restore drill could not verify its copy, or left one running',
+    owner: 'platform-team',
+    anchor: '#11-a-restore-drill-could-not-verify-its-copy-or-left-one-running',
+    alarmNamePatterns: ['*-restore-unverified', '*-restore-drill-instance-orphaned'],
+    summary:
+      'Either the monthly drill restored the database into a copy and could not establish that ' +
+      'the copy is the data — which is the one question backups exist to answer and the one ' +
+      '`LatestRestorableTime` advancing cannot answer — or a full-size copy of the database is ' +
+      'still running after a drill that should have deleted it.',
+    firstStep: {
+      documentKey: 'alarm-history',
+      summary:
+        'reads this alarm\'s own state transitions. For the unverified alarm that answers ' +
+        '"is this the first failed drill or the third", which is the difference between a ' +
+        'bad month and a backup pipeline that has not worked since somebody changed it; for ' +
+        'the orphan alarm it bounds how long a copy of the database has been up',
+      alarmFilledParameters: ['AlarmName'],
     },
   },
 ];
