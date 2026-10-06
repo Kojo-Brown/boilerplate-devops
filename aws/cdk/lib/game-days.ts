@@ -104,6 +104,45 @@ export const METRIC_HOURS_SINCE_REHEARSAL = 'HoursSinceRehearsal';
 export const METRIC_MEASURED_RTO = 'MeasuredRtoSeconds';
 
 /**
+ * Seconds from the restore being requested to the restored copy answering a
+ * verified query. Published once per drill.
+ *
+ * A different kind of number from {@link METRIC_MEASURED_RTO}, and the
+ * difference is worth stating because it is the one exception to this item's
+ * "measure from a signal that was already on" rule. A promotion is an event that
+ * happens to a running system, so an always-on probe can catch it whenever it
+ * occurs, including at 04:00 with nobody awake. A point-in-time restore is not
+ * an event that happens: it is a thing somebody does, and no amount of watching
+ * production will ever produce one. The only way to get a number is to perform
+ * the restore, which is why this metric has one datapoint per drill and why the
+ * drill is scheduled rather than approved.
+ */
+export const METRIC_MEASURED_RESTORE_SECONDS = 'MeasuredRestoreSeconds';
+
+/**
+ * 1 when every check in {@link RESTORE_VERIFICATION_CHECKS} passed, 0 when any
+ * failed.
+ *
+ * Published on every drill that got as far as having something to verify, which
+ * includes the drills that failed verification — a restore that came back wrong
+ * is the finding, and a metric that is only ever published when things worked is
+ * a metric whose absence is indistinguishable from health.
+ */
+export const METRIC_RESTORE_VERIFIED = 'RestoreVerified';
+
+/**
+ * Age of the drill instance that is currently running, in seconds.
+ *
+ * The one failure in this whole item that costs money forever: a drill that
+ * aborted between the restore and the teardown leaves a full-size copy of
+ * production running, and nothing about it is red. It does not serve traffic, it
+ * has no alarms of its own, and it looks exactly like a database somebody meant
+ * to create. The sweeper publishes this every hour so that the orphan is a
+ * number on a graph rather than a line on next month's bill.
+ */
+export const METRIC_DRILL_INSTANCE_AGE = 'DrillInstanceAgeSeconds';
+
+/**
  * Every metric the stack publishes into {@link GAME_DAY_NAMESPACE}.
  *
  * {@link RecoveryObjective.measuredBy} has to name one of these. An objective
@@ -118,6 +157,9 @@ export const GAME_DAY_METRICS = [
   METRIC_RESTORE_POINT_LAG,
   METRIC_HOURS_SINCE_REHEARSAL,
   METRIC_MEASURED_RTO,
+  METRIC_MEASURED_RESTORE_SECONDS,
+  METRIC_RESTORE_VERIFIED,
+  METRIC_DRILL_INSTANCE_AGE,
 ] as const;
 
 export type GameDayMetric = (typeof GAME_DAY_METRICS)[number];
@@ -188,6 +230,57 @@ export const MAX_RESOLUTION_SECONDS = PROBE_SAMPLE_INTERVAL_SECONDS * 2;
  * why this is a rule and not a guideline.
  */
 export const MIN_RTO_PERIODS = 10;
+
+/**
+ * The drill's measurement resolution, in seconds.
+ *
+ * A restore is not watched by the probe — it happens to an instance that did not
+ * exist a minute ago and that nothing is connected to — so its RTO is bounded
+ * by how often the automation asks whether the restored instance is ready.
+ * `aws:waitForAwsResourceProperty` polls on roughly this cadence, which means
+ * the drill notices `available` up to one interval after it became true and the
+ * measured number is up to one interval too large.
+ *
+ * That is the safe direction for an RTO and it is why this is a constant rather
+ * than something to tune: a measurement that errs long is a target nobody
+ * over-promises against, and the alternative — polling the restore every second
+ * for forty minutes — buys thirty seconds of precision on a number whose
+ * objective is half an hour.
+ */
+export const DRILL_POLL_INTERVAL_SECONDS = 30;
+
+/**
+ * Metrics the in-VPC probe publishes continuously.
+ *
+ * Separated from the rest because the preflight rules differ: an objective
+ * measured from the probe cannot be exercised while the probe is quiet, and one
+ * measured from a drill has no probe in its path at all. Requiring
+ * `probe-reporting` of both would put a check on the drill that cannot fail for
+ * any reason the drill cares about, which is the kind of green that teaches
+ * people to stop reading a gate.
+ */
+export const PROBE_METRICS: readonly GameDayMetric[] = [
+  METRIC_CONNECT_SUCCESS,
+  METRIC_CONNECT_LATENCY,
+  METRIC_ENDPOINT_ADDRESS_CHANGED,
+  METRIC_RESOLUTION_FAILED,
+];
+
+/**
+ * The uncertainty attached to an objective's measurement, in seconds.
+ *
+ * Which signal the objective is measured from decides it: the probe samples
+ * every {@link PROBE_SAMPLE_INTERVAL_SECONDS}, and the drill observes the
+ * restored instance every {@link DRILL_POLL_INTERVAL_SECONDS}. The floor rule in
+ * {@link validateGameDayCatalogue} is written against this rather than against
+ * the probe's interval, because an objective of half an hour measured by a
+ * thirty-second poll is perfectly measurable and the probe's number has nothing
+ * to say about it.
+ */
+export const measurementResolutionSeconds = (objective: RecoveryObjective): number =>
+  PROBE_METRICS.includes(objective.measuredBy)
+    ? PROBE_SAMPLE_INTERVAL_SECONDS
+    : DRILL_POLL_INTERVAL_SECONDS;
 
 /* ── Objectives ───────────────────────────────────────────────────────────── */
 
@@ -284,10 +377,11 @@ export interface RecoveryObjective {
 /**
  * The recovery objectives this repository's infrastructure can be held to.
  *
- * Two, over one database, because there are two mechanisms. The promotion path
- * is rehearsed by {@link GAME_DAY_SCENARIOS}; the restore path is `declared`,
- * its RPO is measured continuously and its RTO is not measured at all, and the
- * next spec item is the drill that fixes that.
+ * Two, over one database, because there are two mechanisms. Both are now
+ * rehearsed by {@link GAME_DAY_SCENARIOS}, and by exercises of deliberately
+ * different shapes: the promotion path breaks a live instance and so starts from
+ * a human, and the restore path creates a copy and touches nothing live, so it
+ * starts from a schedule. See {@link GameDayTrigger}.
  */
 export const RECOVERY_OBJECTIVES: readonly RecoveryObjective[] = [
   {
@@ -317,19 +411,32 @@ export const RECOVERY_OBJECTIVES: readonly RecoveryObjective[] = [
     anchor: '#3-the-data-is-wrong-and-has-to-be-rolled-back',
     owner: 'platform-team',
     path: 'point-in-time-restore',
-    status: 'declared',
-    // Thirty minutes is a guess, and is marked as one by `status: 'declared'`.
-    // It stays here because an objective nobody has written down is not thereby
-    // zero — the dependency that has to decide whether to queue or to fail needs
-    // an order of magnitude, and "we have not measured it" is one.
+    status: 'rehearsed',
+    // Thirty minutes. It began life as a guess carrying `status: 'declared'`,
+    // and what changed is not the number but that something now produces one to
+    // compare it against: `rds-pitr-drill` restores to the latest restorable
+    // point every thirty days and publishes the seconds it took. The objective
+    // is deliberately left where it was rather than being moved to whatever the
+    // first drill reports — an objective edited to match the last measurement is
+    // not an objective, and the gap between the two is the finding.
     rtoSeconds: 1800,
     // Five minutes: the interval RDS advances LatestRestorableTime on. Not a
     // target we chose, a property of the mechanism — which is exactly why it is
     // worth publishing rather than asserting.
     rpoSeconds: 300,
     rpoBasis: 'latest-restorable-time',
-    measuredBy: METRIC_RESTORE_POINT_LAG,
-    rehearsalIntervalDays: 180,
+    // The RTO's metric, not the RPO's. `METRIC_RESTORE_POINT_LAG` is still
+    // published every five minutes and still alarmed on — it is this objective's
+    // RPO — but what this field names is the signal the *RTO* is derived from,
+    // and until the drill existed the honest answer was "nothing", written down
+    // as the RPO metric because the field had to hold something.
+    measuredBy: METRIC_MEASURED_RESTORE_SECONDS,
+    // Thirty days rather than the 180 this carried while it was unexercised. A
+    // drill nobody has to approve can run monthly, and the interval is the
+    // objective's shelf life: the restore path's RTO moves with the volume's
+    // size, which grows continuously, so a number from six months ago is a
+    // number about a smaller database.
+    rehearsalIntervalDays: 30,
     summary:
       'A bad migration or a bad deploy corrupts data, and recovery means a new instance ' +
       'restored to a second before the damage. The promotion path cannot help: the standby ' +
@@ -340,14 +447,53 @@ export const RECOVERY_OBJECTIVES: readonly RecoveryObjective[] = [
 /* ── Scenarios ────────────────────────────────────────────────────────────── */
 
 /**
- * The fault a game day injects.
+ * The fault, or the exercise, a game day performs.
  *
- * One kind, deliberately. `rds:RebootDBInstance` with `ForceFailover` is the
- * only way to exercise a promotion that does not involve breaking something we
- * would then have to fix, and an enum of one is the honest shape for a catalogue
- * with one entry in it.
+ * Two, and they are not the same kind of thing — which is the distinction
+ * {@link GameDayTrigger} exists to carry. A forced failover is a fault injected
+ * into a live instance. A point-in-time restore injects nothing: it reads the
+ * backups into a second instance and leaves production untouched. Calling both
+ * "faults" was the first shape of this type and it is what made a restore drill
+ * look like something that needed a human to approve it.
  */
-export type GameDayFault = 'rds-force-failover';
+export type GameDayFault = 'rds-force-failover' | 'rds-point-in-time-restore';
+
+/**
+ * Faults that change something live.
+ *
+ * The list is the reason the approval step exists, so it is data rather than a
+ * comment: {@link validateGameDayCatalogue} refuses a scenario whose fault is in
+ * here and whose trigger is anything but `approval`, and adding a fault without
+ * adding it here is the way a destructive exercise would acquire a schedule.
+ */
+export const DESTRUCTIVE_FAULTS: readonly GameDayFault[] = ['rds-force-failover'];
+
+/**
+ * What starts an exercise.
+ *
+ * The whole of the distinction between the two scenarios in this catalogue, and
+ * the thing most worth getting right, because the two mistakes are not
+ * symmetrical. A destructive exercise on a schedule is an outage nobody chose. A
+ * non-destructive one behind an approval is an exercise that quietly stops
+ * happening — somebody has to remember, and six months later the overdue alarm
+ * is a ticket in a backlog, which is where DR rehearsals go to die. The restore
+ * drill exists because §3 of docs/game-days.md had been honest about an
+ * unmeasured number for one spec item, and an unmeasured number behind a human
+ * gate would have stayed unmeasured.
+ */
+export type GameDayTrigger =
+  /**
+   * A human approves it through `aws:approve`. Mandatory for every fault in
+   * {@link DESTRUCTIVE_FAULTS}.
+   */
+  | 'approval'
+  /**
+   * An EventBridge schedule starts the automation. Permitted only where the
+   * exercise changes nothing live, and required to run at least as often as the
+   * objective's `rehearsalIntervalDays` — otherwise the schedule and the overdue
+   * alarm disagree, and the alarm is red through a drill cadence somebody chose.
+   */
+  | 'schedule';
 
 /**
  * A precondition checked before the fault is injected.
@@ -385,8 +531,34 @@ export const PREFLIGHT_CHECKS = [
    *
    * A game day during an incident is not a game day. This is the check that most
    * often refuses a scheduled exercise, and refusing is the point.
+   *
+   * Deliberately *not* on the restore drill: that exercise changes nothing live,
+   * so "an incident is going on" is not a reason to skip it — and a monthly
+   * drill gated on an account-wide alarm prefix is a drill that stops happening
+   * during the months when something is always red, which are the months you
+   * most want to know the backups restore.
    */
   'no-alarm-in-alarm-state',
+  /**
+   * There is a restore point, and it is recent enough to restore to.
+   *
+   * `UseLatestRestorableTime` on an instance with no automated backups is not an
+   * error the API returns helpfully: it is an `InvalidDBInstanceState` forty
+   * seconds in, and the drill it aborts looks like a drill that failed rather
+   * than like an instance that cannot be restored at all. Checking first turns
+   * the most important finding this item can produce — *there is no restore
+   * path* — into the reason on an abort record instead of a stack trace.
+   */
+  'restore-point-available',
+  /**
+   * No drill instance from a previous run is still around.
+   *
+   * Restoring onto an identifier that exists fails outright, which would be
+   * harmless. The dangerous shape is the next step: a teardown scoped to that
+   * identifier would delete the *other* drill's instance, in the middle of its
+   * verification, and the report would say the restore could not be verified.
+   */
+  'no-drill-instance-present',
 ] as const;
 
 export type PreflightCheck = (typeof PREFLIGHT_CHECKS)[number];
@@ -399,6 +571,22 @@ export const ABORT_CONDITIONS = [
   'instance-not-available-in-time',
   /** A human said stop. Always available, always first. */
   'operator-abort',
+  /**
+   * The restored instance never reached `available` inside the wait.
+   *
+   * Which is a result, not a hitch: it means the restore path's RTO is past the
+   * wait, and the wait is set from the objective. The record carries it and the
+   * instance is torn down, so the finding is "a restore takes longer than we
+   * promised" rather than a drill that hung.
+   */
+  'restore-not-available-in-time',
+  /**
+   * The restored copy came back and could not be verified.
+   *
+   * The single most valuable outcome this item can produce, and the one a drill
+   * that only watched for `available` would have reported as a success.
+   */
+  'verification-failed',
 ] as const;
 
 export type AbortCondition = (typeof ABORT_CONDITIONS)[number];
@@ -411,27 +599,29 @@ export interface GameDayScenario {
   readonly objectiveId: string;
   readonly fault: GameDayFault;
   /**
+   * What starts it. See {@link GameDayTrigger} — the rules are that a
+   * destructive fault must be `approval`, and that a `schedule` must be at least
+   * as frequent as the objective's rehearsal interval.
+   */
+  readonly trigger: GameDayTrigger;
+  /**
+   * Days between automatic runs. Required when {@link trigger} is `schedule`,
+   * and refused when it is not: a cadence on an exercise nothing schedules is a
+   * number that reads like a commitment and drives nothing.
+   */
+  readonly scheduleIntervalDays?: number;
+  /**
    * Environments this scenario may be run in, by name.
    *
    * The blast radius, as data. Empty means anywhere, which is why it is refused,
    * and `*` is refused for the same reason: a scenario runnable everywhere is a
    * scenario runnable in production by someone who thought they were in staging.
-   * Production is in this list for the promotion drill on purpose — a failover
-   * rehearsed only in staging measures staging's connection pool — and that is
-   * exactly why the approval below is not optional.
+   * Production is in this list for both exercises on purpose — a failover
+   * rehearsed only in staging measures staging's connection pool, and a restore
+   * rehearsed only in staging measures staging's volume — and for the failover
+   * that is exactly why {@link trigger} is not negotiable.
    */
   readonly allowedEnvironments: readonly string[];
-  /**
-   * Always `true`, and a field rather than a constant so that a change to it is
-   * a diff somebody has to defend.
-   *
-   * The automation's first step is `aws:approve`. Everything else in this
-   * repository that a machine starts is read-only — see `lib/runbooks.ts`, whose
-   * gate rejects any first step that is not a `Describe` — and this is the one
-   * thing that deliberately changes production, so it starts from a human
-   * saying so.
-   */
-  readonly approvalRequired: true;
   readonly preflight: readonly PreflightCheck[];
   readonly abortIf: readonly AbortCondition[];
   /** Rough wall-clock cost of running it, for the calendar invite. */
@@ -446,8 +636,8 @@ export const GAME_DAY_SCENARIOS: readonly GameDayScenario[] = [
     title: 'Force a Multi-AZ failover and measure the caller-side outage',
     objectiveId: 'rds-multi-az-promotion',
     fault: 'rds-force-failover',
+    trigger: 'approval',
     allowedEnvironments: ['staging', 'production'],
-    approvalRequired: true,
     preflight: [
       'multi-az-enabled',
       'probe-reporting',
@@ -464,6 +654,38 @@ export const GAME_DAY_SCENARIOS: readonly GameDayScenario[] = [
       'Reboot the primary with ForceFailover, then read the outage off the probe rather than ' +
       'off a stopwatch. What is learned is the caller-side RTO, and whether the endpoint ' +
       'address changed at all — which is the difference between a failover and a reboot.',
+  },
+  {
+    id: 'rds-pitr-drill',
+    title: 'Restore to the latest restorable point and prove the data came back',
+    objectiveId: 'rds-point-in-time-restore',
+    fault: 'rds-point-in-time-restore',
+    // A schedule, which is the point. See {@link GameDayTrigger}: this exercise
+    // reads the backups into a second instance and never touches the live one,
+    // so there is nothing for a human to weigh — and a restore drill behind an
+    // approval is a restore drill that runs once, in the week the item shipped.
+    trigger: 'schedule',
+    // Monthly, which is the objective's interval. The rule in
+    // `validateGameDayCatalogue` is that the schedule must be at least as
+    // frequent as the interval: a drill every 60 days against a 30-day shelf
+    // life means the overdue alarm is red for half of every cycle, with nothing
+    // anybody can do about it except widen the interval they just chose.
+    scheduleIntervalDays: 30,
+    allowedEnvironments: ['staging', 'production'],
+    preflight: ['restore-point-available', 'no-drill-instance-present'],
+    abortIf: ['operator-abort', 'restore-not-available-in-time', 'verification-failed'],
+    // Forty-five minutes for a 100 GiB volume, almost all of it the restore
+    // itself. Nobody has to sit through it — the drill reports when it is done —
+    // but it is what the schedule has to be spaced against, and it is why the
+    // teardown is on the failure path of every step after the restore.
+    expectedDurationMinutes: 45,
+    summary:
+      'Restore the instance to its latest restorable point into a scratch instance and verify ' +
+      'the copy: it is available, private and encrypted, its engine negotiates TLS and presents ' +
+      'a certificate for the endpoint that was restored, its volume holds the source\'s bytes, ' +
+      'and its point in time is the one that was asked for. Then measure how long that took and ' +
+      'delete the copy. What is learned is that the backups restore at all, which ' +
+      'LatestRestorableTime advancing is not evidence of.',
   },
 ];
 
@@ -483,6 +705,33 @@ export const gameDayDocumentName = (envName: string, scenarioId: string): string
  */
 export const rehearsalParameterName = (envName: string, objectiveId: string): string =>
   `/${envName}/game-day/${objectiveId}/last-rehearsal`;
+
+/**
+ * `<env>-dr-drill`: the instance a restore drill restores into.
+ *
+ * One identifier per environment, fixed rather than suffixed with an execution
+ * id, and that is a deliberate trade. A fixed name means two drills cannot run
+ * at once — the second one's restore fails on the identifier, which the
+ * `no-drill-instance-present` preflight turns into a clean refusal — and in
+ * exchange every grant that can delete a database in this repository is scoped
+ * to one literal ARN that is known at synth time. With a generated name the
+ * teardown's grant would have to be `<env>-dr-drill-*` at best, and the
+ * difference between a prefix and a name is the difference between "can delete
+ * the drill copy" and "can delete anything somebody names like one".
+ */
+export const drillInstanceIdentifier = (envName: string): string => `${envName}-dr-drill`;
+
+/**
+ * Longest a drill instance may exist before the sweeper treats it as abandoned,
+ * in seconds.
+ *
+ * Six hours, against a drill that takes about forty-five minutes. The margin is
+ * wide on purpose: the sweeper deletes what it finds, and the only thing worse
+ * than an orphaned copy of production is a sweeper that deletes a drill which
+ * was still working — which would report as a verification failure and send
+ * somebody looking at the backups.
+ */
+export const MAX_DRILL_INSTANCE_AGE_SECONDS = 6 * 3600;
 
 /** The objective a scenario measures, or `undefined` if it names one that is gone. */
 export const objectiveFor = (
@@ -517,6 +766,21 @@ export interface RehearsalRecord {
   readonly measuredRtoSeconds?: number;
   /** Uncertainty of that number, from the probe's interval. */
   readonly resolutionSeconds?: number;
+  /**
+   * The point in time a restore drill restored to, ISO 8601. Absent on a
+   * failover exercise, which has no restore point.
+   */
+  readonly restorePoint?: string;
+  /** Verification checks that passed, in the order they ran. */
+  readonly checksPassed?: readonly string[];
+  /**
+   * Verification checks that failed, with the detail each one reported.
+   *
+   * Present and non-empty is the finding: the restore completed, the instance
+   * reached `available`, and the copy is not usable. A drill that recorded only
+   * "aborted" would have thrown that away.
+   */
+  readonly checksFailed?: readonly string[];
   /** Did the endpoint resolve somewhere new? A `false` here means no failover happened. */
   readonly endpointAddressChanged?: boolean;
   /** Restore-point lag at the time of the exercise, for the record. */
@@ -854,6 +1118,315 @@ export const restorePointAlarmThresholdSeconds = (
   recorderIntervalSeconds: number = RECORDER_INTERVAL_SECONDS,
 ): number => objective.rpoSeconds + 2 * recorderIntervalSeconds;
 
+/* ── Verifying a restore ──────────────────────────────────────────────────── */
+
+/**
+ * What a drill checks about the copy it restored.
+ *
+ * The shape of this list is decided by one constraint, and it is worth stating
+ * before the entries rather than apologising for afterwards: **there is no
+ * PostgreSQL client here.** `lambda.Code.fromInline` is how every function in
+ * this repository ships, a driver would mean bundling, and docs/game-days.md has
+ * carried "that needs a client library in the probe, which means bundling, which
+ * this repository does not do" as a known gap since the probe was written. So
+ * none of these checks runs a query, and the two that would have — "the schema
+ * is there", "the rows are there" — are replaced by the two below that reach the
+ * same findings through the control plane and the wire protocol. What that costs
+ * is listed in docs/game-days.md §12.
+ *
+ * Every entry is here because a drill without it reports a success that means
+ * nothing. The order is the order they run in, and it is cheapest-and-most-
+ * decisive first: there is no point opening a socket to an instance that is not
+ * `available`, and the public-access check comes before anything that touches
+ * the data because that is a finding you want *before* a copy of production has
+ * been reachable from the internet for forty minutes.
+ */
+export const RESTORE_VERIFICATION_CHECKS = [
+  /**
+   * The restored instance reports `available`.
+   *
+   * Not sufficient, and until this item it was the whole of what most restore
+   * "drills" test: RDS reports `available` as soon as the engine starts, and an
+   * instance restored from a backup of an empty volume starts perfectly.
+   */
+  'instance-available',
+  /**
+   * `PubliclyAccessible` is false.
+   *
+   * The drill's own worst failure, and the reason this check exists rather than
+   * the request simply setting the flag. `RestoreDBInstanceToPointInTime` does
+   * not copy `PubliclyAccessible` from the source — it takes it from the
+   * request, and the default depends on the subnet group — so a drill that omits
+   * it can put a full copy of production's data on a public endpoint, once a
+   * month, with nobody looking. Asserted against the instance that exists
+   * instead of against the call that was made, because those are different
+   * claims.
+   */
+  'not-publicly-accessible',
+  /** `StorageEncrypted` is true, which a restore of an encrypted source is. */
+  'storage-encrypted',
+  /**
+   * The engine answers PostgreSQL's SSL negotiation and completes a TLS
+   * handshake.
+   *
+   * The first check that is about the database rather than about the control
+   * plane, and strictly stronger than the TCP connect the failover probe makes:
+   * a backend has to read the eight-byte `SSLRequest` and answer `S` before any
+   * session exists, so a listener with no postmaster behind it fails here while
+   * passing a connect. An instance still replaying WAL does not reach this
+   * either — it is the state a restore that silently did not finish leaves
+   * behind.
+   */
+  'engine-negotiates-tls',
+  /**
+   * The certificate the engine presents names the endpoint that was restored.
+   *
+   * Identity without a chain, deliberately — see
+   * {@link RESTORE_TLS_CHAIN_UNVERIFIED}. What it rules out is the whole class
+   * of "something answered": the drill resolved the endpoint of the instance it
+   * created, and the thing on the other end holds a certificate for that name.
+   */
+  'certificate-names-the-instance',
+  /**
+   * The restored volume holds about as many bytes as the source's.
+   *
+   * The replacement for the query nobody can run here, and the check that
+   * catches the restore that completed and brought back nothing: an instance
+   * restored from the wrong source, or from a point before the schema existed,
+   * is `available`, serves TLS, presents the right certificate, and is empty.
+   * `FreeStorageSpace` is published for both instances by RDS itself, once a
+   * minute, so the comparison is between two numbers AWS produced — and an
+   * empty database against a populated one is not a near miss, it is orders of
+   * magnitude. See {@link restoredBytesMatch} for the tolerance and why it is
+   * as wide as it is.
+   */
+  'restored-bytes-match-source',
+  /**
+   * The copy is not older than the point the drill asked for.
+   *
+   * `UseLatestRestorableTime` is a request, and the thing that answers it is a
+   * backup pipeline. A restore that quietly came from an older point is the
+   * exact failure a point-in-time restore exists to avoid — you restore to a
+   * second before the bad migration and get the bad migration — and it is
+   * invisible in every other check here, because an instance restored to last
+   * Tuesday is just as `available`, just as encrypted and holds just as many
+   * bytes. The restored instance's `InstanceCreateTime` is at or after the
+   * moment the restore was requested, and the preflight recorded the source's
+   * `LatestRestorableTime` as of that moment, so the two bracket the point the
+   * data is from.
+   */
+  'restore-point-not-stale',
+] as const;
+
+export type RestoreVerificationCheck = (typeof RESTORE_VERIFICATION_CHECKS)[number];
+
+/**
+ * Why the TLS handshake in `engine-negotiates-tls` does not validate the chain.
+ *
+ * Exported as a constant so it is one string, quoted by the verifier's own
+ * output and by `test/backup-restore-drill-stack.test.ts`, rather than a comment
+ * somebody deletes. RDS serves certificates from Amazon's own RDS CAs, which are
+ * in no default trust store, so validating the chain means shipping a CA bundle.
+ * The three ways to do that were each worse than this: pinning the PEM into this
+ * repository puts a 60 KB certificate blob in copy-paste material and a rotation
+ * deadline in somebody else's calendar; fetching the bundle at run time puts an
+ * internet dependency on the path of the thing that verifies the backups; and a
+ * parameter group with `rds.force_ssl = 0` turns the encryption off on a copy of
+ * production rather than checking it.
+ *
+ * What the connection is for is the identity check below it, which does not need
+ * a chain: nothing is sent to the engine beyond the negotiation and nothing is
+ * read from it beyond the certificate, so there is no session and no data on
+ * this socket to protect.
+ */
+export const RESTORE_TLS_CHAIN_UNVERIFIED =
+  'TLS chain not validated: RDS certificates are signed by Amazon CAs that are in no default ' +
+  'trust store, and the alternatives are a pinned 60 KB bundle, an internet dependency, or ' +
+  'turning TLS off. The certificate is checked for the restored endpoint\'s name instead, and ' +
+  'nothing is sent or read on this socket beyond the handshake.';
+
+export interface VerificationCheckResult {
+  readonly check: RestoreVerificationCheck;
+  readonly passed: boolean;
+  /** What was observed. Goes in the record and in the notification, pass or fail. */
+  readonly detail: string;
+}
+
+export type RestoreVerdict = 'verified' | 'failed';
+
+/**
+ * The verdict, and it is unanimity.
+ *
+ * No weighting, no advisory checks, no "warn". Every entry in
+ * {@link RESTORE_VERIFICATION_CHECKS} is there because the drill is worthless
+ * without it, so a check that may fail without failing the drill is a check that
+ * should have been deleted — and the first optional one is how a verification
+ * suite becomes a dashboard nobody reads. A drill that did not run every check
+ * is `failed` too: a result that is missing is not a result that passed, and
+ * "the verifier crashed after three checks" has to be as loud as "the data is
+ * not there", because from the outside they are the same amount of knowledge.
+ */
+export const restoreVerdict = (
+  results: readonly VerificationCheckResult[],
+  required: readonly RestoreVerificationCheck[] = RESTORE_VERIFICATION_CHECKS,
+): RestoreVerdict => {
+  if (results.some((result) => !result.passed)) return 'failed';
+  const seen = new Set(results.map((result) => result.check));
+  return required.every((check) => seen.has(check)) ? 'verified' : 'failed';
+};
+
+/**
+ * How far the restored copy's used bytes may differ from the source's, as a
+ * fraction.
+ *
+ * A fifth, which is far wider than the difference a correct restore produces and
+ * is chosen against the failure this check is for rather than against precision.
+ * A restore that brought back the data differs from its source by WAL that has
+ * accumulated since the restore point, by an autovacuum state that did not come
+ * with it, and by the source having kept writing while the drill ran. A restore
+ * that brought back *nothing* differs from its source by one to two orders of
+ * magnitude. There is no tolerance between 1.2x and 100x that distinguishes
+ * those two cases better than this one does, and a tight tolerance here buys
+ * nothing except a drill that fails in the month somebody loads a large table.
+ */
+export const RESTORED_BYTES_TOLERANCE = 0.2;
+
+/**
+ * Minimum used bytes on the source before the comparison means anything.
+ *
+ * One GiB. Below it the source is mostly the engine's own files and the ratio is
+ * dominated by them, so a restore of an empty database would pass — which is
+ * precisely the case this check exists for. A source under the floor is reported
+ * as a failed check rather than skipped: "this drill cannot tell whether the
+ * data came back" is a finding about the drill, and skipping it is how a check
+ * that never fires comes to look like a check that passes.
+ */
+export const RESTORED_BYTES_FLOOR = 1024 * 1024 * 1024;
+
+export interface StorageUsage {
+  /** `AllocatedStorage`, in GiB, as RDS reports it. */
+  readonly allocatedStorageGiB: number;
+  /** Latest `AWS/RDS` `FreeStorageSpace` datapoint, in bytes. */
+  readonly freeStorageBytes: number;
+}
+
+export type BytesComparison =
+  | { readonly matches: true; readonly sourceUsedBytes: number; readonly restoredUsedBytes: number; readonly ratio: number }
+  | {
+      readonly matches: false;
+      readonly reason: 'source-too-small' | 'restored-too-small' | 'restored-too-large';
+      readonly sourceUsedBytes: number;
+      readonly restoredUsedBytes: number;
+      readonly ratio: number;
+    };
+
+/**
+ * Do the restored instance's used bytes look like the source's?
+ *
+ * Used bytes rather than free, and each computed from its own instance's
+ * `AllocatedStorage`, because storage autoscaling means the two instances can
+ * have different volume sizes — `maxAllocatedStorage` is set on the source, and
+ * a restore takes the allocation the source had at the restore point. Comparing
+ * free space directly would then report a perfectly good restore as a mismatch
+ * the first time the source's volume grew.
+ */
+export const restoredBytesMatch = (
+  source: StorageUsage,
+  restored: StorageUsage,
+  tolerance: number = RESTORED_BYTES_TOLERANCE,
+  floor: number = RESTORED_BYTES_FLOOR,
+): BytesComparison => {
+  const used = (usage: StorageUsage) =>
+    usage.allocatedStorageGiB * 1024 * 1024 * 1024 - usage.freeStorageBytes;
+  const sourceUsedBytes = used(source);
+  const restoredUsedBytes = used(restored);
+  const ratio = sourceUsedBytes === 0 ? 0 : restoredUsedBytes / sourceUsedBytes;
+
+  if (sourceUsedBytes < floor) {
+    return { matches: false, reason: 'source-too-small', sourceUsedBytes, restoredUsedBytes, ratio };
+  }
+  if (ratio < 1 - tolerance) {
+    return { matches: false, reason: 'restored-too-small', sourceUsedBytes, restoredUsedBytes, ratio };
+  }
+  if (ratio > 1 + tolerance) {
+    return { matches: false, reason: 'restored-too-large', sourceUsedBytes, restoredUsedBytes, ratio };
+  }
+  return { matches: true, sourceUsedBytes, restoredUsedBytes, ratio };
+};
+
+/**
+ * How stale the restored copy's point in time may be, in seconds.
+ *
+ * Twice the restore path's RPO. `UseLatestRestorableTime` lands on a point that
+ * is already up to one RPO old by construction — that is what
+ * {@link METRIC_RESTORE_POINT_LAG} measures — and the restore itself is
+ * requested a moment after the preflight read the number, so one RPO of slack is
+ * the mechanism and the second is the drill's own latency. Past that the copy is
+ * from a point nobody asked for.
+ */
+export const restorePointStaleAfterSeconds = (objective: RecoveryObjective): number =>
+  objective.rpoSeconds * 2;
+
+/**
+ * Is the copy from the point the drill asked for?
+ *
+ * `restorePointAtPreflight` is the source's `LatestRestorableTime` as the
+ * preflight read it, and `instanceCreateTime` is when RDS created the restored
+ * instance. A correct `UseLatestRestorableTime` restore carries data from
+ * somewhere between the two, so the span between them is the uncertainty — and
+ * if that span is wider than {@link restorePointStaleAfterSeconds}, the copy is
+ * from a point the drill cannot vouch for whatever the API reported.
+ */
+export const restorePointIsFresh = (
+  restorePointAtPreflight: Date,
+  instanceCreateTime: Date,
+  maxStaleSeconds: number,
+): boolean => {
+  const span = seconds(restorePointAtPreflight, instanceCreateTime);
+  return span >= 0 && span <= maxStaleSeconds;
+};
+
+export interface RestoreMeasurement {
+  /** Seconds from the restore being requested to the copy being verified. */
+  readonly restoreSeconds: number;
+  /** Uncertainty, from {@link DRILL_POLL_INTERVAL_SECONDS}. */
+  readonly resolutionSeconds: number;
+}
+
+/**
+ * How long the restore took, from two timestamps the platform produced.
+ *
+ * `requestedAt` is the restored instance's `InstanceCreateTime` rather than the
+ * moment the automation called the API, which is the same deliberate choice the
+ * failover exercise makes about `ConnectSuccess`: a number read off something
+ * the platform recorded is reproducible after the fact, and a number the
+ * automation timed itself is only as good as the automation's clock and its own
+ * scheduling. It also errs in the honest direction —
+ * {@link DRILL_POLL_INTERVAL_SECONDS} pushes the measurement long, and an RTO
+ * that errs long is one nobody over-promises against.
+ *
+ * Throws on a negative span: a verification that completed before the instance
+ * was created means the two timestamps are not about the same restore — most
+ * likely a copy left over from an earlier run — and a negative RTO published
+ * into a graph is worse than no datapoint.
+ */
+export const measureRestore = (
+  requestedAt: Date,
+  verifiedAt: Date,
+  resolutionSeconds: number = DRILL_POLL_INTERVAL_SECONDS,
+): RestoreMeasurement => {
+  const restoreSeconds = seconds(requestedAt, verifiedAt);
+  if (restoreSeconds < 0) {
+    throw new Error(
+      `measureRestore: the copy was verified at ${verifiedAt.toISOString()}, before it was ` +
+        `created at ${requestedAt.toISOString()}. The two timestamps are not about the same ` +
+        'restore — most likely a drill instance left over from an earlier run was described ' +
+        'instead of this one.',
+    );
+  }
+  return { restoreSeconds, resolutionSeconds };
+};
+
 /* ── Rehearsal freshness ──────────────────────────────────────────────────── */
 
 export interface RehearsalFreshness {
@@ -999,15 +1572,16 @@ export const validateGameDayCatalogue = (
         `rtoSeconds is ${objective.rtoSeconds}. An RTO of zero is a claim that recovery is ` +
           'instantaneous, which no mechanism here provides, and it makes every measurement a miss.',
       );
-    } else if (objective.rtoSeconds < MIN_RTO_PERIODS * PROBE_SAMPLE_INTERVAL_SECONDS) {
+    } else if (objective.rtoSeconds < MIN_RTO_PERIODS * measurementResolutionSeconds(objective)) {
+      const resolution = measurementResolutionSeconds(objective);
       report(
         objective.id,
         'rto-below-measurable-resolution',
-        `rtoSeconds is ${objective.rtoSeconds}, and '${objective.measuredBy}' is sampled every ` +
-          `${PROBE_SAMPLE_INTERVAL_SECONDS}s — so a measurement of it is mostly quantisation ` +
-          `error. An objective needs at least ${MIN_RTO_PERIODS} sample intervals ` +
-          `(${MIN_RTO_PERIODS * PROBE_SAMPLE_INTERVAL_SECONDS}s) behind it, or it reads as a ` +
-          'demanding target while being an unmeasurable one.',
+        `rtoSeconds is ${objective.rtoSeconds}, and '${objective.measuredBy}' is observed every ` +
+          `${resolution}s — so a measurement of it is mostly quantisation error. An objective ` +
+          `needs at least ${MIN_RTO_PERIODS} observation intervals ` +
+          `(${MIN_RTO_PERIODS * resolution}s) behind it, or it reads as a demanding target ` +
+          'while being an unmeasurable one.',
       );
     }
 
@@ -1170,13 +1744,59 @@ export const validateGameDayCatalogue = (
       }
     }
 
-    if (scenario.approvalRequired !== true) {
+    const destructive = DESTRUCTIVE_FAULTS.includes(scenario.fault);
+    if (destructive && scenario.trigger !== 'approval') {
       report(
         scenario.id,
-        'scenario-without-approval',
-        'approvalRequired must be true. This is the only automation in this repository that ' +
-          'deliberately changes production, and the thing that makes it safe is that a human ' +
-          'starts it.',
+        'destructive-scenario-without-approval',
+        `fault '${scenario.fault}' changes a live instance and trigger is '${scenario.trigger}'. ` +
+          'A destructive exercise a machine can start is an outage nobody chose, at an hour ' +
+          'nobody chose. Every fault in DESTRUCTIVE_FAULTS has to begin with aws:approve.',
+      );
+    }
+
+    if (scenario.trigger === 'schedule') {
+      if (destructive) {
+        // Reported above as well, and deliberately: this one is about the
+        // schedule rather than about the approval, and a reader fixing the first
+        // finding by removing the schedule should see that both halves agreed.
+        report(
+          scenario.id,
+          'destructive-scenario-scheduled',
+          `fault '${scenario.fault}' is destructive and this scenario carries a schedule. ` +
+            'Nothing in this repository starts a deliberate production outage on a timer.',
+        );
+      }
+      const interval = scenario.scheduleIntervalDays;
+      if (interval === undefined || !Number.isFinite(interval) || interval <= 0) {
+        report(
+          scenario.id,
+          'scheduled-scenario-without-interval',
+          `trigger is 'schedule' and scheduleIntervalDays is ${String(interval)}. There is then ` +
+            'nothing to build the EventBridge rule from, and the exercise that was supposed to ' +
+            'be the one nobody has to remember is the one nothing runs.',
+        );
+      } else {
+        const objective = objectiveFor(scenario, objectives);
+        if (objective !== undefined && interval > objective.rehearsalIntervalDays) {
+          report(
+            scenario.id,
+            'schedule-slower-than-rehearsal-interval',
+            `it runs every ${interval} days against an objective whose shelf life is ` +
+              `${objective.rehearsalIntervalDays} days. The overdue alarm is then red for ` +
+              `${interval - objective.rehearsalIntervalDays} days of every cycle, with nothing ` +
+              'anybody can do about it but widen the interval they just chose — which is how an ' +
+              'alarm about a stale DR number acquires a filter rule.',
+          );
+        }
+      }
+    } else if (scenario.scheduleIntervalDays !== undefined) {
+      report(
+        scenario.id,
+        'approval-scenario-with-interval',
+        `trigger is '${scenario.trigger}' and scheduleIntervalDays is ` +
+          `${scenario.scheduleIntervalDays}. Nothing reads that number, so it is a cadence this ` +
+          'catalogue appears to commit to and nothing honours.',
       );
     }
 
@@ -1202,14 +1822,54 @@ export const validateGameDayCatalogue = (
           'reports a measured RTO, and the number is for a failover that never happened.',
       );
     }
-    if (!scenario.preflight.includes('probe-reporting')) {
+    const measuredObjective = objectiveFor(scenario, objectives);
+    const probeMeasured =
+      measuredObjective !== undefined && PROBE_METRICS.includes(measuredObjective.measuredBy);
+    if (probeMeasured && !scenario.preflight.includes('probe-reporting')) {
       report(
         scenario.id,
         'scenario-without-probe-preflight',
-        "every scenario must preflight 'probe-reporting'. With the probe stopped the " +
-          'measurement window is empty, and an exercise that cannot measure anything is worse ' +
-          'than one that was not run — it produces a record.',
+        "it measures '" + measuredObjective.measuredBy + "', which comes from the probe, and it " +
+          "does not preflight 'probe-reporting'. With the probe stopped the measurement window " +
+          'is empty, and an exercise that cannot measure anything is worse than one that was ' +
+          'not run — it produces a record.',
       );
+    }
+    if (!probeMeasured && scenario.preflight.includes('probe-reporting')) {
+      report(
+        scenario.id,
+        'scenario-with-irrelevant-probe-preflight',
+        "it preflights 'probe-reporting' and nothing in its measurement comes from the probe. A " +
+          'check that cannot fail for any reason the exercise cares about is the kind of green ' +
+          'that teaches people to stop reading the others.',
+      );
+    }
+
+    if (scenario.fault === 'rds-point-in-time-restore') {
+      for (const required of ['restore-point-available', 'no-drill-instance-present'] as const) {
+        if (scenario.preflight.includes(required)) continue;
+        report(
+          scenario.id,
+          'restore-drill-without-required-preflight',
+          `a 'rds-point-in-time-restore' scenario must preflight '${required}'. Without ` +
+            "'restore-point-available' the drill's most important finding — there is no restore " +
+            'path at all — arrives as an opaque InvalidDBInstanceState rather than as a refusal ' +
+            "that says so; without 'no-drill-instance-present' a run that starts while an " +
+            "earlier drill's copy is still up tears that copy down mid-verification and reports " +
+            'the restore as unverifiable.',
+        );
+      }
+      for (const required of ['verification-failed', 'restore-not-available-in-time'] as const) {
+        if (scenario.abortIf.includes(required)) continue;
+        report(
+          scenario.id,
+          'restore-drill-without-required-abort',
+          `a 'rds-point-in-time-restore' scenario must declare abortIf '${required}'. Both are ` +
+            'results rather than hitches — a copy that came back unusable, and a restore slower ' +
+            'than the objective — and a drill that does not name them as outcomes is one whose ' +
+            'record cannot tell them from an exercise nobody ran.',
+        );
+      }
     }
 
     for (const condition of scenario.abortIf) {

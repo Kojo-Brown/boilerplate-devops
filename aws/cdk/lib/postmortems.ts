@@ -198,7 +198,14 @@ export const POSTMORTEM_SEVERITIES: readonly PostmortemSeverity[] = [
       'A page cleared itself before anyone acted on it.',
       'A near miss: the system was one failure away from a Sev2 and that failure did not happen.',
     ],
-    runbookIds: ['platform-tooling', 'waf-blocked-requests'],
+    // `restore-drill` is here rather than at Sev2, which is worth saying out
+    // loud because its louder alarm is about the disaster-recovery plan being
+    // untrue. Nothing is broken for a user when a drill cannot verify its copy:
+    // what has broken is a guarantee, with no user-visible effect, which is
+    // this severity's second trigger exactly. It also keeps it alongside
+    // `platform-tooling`, which already carries `*-rehearsal-overdue-*` — the
+    // alarm that stays red for the same reason and for as long.
+    runbookIds: ['platform-tooling', 'waf-blocked-requests', 'restore-drill'],
     requiresPostmortem: false,
     requiresRecord: true,
   },

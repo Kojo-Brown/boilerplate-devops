@@ -291,7 +291,78 @@ in the last half hour before treating this as an incident —
 
 ---
 
-## 11. When the incident ends
+## 11. A restore drill could not verify its copy, or left one running
+
+**Alarms:** `<env>-restore-unverified`, `<env>-restore-drill-instance-orphaned`
+**Owner:** platform-team
+**First step:** `<env>-rb-alarm-history` — this alarm's own state transitions
+
+These are the two findings the monthly backup restore drill can produce, and
+they are different incidents.
+
+### `<env>-restore-unverified`
+
+The drill restored the database into `<env>-dr-drill`, ran its checks against the
+copy, and at least one of them failed. **The execution will have ended green and
+the copy will have been deleted** — that is deliberate: a drill has to tear its
+copy down whatever it finds, so the execution's status cannot be the signal. The
+metric and this alarm are.
+
+What to read, in order:
+
+1. The notification on `<env>-restore-drill`. It carries the failing checks with
+   the detail each one reported, which is the whole diagnosis in most cases.
+2. `aws ssm get-parameter --name /<env>/game-day/rds-point-in-time-restore/last-rehearsal`.
+   `lastAttempt.checksFailed` is the same list, and `lastMeasured` is the last
+   drill that *did* verify — the gap between the two is how long this has been
+   true.
+3. The alarm history, which the first step has already started: one failed drill
+   is a bad month, three in a row is a backup pipeline that has not worked since
+   somebody changed something.
+
+`restored-bytes-match-source` failing is the serious one: the restore completed
+and the copy does not hold the source's data. `engine-negotiates-tls` failing
+means the copy came up and is not serving — usually a parameter group that did
+not come with it. `restore-point-not-stale` failing means the copy is from a
+point nobody asked for, which is also what `<env>-restore-point-stale` reports
+(see §10) and should be read alongside it.
+
+**The rehearsal clock was not reset.** A failed verification leaves
+`lastMeasured` untouched, so `<env>-rehearsal-overdue-rds-point-in-time-restore`
+stays exactly as red as it was: there is still no verified restore for this
+objective. Clearing this alarm means fixing the cause and running the drill
+again, not waiting for the next month.
+
+### `<env>-restore-drill-instance-orphaned`
+
+A copy of the database restored by a drill has been running for more than six
+hours. Nothing is broken; this is the one alarm in the recovery set that is about
+money and about a second copy of production's data existing.
+
+The usual cause is **an execution somebody cancelled** between the restore and
+the teardown: SSM does not run a step's `onFailure` for a cancelled execution, so
+nothing else would ever have removed it. Check the drill document's recent
+executions for a `Cancelled` one.
+
+The sweeper deletes it on the next hour unless a drill execution is in progress,
+so in the normal case this alarm clears itself and the record of what happened is
+the notification on `<env>-restore-drill`. If it does not clear:
+
+* `<env>-restore-drill-sweeper-errors` red (§9) — the sweeper itself is failing.
+* `<env>-restore-drill-conductor-errors` red (§9) — the teardown step is failing,
+  which means every drill from now on leaves a copy.
+* Neither red and the alarm persisting — a drill has been in progress for longer
+  than the window, which is itself the finding: the restore path is slower than
+  the objective.
+
+Deleting it by hand is `aws rds delete-db-instance --db-instance-identifier
+<env>-dr-drill --skip-final-snapshot --delete-automated-backups`. The last flag
+matters: without it RDS keeps the deleted copy's automated backups for the
+source's retention period.
+
+---
+
+## 12. When the incident ends
 
 A runbook's job finishes when the page clears. The next runbook being better
 than this one is a separate piece of work, and it happens on Thursday afternoon
@@ -313,7 +384,7 @@ incident and impossible afterwards, so the correction goes into
 
 ---
 
-## 12. Adding a runbook
+## 13. Adding a runbook
 
 1. Add a section to this file. The heading's GitHub slug is the anchor.
 2. Add an entry to `RUNBOOK_CATALOGUE` in `lib/runbooks.ts` with that anchor and
@@ -327,7 +398,7 @@ incident and impossible afterwards, so the correction goes into
 
 ---
 
-## 13. The failures, and what each one looks like
+## 14. The failures, and what each one looks like
 
 | Rule | What it catches | What it looks like without the gate |
 | --- | --- | --- |
@@ -346,7 +417,7 @@ incident and impossible afterwards, so the correction goes into
 
 ---
 
-## 14. Known gaps
+## 15. Known gaps
 
 - **Nothing here has been deployed.** No automation in this repository has run
   against a real account, so the documents are checked for shape — a single

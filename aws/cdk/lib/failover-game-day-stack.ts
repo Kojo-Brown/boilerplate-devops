@@ -236,7 +236,27 @@ export class FailoverGameDayStack extends cdk.Stack {
 
     // The blast radius, applied. A scenario that does not name this environment
     // has no document here, so there is nothing to run and nothing to refuse.
-    const scenarios = allScenarios.filter((scenario) =>
+    //
+    // Filtered by fault as well, because this stack is not the only one that
+    // builds exercises any more: `BackupRestoreDrillStack` owns the
+    // `rds-point-in-time-restore` scenarios, and without this line every drill
+    // in the catalogue would also be emitted here as a `RebootDBInstance`
+    // document — a forced failover carrying a restore drill's name, approval
+    // message and blast radius, deployed and runnable.
+    const scenarios = allScenarios.filter(
+      (scenario) =>
+        scenario.fault === 'rds-force-failover' &&
+        scenario.allowedEnvironments.includes(envName),
+    );
+
+    // The exercises this stack does not build, kept because the freshness
+    // signals below are published from here for *every* objective: the recorder
+    // reads one parameter per objective and `HoursSinceRehearsal` is this
+    // stack's metric, so the overdue alarm for an objective rehearsed elsewhere
+    // belongs next to the metric rather than next to the document. What it needs
+    // from the other scenarios is only their names, for the "run this" line in
+    // the alarm description.
+    const exercisedHere = allScenarios.filter((scenario) =>
       scenario.allowedEnvironments.includes(envName),
     );
 
@@ -838,15 +858,16 @@ export class FailoverGameDayStack extends cdk.Stack {
       // and would say nothing the status does not already say.
       if (objective.status !== 'rehearsed') continue;
 
-      // And only where an exercise for it exists here. An alarm whose
-      // instruction is "run this document" in an environment that has no such
-      // document is an alarm nobody can clear, and the responder's only options
-      // are to widen the interval or to mute it. The case is not thereby
+      // And only where an exercise for it exists in this environment — in this
+      // stack or in `BackupRestoreDrillStack`. An alarm whose instruction is
+      // "run this document" in an environment that has no such document is an
+      // alarm nobody can clear, and the responder's only options are to widen
+      // the interval or to mute it. The case is not thereby
       // ignored: `tools/audit-game-days.ts` requires an overdue alarm for every
       // rehearsed objective in every environment that publishes the signal, so
       // a scenario that excludes production while its objective claims a number
       // for production fails the build here rather than going unmeasured there.
-      if (!scenarios.some((candidate) => candidate.objectiveId === objective.id)) continue;
+      if (!exercisedHere.some((candidate) => candidate.objectiveId === objective.id)) continue;
 
       const overdue = new cloudwatch.Alarm(this, `RehearsalOverdueAlarm${pascalCase(objective.id)}`, {
         alarmName: `${envName}-rehearsal-overdue-${objective.id}`,
@@ -856,7 +877,7 @@ export class FailoverGameDayStack extends cdk.Stack {
           `${objective.rtoSeconds}s is now a number from the last time somebody checked. An ` +
           'engine upgrade, an instance-class change or a new connection pool each move it, and ' +
           'none of them is a change anybody files under disaster recovery. Run ' +
-          `\`${gameDayDocumentName(envName, scenariosForAlarm(objective, scenarios))}\`. Owner: ` +
+          `\`${gameDayDocumentName(envName, scenariosForAlarm(objective, exercisedHere))}\`. Owner: ` +
           `${objective.owner}.`,
         metric: new cloudwatch.Metric({
           namespace: GAME_DAY_NAMESPACE,

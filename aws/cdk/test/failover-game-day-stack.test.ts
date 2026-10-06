@@ -14,8 +14,15 @@ import {
   FailoverGameDayStackProps,
   endpointAddressParameterName,
 } from '../lib/failover-game-day-stack';
+import { BackupRestoreDrillStack } from '../lib/backup-restore-drill-stack';
 import { auditGameDays } from '../tools/audit-game-days';
 import { flattenIntrinsic, resourceProps } from './support/cfn';
+
+/** The failover scenario, narrowed, with the restore drill left alone. */
+const failoverIn = (allowedEnvironments: string[]) =>
+  GAME_DAY_SCENARIOS.map((scenario) =>
+    scenario.fault === 'rds-force-failover' ? { ...scenario, allowedEnvironments } : scenario,
+  );
 
 /** The one Lambda whose environment and shape the measurement depends on. */
 const probeProps = (template: Template): Record<string, any> => {
@@ -91,6 +98,8 @@ const DOCUMENT_NAME = 'production-gameday-rds-failover';
 const DOC_HEADINGS = [
   '## 2. The database loses its writer',
   '## 3. The data is wrong and has to be rolled back',
+  '## 14. What the drill verifies',
+  '## 15. The copy that outlives the drill',
   '## 4. How the RTO is measured',
   '## 5. The RPO nobody watches',
   '## 6. The alarm that is supposed to fire',
@@ -128,9 +137,7 @@ describe('the blast radius', () => {
     // Not "refuses at run time": there is nothing to run. A runtime check's
     // failure mode is a document that exists in production and declines, which
     // is one parameter override away from not declining.
-    const template = synth({
-      scenarios: [{ ...GAME_DAY_SCENARIOS[0], allowedEnvironments: ['staging'] }],
-    });
+    const template = synth({ scenarios: failoverIn(['staging']) });
     template.resourceCountIs('AWS::SSM::Document', 0);
   });
 
@@ -138,9 +145,7 @@ describe('the blast radius', () => {
     // The probe and the gauges are not part of the exercise: they measure the
     // real event, which happens in every environment whether or not anybody
     // rehearses there.
-    const template = synth({
-      scenarios: [{ ...GAME_DAY_SCENARIOS[0], allowedEnvironments: ['staging'] }],
-    });
+    const template = synth({ scenarios: failoverIn(['staging']) });
     template.hasResourceProperties('AWS::Lambda::Function', {
       FunctionName: 'production-game-day-probe',
     });
@@ -328,8 +333,30 @@ describe('the signals', () => {
     expect(stale.TreatMissingData).toBe('breaching');
   });
 
-  it('arms an overdue alarm for a rehearsed objective and not for a declared one', () => {
+  it('arms an overdue alarm for every rehearsed objective, including one exercised elsewhere', () => {
+    // Both objectives are rehearsed now, and only one of them is rehearsed by
+    // *this* stack. The alarm belongs next to the metric rather than next to the
+    // document: `HoursSinceRehearsal` is published from here, for every
+    // objective, from the parameter whichever exercise last wrote it.
     const names = alarms().map((candidate) => candidate.AlarmName as string);
+    expect(names).toContain('production-rehearsal-overdue-rds-multi-az-promotion');
+    expect(names).toContain('production-rehearsal-overdue-rds-point-in-time-restore');
+  });
+
+  it('arms no overdue alarm for a declared objective', () => {
+    // A `declared` objective has no exercise, so an overdue alarm on it would be
+    // red forever and would say nothing its status does not already say.
+    const template = synth({
+      objectives: RECOVERY_OBJECTIVES.map((objective) =>
+        objective.id === 'rds-point-in-time-restore'
+          ? { ...objective, status: 'declared' as const }
+          : objective,
+      ),
+      scenarios: GAME_DAY_SCENARIOS.filter((scenario) => scenario.fault === 'rds-force-failover'),
+    });
+    const names = Object.values(template.findResources('AWS::CloudWatch::Alarm')).map(
+      (candidate) => candidate.Properties.AlarmName as string,
+    );
     expect(names).toContain('production-rehearsal-overdue-rds-multi-az-promotion');
     expect(names).not.toContain('production-rehearsal-overdue-rds-point-in-time-restore');
   });
@@ -348,9 +375,7 @@ describe('the signals', () => {
     // no such document cannot be cleared, and the responder's only options are
     // to widen the interval or mute it. The case is caught by the gate instead —
     // see the audit test below.
-    const template = synth({
-      scenarios: [{ ...GAME_DAY_SCENARIOS[0], allowedEnvironments: ['staging'] }],
-    });
+    const template = synth({ scenarios: failoverIn(['staging']) });
     const names = Object.values(template.findResources('AWS::CloudWatch::Alarm')).map(
       (candidate) => candidate.Properties.AlarmName as string,
     );
@@ -371,14 +396,54 @@ describe('the signals', () => {
 /* ── The gate, over this stack's own template ─────────────────────────────── */
 
 describe('tools/audit-game-days.ts, over what this stack synthesises', () => {
-  it('reports nothing', () => {
-    const { template } = synthWith();
-    const result = auditGameDays({
-      templates: [{ path: 'FailoverGameDayStack-Test.template.json', document: template.toJSON() }],
-      gameDayDoc: DOC_HEADINGS,
+  /*
+   * Both stacks, because the catalogue now spans them: the gate requires a
+   * document for every environment a scenario sanctions, and half the scenarios
+   * are built in `BackupRestoreDrillStack`. Auditing one template in isolation
+   * would report the other stack's exercises as missing, which is the gate
+   * working — see the drill stack's own test for that direction.
+   */
+  const bothTemplates = (props: Partial<FailoverGameDayStackProps> = {}) => {
+    const app = new cdk.App({ context: VPC_CONTEXT });
+    const networkStack = new cdk.Stack(app, 'Network', {
+      env: { account: '123456789012', region: 'us-east-1' },
     });
+    const vpc = new ec2.Vpc(networkStack, 'Vpc', { maxAzs: 2 });
+    const failover = new FailoverGameDayStack(app, 'FailoverGameDayStack-Test', {
+      envName: 'production',
+      vpc,
+      databaseSecurityGroupId: 'sg-0123456789abcdef0',
+      databaseEndpointAddress: 'production-postgres.example.invalid',
+      databaseInstanceIdentifier: 'production-postgres',
+      service: { clusterName: 'production-cluster', serviceName: 'production-service' },
+      approverArns: ['platform-team-oncall'],
+      env: { account: '123456789012', region: 'us-east-1' },
+      ...props,
+    });
+    const drill = new BackupRestoreDrillStack(app, 'BackupRestoreDrillStack-Test', {
+      envName: 'production',
+      vpc,
+      sourceInstanceIdentifier: 'production-postgres',
+      env: { account: '123456789012', region: 'us-east-1' },
+      scenarios: props.scenarios,
+      objectives: props.objectives,
+    });
+    return [
+      {
+        path: 'FailoverGameDayStack-Test.template.json',
+        document: Template.fromStack(failover).toJSON() as unknown,
+      },
+      {
+        path: 'BackupRestoreDrillStack-Test.template.json',
+        document: Template.fromStack(drill).toJSON() as unknown,
+      },
+    ];
+  };
+
+  it('reports nothing', () => {
+    const result = auditGameDays({ templates: bothTemplates(), gameDayDoc: DOC_HEADINGS });
     expect(result.violations).toEqual([]);
-    expect(result.documentsRead).toBe(1);
+    expect(result.documentsRead).toBe(2);
     expect(result.environmentsRead).toEqual(['production']);
   });
 
@@ -387,11 +452,8 @@ describe('tools/audit-game-days.ts, over what this stack synthesises', () => {
     // configuration existing. Without both halves, an objective rehearsed only
     // in staging quietly carries a production RTO nobody has measured in
     // production.
-    const { template } = synthWith({
-      scenarios: [{ ...GAME_DAY_SCENARIOS[0], allowedEnvironments: ['staging'] }],
-    });
     const result = auditGameDays({
-      templates: [{ path: 'FailoverGameDayStack-Test.template.json', document: template.toJSON() }],
+      templates: bothTemplates({ scenarios: failoverIn(['staging']) }),
       gameDayDoc: DOC_HEADINGS,
     });
     expect(result.violations.map((violation) => violation.rule)).toContain(
