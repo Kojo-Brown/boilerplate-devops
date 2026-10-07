@@ -27,6 +27,7 @@
     "audit:runbooks": "ts-node tools/audit-runbooks.ts",
     "audit:postmortems": "ts-node tools/audit-postmortems.ts",
     "audit:gamedays": "ts-node tools/audit-game-days.ts",
+    "audit:chaos": "ts-node tools/audit-fis-experiments.ts",
     "cdk": "cdk"
   },
   "devDependencies": {

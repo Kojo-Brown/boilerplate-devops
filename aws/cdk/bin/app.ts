@@ -43,6 +43,7 @@ import {
 import { SyntheticCanaryFleet } from '../lib/synthetic-canary-probes';
 import { FailoverGameDayStack } from '../lib/failover-game-day-stack';
 import { BackupRestoreDrillStack } from '../lib/backup-restore-drill-stack';
+import { ChaosFisStack } from '../lib/chaos-fis-stack';
 import { RunbookStack } from '../lib/runbook-stack';
 
 const app = new cdk.App();
@@ -250,7 +251,20 @@ const vpcStackStaging = new VpcStack(app, 'VpcStack-Staging', {
   envName: 'staging',
   vpcCidr: '10.1.0.0/16',
   maxAzs: 2,
-  natGateways: 1,
+  // Two, raised from the cost-optimised one, because `ChaosFisStack-Staging`
+  // runs the AZ-partition experiment here and that experiment is meaningless
+  // against a single NAT gateway: every private subnet in the VPC egresses
+  // through whichever AZ holds it, so partitioning *that* AZ is a total loss of
+  // outbound connectivity for the whole application — including from the AZ that
+  // was supposed to survive and serve — rather than an AZ fault. The experiment
+  // would "fail" and the write-up would record that the application does not
+  // tolerate losing an AZ, which is a conclusion about this line.
+  //
+  // The AZ experiment is staging-only on purpose (see docs/chaos-engineering.md
+  // §4), so staging is the environment that has to be able to answer the
+  // question. The second NAT gateway is what that costs; `npm run audit:chaos`
+  // reports `single-nat-gateway` if it goes away again.
+  natGateways: 2,
   // EksStack-Staging runs in this VPC; see the EKS section at the end of the file.
   tagSubnetsForEks: true,
   env: {
@@ -2031,6 +2045,71 @@ const backupRestoreDrillStackProduction = new BackupRestoreDrillStack(
     tags: { Project: 'boilerplate', CostCenter: 'engineering' },
   },
 );
+
+// ── Chaos Engineering ─────────────────────────────────────────────────────────
+// The two stacks above exercise recovery *mechanisms* — force a promotion, time
+// it; restore a copy, time it. Both rehearse a procedure this repository already
+// believes in. `ChaosFisStack` asks the other question: does the application
+// survive a fault nobody planned for, which is the one thing every architecture
+// diagram here implicitly claims and nothing has ever tested.
+//
+// Three faults, one per spec item, in `lib/fis-experiments.ts`: a task
+// disappears, egress gets 200 ms slower, one Availability Zone is partitioned
+// from the others. The AZ experiment is staging-only — it is the one fault here
+// that cannot be undone faster than FIS's own rollback, since the action
+// re-associates the subnets' network ACL for the duration.
+//
+// Nothing schedules any of them. The templates are inert until somebody calls
+// `StartExperiment`, which is the same line `lib/game-days.ts` draws for a
+// destructive fault: an `aws:ecs:stop-task` experiment on a cron is an outage
+// nobody chose, arriving at the traffic peak because that is when the cron fired.
+//
+// The stop conditions are alarms the rest of this app already owns, passed in
+// rather than created here. One of them has to be on a metric published by a
+// schedule rather than by request traffic, and the game-day probe's
+// `ConnectSuccess` is the only one in this repository that is: every fault below
+// *reduces* the requests reaching a target, so an error count in a quiet
+// environment is zero whether the application is healthy or on fire — and quiet
+// is exactly when somebody chooses to run a chaos experiment.
+const chaosStopConditionAlarms = (
+  gameDay: FailoverGameDayStack,
+  alarms: CloudWatchAlarmsStack,
+) => ({
+  'db-connect-failing': gameDay.connectFailingAlarm,
+  'alb-5xx-elb': alarms.alarms.alb5xxElb,
+});
+
+new ChaosFisStack(app, 'ChaosFisStack-Staging', {
+  envName: 'staging',
+  vpc: vpcStackStaging.vpc,
+  service: {
+    clusterName: ecsStackStaging.cluster.clusterName,
+    serviceName: ecsStackStaging.service.serviceName,
+  },
+  stopConditionAlarms: chaosStopConditionAlarms(
+    failoverGameDayStackStaging,
+    cloudWatchAlarmsStackStaging,
+  ),
+  env: { account: process.env.CDK_DEFAULT_ACCOUNT, region: primaryRegion },
+  description: 'Staging chaos experiments — task loss, egress latency, AZ partition',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+new ChaosFisStack(app, 'ChaosFisStack-Production', {
+  envName: 'production',
+  vpc: vpcStackProduction.vpc,
+  service: {
+    clusterName: ecsStackProduction.cluster.clusterName,
+    serviceName: ecsStackProduction.service.serviceName,
+  },
+  stopConditionAlarms: chaosStopConditionAlarms(
+    failoverGameDayStackProduction,
+    cloudWatchAlarmsStackProduction,
+  ),
+  env: { account: process.env.CDK_DEFAULT_ACCOUNT, region: primaryRegion },
+  description: 'Production chaos experiments — task loss and egress latency',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
 
 // ── Runbook Automation ────────────────────────────────────────────────────────
 // Every alarm above reaches a topic; until now, what arrived on that topic was

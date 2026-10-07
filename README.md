@@ -1070,5 +1070,62 @@ numbers, how each is measured and when a measurement is refused, how to run an
 exercise, what the drill does and does not verify, what you have to set, the
 cost, the thirty-three gate rules (plus the catalogue's own) and the known gaps.
 
+## Chaos engineering
+
+The game days above rehearse two recovery *mechanisms* this repository already
+believes in. `ChaosFisStack` asks the other question — does the application
+survive a fault nobody planned for — with three AWS FIS experiment templates, one
+per fault every architecture diagram here implicitly claims to tolerate: a task
+disappears (`aws:ecs:stop-task`), egress gets 200 ms slower
+(`aws:ecs:task-network-latency`), one Availability Zone is partitioned from the
+others (`aws:network:disrupt-connectivity`). Nothing schedules them: the
+templates are inert until somebody calls `StartExperiment`, which is the same
+line the game days draw for a destructive fault.
+
+Every entry in `lib/fis-experiments.ts` carries a `hypothesis` stating what would
+refute it, because "the system is resilient" is not a hypothesis — an experiment
+with no stated expectation cannot fail, so whatever happens gets written up as a
+learning and nothing is decided. Four things the catalogue and
+`npm run audit:chaos` are arranged around, each because the failing shape is a
+template that looks finished:
+
+- **A stop condition that cannot fire is the default.** FIS requires
+  `stopConditions` and accepts `{ source: 'none' }` — what AWS's own
+  CloudFormation sample for `aws:network:disrupt-connectivity` ships. In review
+  it reads as "not configured yet"; it means the fault runs its full duration
+  whatever happens to the application.
+- **A traffic-derived guardrail is weakest where it is needed.** All three faults
+  *reduce* the requests reaching a target, and a count of errors in an
+  environment nobody is calling is zero whether the application is healthy or on
+  fire — and quiet is when somebody chooses to run a chaos experiment. So every
+  experiment also stops on the game-day probe's `ConnectSuccess`, which is
+  published every minute whether or not anybody is running anything.
+- **A guardrail slower than the experiment is decoration.** An alarm needs
+  `period x evaluationPeriods` to change state, and the ALB alarms are 300s x 2 —
+  so a five-minute fault guarded only by one of them is guaranteed to end while
+  the alarm is still evaluating. The gate reads the alarms' real periods out of
+  the synthesised templates, because those are props with defaults in another
+  stack.
+- **Blast radius is arithmetic, not a word in the description.** `ALL` of two
+  tasks is a total outage with no survivor to observe; `PERCENT(25)` of two is
+  either one task or none depending on a rounding rule the template does not
+  state, so the experiment injects nothing, succeeds, and reports that the
+  application was unaffected.
+
+The latency fault needs three properties to line up across two stacks — the
+action's `useEcsFaultInjectionEndpoints`, and `pidMode` plus
+`enableFaultInjection` on `EcsStack`'s task definition — and **every combination
+deploys cleanly**, so the gate reads the synthesised `EcsStack` template rather
+than trusting the catalogue. The AZ fault is staging-only, and staging now runs
+a NAT gateway per AZ: with one gateway, partitioning the AZ that holds it is a
+total loss of outbound connectivity rather than an AZ fault, and the write-up
+would record a conclusion about the NAT layout instead.
+
+See [docs/chaos-engineering.md](./docs/chaos-engineering.md) for each
+experiment's hypothesis and what refutes it, how to start one, what the latency
+fault needs from `EcsStack`, the three ways a guardrail turns out to be
+decoration, why the role is written out instead of attaching AWS's managed FIS
+policies, how to write up a run, and the nineteen gate rules.
+
 ## Spec Progress
 See [SPEC.md](./SPEC.md).

@@ -121,6 +121,37 @@ export class EcsStack extends cdk.Stack {
       memoryLimitMiB,
       executionRole,
       taskRole,
+      // ── Prerequisites for `aws:ecs:task-network-latency` ──────────────────
+      // Three properties, and all three have to be here for the latency
+      // experiment in `lib/fis-experiments.ts` to be able to run at all. They
+      // are in this stack because the task definition is, which is the whole
+      // reason `tools/audit-fis-experiments.ts` exists: every combination of
+      // them deploys cleanly, the service stays healthy, FIS resolves its
+      // targets, and the experiment fails when somebody starts it — during the
+      // exercise, in front of the people who booked the hour.
+      //
+      // `enableFaultInjection` is the one with a cost attached, so it is worth
+      // being explicit: it lets a process inside the container reach the ECS
+      // fault-injection endpoint, which is how FIS injects without an agent of
+      // its own. It is set in every environment rather than staging only,
+      // because a task definition that differs in shape between environments
+      // means the latency experiment is rehearsed against something other than
+      // what production runs — which is the failure the experiment exists to
+      // rule out. See docs/chaos-engineering.md#5-what-the-latency-experiment-needs-from-this-stack.
+      enableFaultInjection: true,
+      // `pidMode: task` puts the task's containers in one process namespace,
+      // which is what lets the injection reach the application's network
+      // interface rather than only its own sidecar's.
+      pidMode: ecs.PidMode.TASK,
+      // Not optional alongside `pidMode`: CDK refuses a Fargate task definition
+      // that sets one without the other ("Specifying 'pidMode' requires that
+      // operating system family also be provided"), and AWS only supports
+      // `pidMode: task` on Linux platform 1.4.0 or later. Stating the platform
+      // explicitly also pins what had been an implicit default.
+      runtimePlatform: {
+        operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
+        cpuArchitecture: ecs.CpuArchitecture.X86_64,
+      },
     });
 
     taskDefinition.addContainer('AppContainer', {

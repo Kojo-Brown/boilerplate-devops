@@ -299,6 +299,26 @@ jobs:
       - name: Audit the recovery objectives and the failover game day
         run: npm run audit:gamedays
 
+      # The gate above exercises two recovery *mechanisms* — a promotion and a
+      # restore — and both rehearse a procedure this repository already believes
+      # in. This one is about the faults nobody wrote a procedure for, and about
+      # the single property that decides whether such a template is an
+      # experiment or an outage: its stop condition. FIS requires the field and
+      # accepts `{ source: 'none' }`, which is what AWS's own CloudFormation
+      # sample for aws:network:disrupt-connectivity ships, so the dangerous
+      # template is the one that looks finished. The near misses are each one
+      # property and each leaves a green build: every guardrail derived from
+      # request traffic, which all three faults remove, so the alarm counts
+      # nothing in the quiet environment somebody chose to experiment in; a
+      # duration shorter than twice the alarm's own `period x evaluationPeriods`,
+      # so the guardrail is still evaluating when the fault ends; a
+      # `PERCENT(25)` of two tasks, which injects nothing and reports success;
+      # and `PidMode` or `EnableFaultInjection` dropped from EcsStack's task
+      # definition by a tidy-up in a stack that has never heard of the latency
+      # experiment. See docs/chaos-engineering.md.
+      - name: Audit the chaos experiments and their stop conditions
+        run: npm run audit:chaos
+
       # The Checkov job scans the synthesised CloudFormation rather than the
       # TypeScript, so the templates have to cross the job boundary.
       #
