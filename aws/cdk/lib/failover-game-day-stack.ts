@@ -214,6 +214,17 @@ export class FailoverGameDayStack extends cdk.Stack {
   /** Role the game-day automations assume. Holds the one write in this repository. */
   public readonly automationRole: iam.Role;
   public readonly probeSecurityGroup: ec2.SecurityGroup;
+  /**
+   * The alarm that goes red when nothing in the VPC can reach the database.
+   *
+   * Exposed because `ChaosFisStack` stops its experiments on it. It is the one
+   * alarm in this repository whose metric is published on a schedule rather than
+   * by request traffic — the probe below emits `ConnectSuccess` every minute
+   * whether or not anybody is running anything — which is the property that
+   * makes it usable as a chaos guardrail in an environment nobody is calling.
+   * See `TRAFFIC_INDEPENDENT_METRICS` in `lib/fis-experiments.ts`.
+   */
+  public readonly connectFailingAlarm: cloudwatch.Alarm;
 
   constructor(scope: Construct, id: string, props: FailoverGameDayStackProps) {
     super(scope, id, props);
@@ -768,6 +779,7 @@ export class FailoverGameDayStack extends cdk.Stack {
       treatMissingData: cloudwatch.TreatMissingData.MISSING,
     });
     connectFailing.addAlarmAction(new cw_actions.SnsAction(this.notificationTopic));
+    this.connectFailingAlarm = connectFailing;
 
     const probeSilent = new cloudwatch.Alarm(this, 'GameDayProbeSilentAlarm', {
       alarmName: `${envName}-game-day-probe-silent`,
