@@ -522,6 +522,9 @@ export class SloBurnRateRollbackStack extends cdk.Stack {
       functionName: `${envName}-slo-burn-rate-rollback`,
       description: `Rolls back ${envName} ECS services when an SLO burn-rate composite alarm fires`,
       runtime: lambda.Runtime.NODEJS_22_X,
+      // arm64: inline source on a managed runtime, so nothing in the artifact
+      // is architecture-specific. 20% cheaper per GB-second — docs/graviton.md.
+      architecture: lambda.Architecture.ARM_64,
       handler: 'index.handler',
       role: rollbackRole,
       timeout: cdk.Duration.seconds(lambdaTimeoutSeconds),

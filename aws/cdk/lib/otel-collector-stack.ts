@@ -397,6 +397,15 @@ export class OtelCollectorStack extends cdk.Stack {
       memoryLimitMiB,
       executionRole,
       taskRole,
+      // ARM64, and this is the one ECS workload in the repository where that is
+      // entirely our call: the task runs ADOT_COLLECTOR_IMAGE and nothing else,
+      // pinned by *index* digest, and the index carries a linux/arm64 manifest.
+      // Everything consumer-facing stays on X86_64 because the image pipeline
+      // builds one platform — see docs/graviton.md.
+      runtimePlatform: {
+        operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
+        cpuArchitecture: ecs.CpuArchitecture.ARM64,
+      },
     });
 
     const samplerConfig = buildSamplerConfig({

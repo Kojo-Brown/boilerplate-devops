@@ -337,6 +337,9 @@ export class RunbookStack extends cdk.Stack {
       functionName: `${envName}-runbook-enricher`,
       description: `Attaches the runbook to a ${envName} alarm and starts its first step`,
       runtime: lambda.Runtime.NODEJS_22_X,
+      // arm64: inline source on a managed runtime, so nothing in the artifact
+      // is architecture-specific. 20% cheaper per GB-second — docs/graviton.md.
+      architecture: lambda.Architecture.ARM_64,
       handler: 'index.handler',
       role: enricherRole,
       timeout: cdk.Duration.seconds(timeoutSeconds),

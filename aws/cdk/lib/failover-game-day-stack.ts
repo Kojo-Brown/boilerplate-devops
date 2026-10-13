@@ -378,6 +378,9 @@ export class FailoverGameDayStack extends cdk.Stack {
       functionName: `${envName}-game-day-probe`,
       description: `Resolves and connects to the ${envName} database endpoint once a minute`,
       runtime: lambda.Runtime.NODEJS_22_X,
+      // arm64: inline source on a managed runtime, so nothing in the artifact
+      // is architecture-specific. 20% cheaper per GB-second — docs/graviton.md.
+      architecture: lambda.Architecture.ARM_64,
       handler: 'index.handler',
       role: probeRole,
       // Six samples spaced ten seconds apart span fifty seconds, plus the last
@@ -471,6 +474,9 @@ export class FailoverGameDayStack extends cdk.Stack {
         `Publishes the ${envName} restore-point lag — the RPO nobody watches — and how stale ` +
         'each objective\'s last measurement is',
       runtime: lambda.Runtime.NODEJS_22_X,
+      // arm64: inline source on a managed runtime, so nothing in the artifact
+      // is architecture-specific. 20% cheaper per GB-second — docs/graviton.md.
+      architecture: lambda.Architecture.ARM_64,
       handler: 'index.handler',
       role: recorderRole,
       timeout: cdk.Duration.seconds(30),
@@ -570,6 +576,9 @@ export class FailoverGameDayStack extends cdk.Stack {
       functionName: `${envName}-game-day-conductor`,
       description: `Preflight, RTO measurement and abort recording for ${envName} game days`,
       runtime: lambda.Runtime.NODEJS_22_X,
+      // arm64: inline source on a managed runtime, so nothing in the artifact
+      // is architecture-specific. 20% cheaper per GB-second — docs/graviton.md.
+      architecture: lambda.Architecture.ARM_64,
       handler: 'index.handler',
       role: conductorRole,
       // A measurement reads up to an hour of one-minute datapoints, which is one

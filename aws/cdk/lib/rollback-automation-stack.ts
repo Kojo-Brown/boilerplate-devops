@@ -213,6 +213,9 @@ export class RollbackAutomationStack extends cdk.Stack {
       functionName: `${envName}-rollback-automation`,
       description: `Rolls back ECS services when a CloudWatch alarm breaches (${envName})`,
       runtime: lambda.Runtime.NODEJS_22_X,
+      // arm64: inline source on a managed runtime, so nothing in the artifact
+      // is architecture-specific. 20% cheaper per GB-second — docs/graviton.md.
+      architecture: lambda.Architecture.ARM_64,
       handler: 'index.handler',
       role: lambdaRole,
       timeout: cdk.Duration.seconds(lambdaTimeoutSeconds),

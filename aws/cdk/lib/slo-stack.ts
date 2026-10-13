@@ -455,6 +455,9 @@ export class SloStack extends cdk.Stack {
       functionName: `${envName}-slo-budget-reporter`,
       description: `Republishes ${envName} error-budget consumption as CloudWatch metrics`,
       runtime: lambda.Runtime.NODEJS_22_X,
+      // arm64: inline source on a managed runtime, so nothing in the artifact
+      // is architecture-specific. 20% cheaper per GB-second — docs/graviton.md.
+      architecture: lambda.Architecture.ARM_64,
       handler: 'index.handler',
       role: reporterRole,
       timeout: cdk.Duration.seconds(lambdaTimeoutSeconds),

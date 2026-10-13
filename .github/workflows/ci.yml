@@ -319,6 +319,27 @@ jobs:
       - name: Audit the chaos experiments and their stop conditions
         run: npm run audit:chaos
 
+      # Every gate above asks whether something works. This one asks what it
+      # costs, and it is the only gate here whose subject is a processor. A
+      # workload's architecture is decided in three places that never meet: a
+      # property in a stack, the bytes in a registry, and a `docker build` in a
+      # workflow template. Each of the three is individually green while the
+      # combination fails at task placement — `CannotPullContainerError`, in one
+      # environment, minutes after a deploy nothing objected to. The near misses
+      # are each one property and each leaves a green build: a task definition
+      # with no `RuntimePlatform` at all, where ECS's x86 default and a
+      # deliberate x86 choice produce the same template; an ARM64 task pulling a
+      # digest that resolves to a single `linux/amd64` manifest; an EKS node
+      # group whose AMI type and instance types disagree, which CloudFormation
+      # accepts and whose nodes then never join; a `layer-binaries-x86` blocker
+      # left in place after the layer stopped shipping x86 binaries; and 26 of
+      # the 58 Lambda functions in cdk.out being created by the CDK framework,
+      # named in no file here, so "we moved our Lambdas to Graviton" is 55% true
+      # and nothing says so. Runs after synth because every rule is about what
+      # synth wrote. See docs/graviton.md.
+      - name: Audit processor architectures and the Graviton migration
+        run: npm run audit:graviton
+
       # The Checkov job scans the synthesised CloudFormation rather than the
       # TypeScript, so the templates have to cross the job boundary.
       #

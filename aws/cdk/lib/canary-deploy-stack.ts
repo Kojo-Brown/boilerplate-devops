@@ -303,6 +303,18 @@ export class CanaryDeployStack extends cdk.Stack {
     // it and the state machine moves the canary service, then the stable
     // service, onto that revision.
     const taskDefinition = new ecs.FargateTaskDefinition(this, 'TaskDefinition', {
+      // X86_64, stated rather than defaulted. ECS defaults a task definition with
+      // no RuntimePlatform to Linux/X86_64, so "unexamined" and "chosen" produce
+      // the same template — which is why `npm run audit:graviton` requires the
+      // declaration. It stays x86 because the image is the one
+      // `docker-build-push.yml` builds, and that is a single-platform
+      // `docker build`: ARM64 here deploys cleanly and fails at task placement
+      // with CannotPullContainerError. See docs/graviton.md.
+      runtimePlatform: {
+        operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
+        cpuArchitecture: ecs.CpuArchitecture.X86_64,
+      },
+
       family: `${envName}-canary-task`,
       cpu,
       memoryLimitMiB,
@@ -561,6 +573,9 @@ export class CanaryDeployStack extends cdk.Stack {
       functionName: `${envName}-canary-controller`,
       description: `Shifts ALB weights and updates ECS services for ${envName} canary deployments`,
       runtime: lambda.Runtime.NODEJS_22_X,
+      // arm64: inline source on a managed runtime, so nothing in the artifact
+      // is architecture-specific. 20% cheaper per GB-second — docs/graviton.md.
+      architecture: lambda.Architecture.ARM_64,
       handler: 'index.handler',
       role: controllerRole,
       timeout: cdk.Duration.seconds(60),
@@ -613,6 +628,9 @@ export class CanaryDeployStack extends cdk.Stack {
       functionName: `${envName}-canary-analyzer`,
       description: `Compares canary and stable target-group metrics for ${envName}`,
       runtime: lambda.Runtime.NODEJS_22_X,
+      // arm64: inline source on a managed runtime, so nothing in the artifact
+      // is architecture-specific. 20% cheaper per GB-second — docs/graviton.md.
+      architecture: lambda.Architecture.ARM_64,
       handler: 'index.handler',
       role: analyzerRole,
       timeout: cdk.Duration.seconds(60),

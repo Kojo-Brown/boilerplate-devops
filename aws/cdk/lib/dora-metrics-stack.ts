@@ -385,6 +385,9 @@ export class DoraMetricsStack extends cdk.Stack {
       functionName: `${this.stackName}-recorder`,
       description: 'Records DORA deployment and incident events',
       runtime: lambda.Runtime.NODEJS_22_X,
+      // arm64: inline source on a managed runtime, so nothing in the artifact
+      // is architecture-specific. 20% cheaper per GB-second — docs/graviton.md.
+      architecture: lambda.Architecture.ARM_64,
       handler: 'index.handler',
       role: recorderRole,
       logGroup: recorderLogGroup,
@@ -500,6 +503,9 @@ export class DoraMetricsStack extends cdk.Stack {
       functionName: `${this.stackName}-aggregator`,
       description: 'Publishes deployment frequency and change failure rate over the window',
       runtime: lambda.Runtime.NODEJS_22_X,
+      // arm64: inline source on a managed runtime, so nothing in the artifact
+      // is architecture-specific. 20% cheaper per GB-second — docs/graviton.md.
+      architecture: lambda.Architecture.ARM_64,
       handler: 'index.handler',
       role: aggregatorRole,
       logGroup: aggregatorLogGroup,

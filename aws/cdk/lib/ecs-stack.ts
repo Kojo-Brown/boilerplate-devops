@@ -148,6 +148,13 @@ export class EcsStack extends cdk.Stack {
       // operating system family also be provided"), and AWS only supports
       // `pidMode: task` on Linux platform 1.4.0 or later. Stating the platform
       // explicitly also pins what had been an implicit default.
+      //
+      // X86_64 rather than ARM64 for one reason, and it is not this stack's:
+      // `containerImage` is what `workflow-templates/docker-build-push.yml`
+      // built, and that is a single-platform `docker build`. ARM64 here
+      // synthesises, deploys, and then fails at task placement. This is the
+      // largest Graviton saving in the repository and it is gated on the
+      // pipeline — see docs/graviton.md §4.
       runtimePlatform: {
         operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
         cpuArchitecture: ecs.CpuArchitecture.X86_64,
