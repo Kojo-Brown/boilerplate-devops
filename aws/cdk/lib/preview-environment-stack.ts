@@ -472,6 +472,12 @@ export class PreviewEnvironmentStack extends cdk.Stack {
       family: `${envName}-db-admin`,
       cpu: 256,
       memoryLimitMiB: 512,
+      // ARM64: the only thing this task runs is POSTGRES_CLIENT_IMAGE, a
+      // 16-platform index that includes linux/arm64. See docs/graviton.md.
+      runtimePlatform: {
+        operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
+        cpuArchitecture: ecs.CpuArchitecture.ARM64,
+      },
       executionRole: adminExecutionRole,
       taskRole: new iam.Role(this, 'PreviewDbAdminTaskRole', {
         roleName: `${envName}-db-admin-task-role`,
@@ -609,6 +615,9 @@ export class PreviewEnvironmentStack extends cdk.Stack {
       functionName: `${envName}-reaper`,
       description: 'Deletes preview stacks whose pull request closed, or that outlived their TTL',
       runtime: lambda.Runtime.NODEJS_22_X,
+      // arm64: inline source on a managed runtime, so nothing in the artifact
+      // is architecture-specific. 20% cheaper per GB-second — docs/graviton.md.
+      architecture: lambda.Architecture.ARM_64,
       handler: 'index.handler',
       role: reaperRole,
       logGroup: reaperLogGroup,

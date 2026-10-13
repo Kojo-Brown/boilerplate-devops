@@ -908,6 +908,9 @@ export class LogPipelineStack extends cdk.Stack {
       functionName: scrubberName,
       description: `Redacts and tokenises PII in ${envName} log records before Firehose writes them`,
       runtime: lambda.Runtime.NODEJS_22_X,
+      // arm64: inline source on a managed runtime, so nothing in the artifact
+      // is architecture-specific. 20% cheaper per GB-second — docs/graviton.md.
+      architecture: lambda.Architecture.ARM_64,
       handler: 'index.handler',
       role: scrubberRole,
       timeout: cdk.Duration.seconds(transformTimeoutSeconds),

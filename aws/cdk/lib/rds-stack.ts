@@ -12,7 +12,7 @@ export interface RdsStackProps extends cdk.StackProps {
   readonly envName?: string;
   /** PostgreSQL database name (default: appdb) */
   readonly databaseName?: string;
-  /** RDS instance type (default: t3.medium) */
+  /** RDS instance type (default: t4g.medium, Graviton2 — see docs/graviton.md) */
   readonly instanceType?: ec2.InstanceType;
   /** PostgreSQL engine version (default: VER_16) */
   readonly postgresVersion?: rds.PostgresEngineVersion;
@@ -67,9 +67,19 @@ export class RdsStack extends cdk.Stack {
     const backupRetentionDays = props.backupRetentionDays ?? 7;
     const secretRotationDays = props.secretRotationDays ?? 30;
     const deletionProtection = props.deletionProtection ?? envName === 'production';
+    // Graviton2, and the cheapest of the five services in this repository to
+    // move: there is no image and no architecture-specific artifact anywhere in
+    // an RDS instance, so the class name is the whole migration. Same 2 vCPU /
+    // 4 GiB as the db.t3.medium it replaces, 9.72% cheaper Single-AZ and 11.03%
+    // cheaper Multi-AZ — two different savings for one pair of classes, because
+    // Multi-AZ is not exactly twice Single-AZ on either side.
+    //
+    // For an instance that already exists this is a modification rather than a
+    // replacement: one reboot Single-AZ, a failover Multi-AZ. See
+    // docs/graviton.md for the ordering and for the blue/green alternative.
     const instanceType =
       props.instanceType ??
-      ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.MEDIUM);
+      ec2.InstanceType.of(ec2.InstanceClass.T4G, ec2.InstanceSize.MEDIUM);
     const postgresVersion = props.postgresVersion ?? rds.PostgresEngineVersion.VER_16;
     const engine = rds.DatabaseInstanceEngine.postgres({ version: postgresVersion });
 

@@ -381,11 +381,14 @@ Small, and not nothing. Per environment, per month, at us-east-1 list prices:
 * **The recorder and the conductor**: 8,640 invocations and a handful. Under
   $0.05.
 
-* **The restore drill**: one `db.t3.medium` with 100 GiB of gp3, for about 45
+* **The restore drill**: one `db.t4g.medium` with 100 GiB of gp3, for about 45
   minutes, once a month, plus the sweeper's 720 invocations. At list prices that
-  is roughly **$0.06 of instance time and $0.02 of storage per drill** — the
+  is roughly **$0.05 of instance time and $0.02 of storage per drill** — the
   storage is billed per GiB-month and a 45-minute instance is a thousandth of
-  one. Add the restore's own I/O, which gp3 includes up to its baseline.
+  one. Add the restore's own I/O, which gp3 includes up to its baseline. The
+  class is not a constant here: the drill restores whatever `DBInstanceClass`
+  the source instance reports, so this figure follows `RdsStack`, which moved to
+  Graviton in docs/graviton.md.
 
 Call it **$3 a month per environment**, which buys an RTO number somebody has
 watched happen, an RPO that is checked every five minutes, and a monthly

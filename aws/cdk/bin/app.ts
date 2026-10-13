@@ -312,7 +312,7 @@ new ElastiCacheStack(app, 'ElastiCacheStack-Staging', {
   envName: 'staging',
   // Single node (no replicas) for cost-optimised staging
   numReadReplicas: 0,
-  cacheNodeType: 'cache.t3.micro',
+  cacheNodeType: 'cache.t4g.micro',
   allowedSecurityGroups: [ecsStackStaging.taskSecurityGroup],
   env: {
     account: process.env.CDK_DEFAULT_ACCOUNT,
@@ -389,7 +389,7 @@ new ElastiCacheStack(app, 'ElastiCacheStack-Production', {
   envName: 'production',
   // 1 replica → Multi-AZ automatic failover in ~20 s
   numReadReplicas: 1,
-  cacheNodeType: 'cache.t3.small',
+  cacheNodeType: 'cache.t4g.small',
   allowedSecurityGroups: [ecsStackProduction.taskSecurityGroup],
   env: {
     account: process.env.CDK_DEFAULT_ACCOUNT,

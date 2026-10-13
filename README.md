@@ -1127,5 +1127,54 @@ fault needs from `EcsStack`, the three ways a guardrail turns out to be
 decoration, why the role is written out instead of attaching AWS's managed FIS
 policies, how to write up a run, and the nineteen gate rules.
 
+## Graviton / ARM
+
+`npm run audit:graviton` classifies all **87** compute resources this repository
+synthesises and keeps the classification true against `cdk.out`: **40 run on
+arm64**, 11 are blocked, and 36 cannot move at all. The prices behind every
+decision were read out of AWS's public price list — SKU and offer publication
+date recorded beside each one — and no performance claim here is this
+repository's own, because nothing in it has ever executed on an arm64 host.
+
+What the measurement changed about the usual advice:
+
+- **"20% cheaper" is two of eight rows.** It is 15.00% for the EC2 m-family,
+  9.72% Single-AZ and 11.03% Multi-AZ for the *same* pair of RDS classes, and
+  **5.88% for the ElastiCache node this repository runs** — a 3.4x spread from
+  one price list on one day. And `m8g.large` (Graviton4) costs **10% more per
+  hour** than `m7g.large`, so "move to Graviton" is a choice of generation
+  before it is a choice of architecture.
+- **The only performance number here is a bound.** A 20% cheaper hour buys 25%
+  more hours; the ElastiCache saving tolerates 6.25%. The service with the
+  smallest price gap needs the strongest benchmark, which is the opposite of
+  where anyone measures.
+- **Eleven resources are blocked by one line**, and it is not in any stack:
+  `docker-build-push.yml` runs `docker build` with no `--platform`, so the ECS
+  service, the blue/green and canary services, the preview task, the migration
+  task and the EKS node group cannot be moved however many times
+  `cpuArchitecture: ARM64` is proposed. That is also where the money is: the
+  cheap migration is where the savings are not. Fixing it is its own change —
+  `buildx` cannot `--load` two platforms, so the build-then-inventory-then-push
+  ordering that `audit:sbom` and `audit:vulns` enforce has to become a
+  per-platform matrix, and the signing subject becomes the index digest.
+- **26 of the 58 Lambda functions are the CDK framework's**, named in no file
+  here, and six carry layers whose `kubectl`, `helm` and `_yaml` binaries are
+  ELF x86-64 — read out of the layer zips on every audit run. "We moved our
+  Lambdas to Graviton" is 55% true here and nothing else would have said so.
+- **Ten of twelve task definitions declared no architecture at all.** ECS reads
+  that as x86, so an unexamined workload and a deliberate choice produced
+  identical CloudFormation. All twelve now say which they are, and the gate
+  rejects an absent declaration.
+
+The gate reads the templates, not the TypeScript, and runs **in both
+directions**: the pipeline blocker must be present while the pipeline builds one
+platform and must be gone the day it builds `linux/arm64`, and a
+`layer-binaries-x86` blocker fails if those binaries ever stop being x86.
+
+See [docs/graviton.md](./docs/graviton.md) for the price table with its SKUs, the
+workload table, how to re-read a price or measure an image's platforms with
+curl, what a benchmark would have to show and in which order, the per-service
+mechanics of migrating something already running, and the sixteen gate rules.
+
 ## Spec Progress
 See [SPEC.md](./SPEC.md).

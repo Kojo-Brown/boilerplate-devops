@@ -163,6 +163,18 @@ export class PreviewPrStack extends cdk.Stack {
 
     this.taskDefinition = new ecs.FargateTaskDefinition(this, 'TaskDefinition', {
       family: `${envName}-pr-${props.prNumber}`,
+      // X86_64, stated rather than defaulted. ECS defaults a task definition with
+      // no RuntimePlatform to Linux/X86_64, so "unexamined" and "chosen" produce
+      // the same template — which is why `npm run audit:graviton` requires the
+      // declaration. It stays x86 because the image is the one
+      // `docker-build-push.yml` builds, and that is a single-platform
+      // `docker build`: ARM64 here deploys cleanly and fails at task placement
+      // with CannotPullContainerError. See docs/graviton.md.
+      runtimePlatform: {
+        operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
+        cpuArchitecture: ecs.CpuArchitecture.X86_64,
+      },
+
       cpu,
       memoryLimitMiB,
       executionRole,

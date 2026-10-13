@@ -181,10 +181,14 @@ describe('ElastiCacheStack', () => {
       });
     });
 
-    it('defaults to cache.t3.small node type', () => {
+    it('defaults to the Graviton2 cache.t4g.small node type', () => {
+      // Same 2 vCPU / 1.37 GiB as the cache.t3.small it replaced, 5.88% cheaper
+      // per node-hour, and the smallest saving of any service in the
+      // repository — see docs/graviton.md §2 for why that makes it the row that
+      // needs a benchmark most.
       const { template } = makeStacks();
       template.hasResourceProperties('AWS::ElastiCache::ReplicationGroup', {
-        CacheNodeType: 'cache.t3.small',
+        CacheNodeType: 'cache.t4g.small',
       });
     });
 

@@ -10,7 +10,7 @@ export interface ElastiCacheStackProps extends cdk.StackProps {
   readonly envName?: string;
   /** Redis engine version (default: '7.1') */
   readonly engineVersion?: string;
-  /** ElastiCache node type (default: cache.t3.small) */
+  /** ElastiCache node type (default: cache.t4g.small, Graviton2 — see docs/graviton.md) */
   readonly cacheNodeType?: string;
   /** Number of read replicas; 0 = single-node, 1+ enables Multi-AZ failover */
   readonly numReadReplicas?: number;
@@ -63,7 +63,13 @@ export class ElastiCacheStack extends cdk.Stack {
 
     const envName = props.envName ?? 'production';
     const engineVersion = props.engineVersion ?? '7.1';
-    const cacheNodeType = props.cacheNodeType ?? 'cache.t3.small';
+    // Graviton2, with the smallest saving of any service here: 5.88% against
+    // the cache.t3.small it replaces, for the same 2 vCPU / 1.37 GiB. Worth
+    // doing because there is nothing to it — no image, no engine change, the
+    // same node count — but it is the row that makes the point in
+    // docs/graviton.md: a 5.88% cheaper hour is erased by a 6.25% regression,
+    // and nobody benchmarks a cache node.
+    const cacheNodeType = props.cacheNodeType ?? 'cache.t4g.small';
     const numReadReplicas = props.numReadReplicas ?? (envName === 'production' ? 1 : 0);
     const multiAzEnabled = props.multiAzEnabled ?? numReadReplicas > 0;
     const atRestEncryptionEnabled = props.atRestEncryptionEnabled ?? true;

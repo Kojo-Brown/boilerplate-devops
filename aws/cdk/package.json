@@ -28,6 +28,7 @@
     "audit:postmortems": "ts-node tools/audit-postmortems.ts",
     "audit:gamedays": "ts-node tools/audit-game-days.ts",
     "audit:chaos": "ts-node tools/audit-fis-experiments.ts",
+    "audit:graviton": "ts-node tools/audit-graviton.ts",
     "cdk": "cdk"
   },
   "devDependencies": {

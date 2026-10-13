@@ -159,6 +159,14 @@ export class DbMigrationStack extends cdk.Stack {
         memoryLimitMiB,
         executionRole,
         taskRole,
+        // X86_64, stated rather than defaulted, and for the same reason as the
+        // service it migrates the database for: `migrationImageUri` is the
+        // application image with a different command, and that image is built
+        // for one platform. See docs/graviton.md.
+        runtimePlatform: {
+          operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
+          cpuArchitecture: ecs.CpuArchitecture.X86_64,
+        },
       },
     );
 
@@ -274,6 +282,9 @@ export class DbMigrationStack extends cdk.Stack {
       functionName: `${envName}-migration-hook`,
       description: `Runs DB migrations before traffic shifts to the green ECS tasks (${envName})`,
       runtime: lambda.Runtime.NODEJS_22_X,
+      // arm64: inline source on a managed runtime, so nothing in the artifact
+      // is architecture-specific. 20% cheaper per GB-second — docs/graviton.md.
+      architecture: lambda.Architecture.ARM_64,
       handler: 'index.handler',
       role: lambdaRole,
       // Must complete before CodeDeploy's hook timeout (default 1 hour).

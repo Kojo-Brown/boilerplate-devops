@@ -396,6 +396,9 @@ export class BackupRestoreDrillStack extends cdk.Stack {
         `Runs the ${RESTORE_VERIFICATION_CHECKS.length} restore-verification checks against the ` +
         `${envName} restored copy and publishes the verdict`,
       runtime: lambda.Runtime.NODEJS_22_X,
+      // arm64: inline source on a managed runtime, so nothing in the artifact
+      // is architecture-specific. 20% cheaper per GB-second — docs/graviton.md.
+      architecture: lambda.Architecture.ARM_64,
       handler: 'index.handler',
       role: verifierRole,
       // Long, because of one check: `FreeStorageSpace` for a minutes-old
@@ -504,6 +507,9 @@ export class BackupRestoreDrillStack extends cdk.Stack {
       functionName: conductorFunctionName(envName),
       description: `Preflight, measurement, teardown and abort record for ${envName} restore drills`,
       runtime: lambda.Runtime.NODEJS_22_X,
+      // arm64: inline source on a managed runtime, so nothing in the artifact
+      // is architecture-specific. 20% cheaper per GB-second — docs/graviton.md.
+      architecture: lambda.Architecture.ARM_64,
       handler: 'index.handler',
       role: conductorRole,
       timeout: cdk.Duration.seconds(60),
@@ -597,6 +603,9 @@ export class BackupRestoreDrillStack extends cdk.Stack {
         `Publishes the age of the ${envName} restore-drill copy and deletes one no drill is ` +
         'using — the path an operator cancelling an execution leaves behind',
       runtime: lambda.Runtime.NODEJS_22_X,
+      // arm64: inline source on a managed runtime, so nothing in the artifact
+      // is architecture-specific. 20% cheaper per GB-second — docs/graviton.md.
+      architecture: lambda.Architecture.ARM_64,
       handler: 'index.handler',
       role: sweeperRole,
       timeout: cdk.Duration.seconds(60),
