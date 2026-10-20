@@ -45,6 +45,8 @@ import { FailoverGameDayStack } from '../lib/failover-game-day-stack';
 import { BackupRestoreDrillStack } from '../lib/backup-restore-drill-stack';
 import { ChaosFisStack } from '../lib/chaos-fis-stack';
 import { RunbookStack } from '../lib/runbook-stack';
+import { SpotInterruptionStack } from '../lib/spot-interruption-stack';
+import { spotWorkloadById } from '../lib/spot-capacity';
 
 const app = new cdk.App();
 
@@ -283,12 +285,24 @@ const ecsStackStaging = new EcsStack(app, 'EcsStack-Staging', {
   containerPort: 3000,
   cpu: 512,
   memoryLimitMiB: 1024,
+  // One task, and the on-demand base below is also one — so nothing here is on
+  // Spot until the service scales. That is deliberate and is the honest shape
+  // of a base-plus-weight strategy: the base is what survives a Spot shortage
+  // and the burst is what gets the discount. See the `staging-application` note
+  // in lib/spot-capacity.ts and docs/spot.md §5.
   desiredCount: 1,
+  // Staging carries no objective, so a reclaim here is a rehearsal of what
+  // production is supposed to survive. The on-demand base keeps the
+  // environment every release is validated against from disappearing in a
+  // Spot-wide shortage, which would otherwise be silent: no tasks, no
+  // utilisation metrics, no alarm. SpotInterruptionStack-Staging below carries
+  // the page that catches it.
+  capacity: spotWorkloadById('staging-application'),
   env: {
     account: process.env.CDK_DEFAULT_ACCOUNT,
     region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
   },
-  description: 'Staging ECS Fargate service + ALB + HTTPS',
+  description: 'Staging ECS Fargate service + ALB + HTTPS (on-demand base, Spot burst)',
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
 
@@ -1460,6 +1474,65 @@ new PreviewPrStack(app, `PreviewPrStack-${previewPrNumber}`, {
     region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
   },
   description: `Preview environment for pull request #${previewPrNumber}`,
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+// ── Fargate Spot: the record, and the two silent failures ────────────────────
+// `lib/spot-capacity.ts` decides which workloads run on Spot — two of the
+// eleven ECS services here — and what each one owes the two-minute warning it
+// gets when the capacity is reclaimed. This stack is the other half of that
+// deal, and it exists because both ways a Spot strategy goes wrong are quiet:
+//
+//   • **No Spot capacity to place on.** RunTask does not place, the service
+//     event log says so, the desired count stays unmet, and every alarm that
+//     might have caught it is a utilisation alarm on tasks that do not exist.
+//     `staging-spot-capacity-starved` is metric math over Container Insights'
+//     running and desired task counts, both terms FILL()ed, treating missing
+//     data as breaching — because the thing being looked for is the absence.
+//
+//   • **A shutdown that outran its budget.** A task killed at the end of its
+//     grace period and a task that drained cleanly both end as a task that is
+//     gone. The difference is `stoppedAt - stoppingAt` against the declared
+//     budget, which the ECS event carries and nothing else here reads.
+//
+// One stack rather than one per environment: the only Spot capacity in this
+// account is staging's burst and the previews, previews run in the staging VPC,
+// and production is on-demand by posture — a production instance of this stack
+// would carry alarms on metrics that are structurally zero.
+//
+// The alarms go to `cloudWatchAlarmsStackStaging.alarmTopic`, which
+// `RunbookStack-Staging` already enriches; a topic of its own would be one
+// `npm run audit:runbooks` fails for, correctly.
+//
+// `npm run audit:spot` holds the templates to the catalogue. See docs/spot.md.
+new SpotInterruptionStack(app, 'SpotInterruptionStack-Staging', {
+  envName: 'staging',
+  alarmTopic: cloudWatchAlarmsStackStaging.alarmTopic,
+  monitoredClusterArns: [
+    ecsStackStaging.cluster.clusterArn,
+    previewEnvironmentStack.cluster.clusterArn,
+  ],
+  workloads: [
+    { serviceNamePattern: 'staging-service', workload: spotWorkloadById('staging-application') },
+    // The per-pull-request services are `preview-pr-<number>`, so the recorder
+    // matches them by prefix — the number is not knowable here and a catalogue
+    // CI had to edit would not be one.
+    { serviceNamePattern: 'preview-pr-*', workload: spotWorkloadById('preview-pr-service') },
+  ],
+  // Staging's application service, and deliberately not the previews: a preview
+  // that cannot be placed is visible in the pull request waiting for it, and
+  // paging a rota for somebody else's branch is how a rota learns to ignore a
+  // page.
+  starvationTarget: {
+    clusterName: 'staging-cluster',
+    serviceName: 'staging-service',
+    onDemandBase: spotWorkloadById('staging-application').onDemandBase ?? 0,
+  },
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Fargate Spot interruption recorder, drain-budget measurement, and alarms',
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
 

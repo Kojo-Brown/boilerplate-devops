@@ -205,7 +205,14 @@ export const POSTMORTEM_SEVERITIES: readonly PostmortemSeverity[] = [
     // this severity's second trigger exactly. It also keeps it alongside
     // `platform-tooling`, which already carries `*-rehearsal-overdue-*` — the
     // alarm that stays red for the same reason and for as long.
-    runbookIds: ['platform-tooling', 'waf-blocked-requests', 'restore-drill'],
+    // `spot-capacity` is here rather than at Sev2 even though one of its three
+    // alarms is a page: the only Spot capacity in this account is staging's
+    // burst and the per-pull-request previews, so a shortage degrades an
+    // environment that carries no objective and reaches no user. What it still
+    // owes is the record — "is this the third time this month" is the question
+    // that turns a Spot posture from a saving into a bad trade, and it is
+    // unanswerable from alarm history alone once the alarm has cleared.
+    runbookIds: ['platform-tooling', 'waf-blocked-requests', 'restore-drill', 'spot-capacity'],
     requiresPostmortem: false,
     requiresRecord: true,
   },

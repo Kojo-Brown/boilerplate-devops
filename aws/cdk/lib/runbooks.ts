@@ -315,6 +315,13 @@ export const RUNBOOK_CATALOGUE: readonly RunbookDefinition[] = [
       '*-restore-drill-verifier-errors',
       '*-restore-drill-conductor-errors',
       '*-restore-drill-sweeper-errors',
+      // The Spot interruption recorder's own two alarms, here rather than in
+      // §12 for the reason this section exists: while the recorder is down,
+      // every Spot metric reads zero, and zero is what a healthy week looks
+      // like. The findings it publishes are §12; these two are about the
+      // instrument.
+      '*-spot-recorder-errors',
+      '*-spot-events-undelivered',
     ],
     summary:
       'Something that measures the platform has failed, rather than the platform itself. ' +
@@ -366,6 +373,30 @@ export const RUNBOOK_CATALOGUE: readonly RunbookDefinition[] = [
         'bad month and a backup pipeline that has not worked since somebody changed it; for ' +
         'the orphan alarm it bounds how long a copy of the database has been up',
       alarmFilledParameters: ['AlarmName'],
+    },
+  },
+  {
+    id: 'spot-capacity',
+    title: 'Fargate Spot took the capacity, or the drain did not fit',
+    owner: 'platform-team',
+    anchor: '#12-fargate-spot-took-the-capacity-or-the-drain-did-not-fit',
+    alarmNamePatterns: [
+      '*-spot-capacity-starved',
+      '*-spot-interruptions-high',
+      '*-spot-drain-overrun',
+    ],
+    summary:
+      'Either a Spot-bearing service has been running fewer tasks than it wants for long ' +
+      'enough that it is not a deployment, or a reclaimed task was killed before it finished ' +
+      'draining. The first is capacity that cannot be placed; the second is the only failure ' +
+      'in the set that costs data, and both look like a task that is simply gone.',
+    firstStep: {
+      documentKey: 'ecs-service-state',
+      summary:
+        'reads the ECS service: running against desired, whether anything is still pending, ' +
+        'and whether a deployment is in progress \u2014 which is what separates a Spot shortage ' +
+        'from a service mid-release',
+      alarmFilledParameters: [],
     },
   },
 ];

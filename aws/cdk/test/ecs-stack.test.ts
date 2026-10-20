@@ -2,6 +2,7 @@ import * as cdk from 'aws-cdk-lib';
 import { Template, Match } from 'aws-cdk-lib/assertions';
 import { VpcStack } from '../lib/vpc-stack';
 import { EcsStack, EcsStackProps } from '../lib/ecs-stack';
+import { spotWorkloadById } from '../lib/spot-capacity';
 import { managedPolicyArns, resourceProps } from './support/cfn';
 
 const CERT_ARN =
@@ -303,6 +304,69 @@ describe('EcsStack', () => {
           }),
         ]),
       });
+    });
+  });
+
+  describe('capacity posture', () => {
+    it('leaves the production shape untouched without a posture', () => {
+      // The default is on-demand with no capacity provider associated: a
+      // service that gained reclaimable capacity by being forgotten is the
+      // failure docs/spot.md exists to prevent.
+      const { template } = makeStacks();
+      template.hasResourceProperties('AWS::ECS::Service', { LaunchType: 'FARGATE' });
+      template.resourceCountIs('AWS::ECS::ClusterCapacityProviderAssociations', 0);
+      const [taskDefinition] = resourceProps(template, 'AWS::ECS::TaskDefinition');
+      const containers = taskDefinition.ContainerDefinitions as Record<string, unknown>[];
+      expect(containers[0].StopTimeout).toBeUndefined();
+    });
+
+    it('places the on-demand base before any weight with a spot posture', () => {
+      const { template } = makeStacks({
+        capacity: spotWorkloadById('staging-application'),
+      });
+      template.hasResourceProperties('AWS::ECS::Service', {
+        CapacityProviderStrategy: [
+          { CapacityProvider: 'FARGATE', Base: 1, Weight: 0 },
+          { CapacityProvider: 'FARGATE_SPOT', Weight: 1 },
+        ],
+      });
+      // CloudFormation rejects a service carrying both.
+      const [service] = resourceProps(template, 'AWS::ECS::Service');
+      expect(service.LaunchType).toBeUndefined();
+    });
+
+    it('associates the provider on the cluster, without which CreateService fails', () => {
+      const { template } = makeStacks({
+        capacity: spotWorkloadById('staging-application'),
+      });
+      template.hasResourceProperties('AWS::ECS::ClusterCapacityProviderAssociations', {
+        CapacityProviders: ['FARGATE', 'FARGATE_SPOT'],
+      });
+    });
+
+    it('takes the grace period and the drain delay from the same declaration', () => {
+      // The three numbers are only correct together: ECS deregisters the target
+      // before it signals the container, so 30 + 60 is what is spent inside the
+      // two-minute warning.
+      const { template } = makeStacks({
+        capacity: spotWorkloadById('staging-application'),
+      });
+      const [taskDefinition] = resourceProps(template, 'AWS::ECS::TaskDefinition');
+      const containers = taskDefinition.ContainerDefinitions as Record<string, unknown>[];
+      expect(containers[0].StopTimeout).toBe(60);
+      template.hasResourceProperties('AWS::ElasticLoadBalancingV2::TargetGroup', {
+        TargetGroupAttributes: Match.arrayWith([
+          Match.objectLike({ Key: 'deregistration_delay.timeout_seconds', Value: '30' }),
+        ]),
+      });
+    });
+
+    it('refuses a posture the catalogue would reject, at synth time', () => {
+      expect(() =>
+        makeStacks({
+          capacity: { ...spotWorkloadById('staging-application'), onDemandBase: 0 },
+        }),
+      ).toThrow(/\[base-missing\]/);
     });
   });
 

@@ -12,6 +12,13 @@ import {
   previewDatabaseName,
   previewStackNamePrefix,
 } from './preview-environment-stack';
+import {
+  type SpotWorkload,
+  assertValidSpotCatalogue,
+  spotCapacityProviderStrategies,
+  spotWorkloadById,
+  usesSpot,
+} from './spot-capacity';
 
 /** First listener-rule priority a preview may claim. */
 export const DEFAULT_RULE_PRIORITY_BASE = 1000;
@@ -73,6 +80,21 @@ export interface PreviewPrStackProps extends cdk.StackProps {
   readonly rulePriorityBase?: number;
   /** Number of priorities previews may claim (default: 40000). */
   readonly rulePriorityRange?: number;
+  /**
+   * Capacity posture for this preview (default: `preview-pr-service`).
+   *
+   * Spot by default, which is the one place in this repository where that is the
+   * default rather than an opt-in. A preview runs for the life of one pull
+   * request, and a reclaimed task is a task replaced when capacity returns —
+   * noticed, if at all, by the single person already looking at the pull request
+   * it belongs to. That is what makes an on-demand base unnecessary here and
+   * necessary everywhere else: the absence reaches somebody without an alarm.
+   *
+   * The cluster this runs on must have associated `FARGATE_SPOT`, which
+   * `PreviewEnvironmentStack` does by default — the two props move together.
+   * See docs/spot.md.
+   */
+  readonly capacity?: SpotWorkload;
 }
 
 /**
@@ -132,6 +154,9 @@ export class PreviewPrStack extends cdk.Stack {
     const memoryLimitMiB = props.memoryLimitMiB ?? 1024;
     const healthCheckPath = props.healthCheckPath ?? '/health';
     const seedCommand = props.seedCommand ?? ['npm', 'run', 'seed:preview'];
+    const capacity = props.capacity ?? spotWorkloadById('preview-pr-service');
+    assertValidSpotCatalogue([capacity]);
+    const onSpot = usesSpot(capacity);
     const rulePriorityBase = props.rulePriorityBase ?? DEFAULT_RULE_PRIORITY_BASE;
     const rulePriorityRange = props.rulePriorityRange ?? DEFAULT_RULE_PRIORITY_RANGE;
 
@@ -208,6 +233,14 @@ export class PreviewPrStack extends cdk.Stack {
       },
       readonlyRootFilesystem: false,
       essential: true,
+      // From the declared drain budget rather than ECS's 30-second default,
+      // which happens to be the same number: stating it is what makes the
+      // budget in `lib/spot-capacity.ts` enforceable, since `tools/audit-spot-
+      // capacity.ts` reads the template and an absent `StopTimeout` is
+      // indistinguishable from a default nobody chose.
+      ...(capacity.drainBudget
+        ? { stopTimeout: cdk.Duration.seconds(capacity.drainBudget.stopTimeoutSeconds) }
+        : {}),
     });
 
     // ── Target group ──────────────────────────────────────────────────────────
@@ -234,8 +267,13 @@ export class PreviewPrStack extends cdk.Stack {
         healthyHttpCodes: '200',
       },
       // Nothing is draining to: the previous tasks are being replaced by a
-      // deploy nobody is depending on for uptime.
-      deregistrationDelay: cdk.Duration.seconds(5),
+      // deploy nobody is depending on for uptime. On a Spot reclaim this is
+      // also the first thing spent out of the two-minute warning, before
+      // `SIGTERM` reaches the container — five seconds leaves the whole grace
+      // period for the process.
+      deregistrationDelay: cdk.Duration.seconds(
+        capacity.drainBudget?.deregistrationDelaySeconds ?? 5,
+      ),
     });
 
     // ── Service ───────────────────────────────────────────────────────────────
@@ -257,6 +295,7 @@ export class PreviewPrStack extends cdk.Stack {
       enableExecuteCommand: true,
       propagateTags: ecs.PropagatedTagSource.SERVICE,
       healthCheckGracePeriod: cdk.Duration.seconds(60),
+      ...(onSpot ? { capacityProviderStrategies: [...spotCapacityProviderStrategies(capacity)] } : {}),
     });
 
     // ECS Exec is the reason a preview is worth having when it breaks — it is

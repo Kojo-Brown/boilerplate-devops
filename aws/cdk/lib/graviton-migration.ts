@@ -491,6 +491,7 @@ const REPOSITORY_LAMBDAS: readonly {
   { id: 'dora-recorder', path: 'RecorderFunction/Resource', copies: 1 },
   { id: 'feature-flag-sweep', path: 'FeatureFlagSweepFunction/Resource', copies: 1 },
   { id: 'preview-reaper', path: 'PreviewReaperFunction/Resource', copies: 1 },
+  { id: 'spot-interruption-recorder', path: 'SpotRecorder/Resource', copies: 1 },
 ];
 
 /**

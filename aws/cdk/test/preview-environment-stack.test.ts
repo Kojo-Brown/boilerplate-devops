@@ -71,6 +71,23 @@ describe('PreviewEnvironmentStack', () => {
     });
   });
 
+  describe('capacity providers', () => {
+    it('associates FARGATE_SPOT by default, which is what makes a preview deployable on Spot', () => {
+      // The shared half owns the cluster and the per-pull-request half names
+      // the provider; a service naming one the cluster has not associated is
+      // rejected at CreateService, after every gate here has passed.
+      const { template } = makeStack();
+      template.hasResourceProperties('AWS::ECS::ClusterCapacityProviderAssociations', {
+        CapacityProviders: ['FARGATE', 'FARGATE_SPOT'],
+      });
+    });
+
+    it('leaves the cluster alone when previews are put back on on-demand', () => {
+      const { template } = makeStack({ spotCapacityProvider: false });
+      template.resourceCountIs('AWS::ECS::ClusterCapacityProviderAssociations', 0);
+    });
+  });
+
   describe('routing', () => {
     it('answers an unrouted preview hostname with 404, not another pull request', () => {
       // The wildcard DNS record resolves for torn-down previews too. Whatever
