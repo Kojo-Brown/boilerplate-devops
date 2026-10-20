@@ -27,6 +27,7 @@ Reusable CI/CD workflows and AWS infrastructure templates.
 | GitOps delivery — app-of-apps, sync waves, drift detection | `k8s/argocd/` |
 | Log pipeline — PII scrubbed before the archive ingests it | `aws/cdk/lib/log-pipeline-stack.ts`, `aws/cdk/lib/log-scrubbing.ts` |
 | Trace context across a queue — API → queue → worker | `aws/cdk/lib/queue-trace-context.ts`, `aws/cdk/lib/traced-queue-stack.ts` |
+| Fargate Spot posture per service + interruption handling | `aws/cdk/lib/spot-capacity.ts`, `aws/cdk/lib/spot-interruption-stack.ts` |
 
 ## Usage
 
@@ -1129,8 +1130,8 @@ policies, how to write up a run, and the nineteen gate rules.
 
 ## Graviton / ARM
 
-`npm run audit:graviton` classifies all **87** compute resources this repository
-synthesises and keeps the classification true against `cdk.out`: **40 run on
+`npm run audit:graviton` classifies all **88** compute resources this repository
+synthesises and keeps the classification true against `cdk.out`: **41 run on
 arm64**, 11 are blocked, and 36 cannot move at all. The prices behind every
 decision were read out of AWS's public price list — SKU and offer publication
 date recorded beside each one — and no performance claim here is this
@@ -1157,10 +1158,10 @@ What the measurement changed about the usual advice:
   `buildx` cannot `--load` two platforms, so the build-then-inventory-then-push
   ordering that `audit:sbom` and `audit:vulns` enforce has to become a
   per-platform matrix, and the signing subject becomes the index digest.
-- **26 of the 58 Lambda functions are the CDK framework's**, named in no file
+- **26 of the 59 Lambda functions are the CDK framework's**, named in no file
   here, and six carry layers whose `kubectl`, `helm` and `_yaml` binaries are
   ELF x86-64 — read out of the layer zips on every audit run. "We moved our
-  Lambdas to Graviton" is 55% true here and nothing else would have said so.
+  Lambdas to Graviton" is 56% true here and nothing else would have said so.
 - **Ten of twelve task definitions declared no architecture at all.** ECS reads
   that as x86, so an unexamined workload and a deliberate choice produced
   identical CloudFormation. All twelve now say which they are, and the gate
@@ -1175,6 +1176,62 @@ See [docs/graviton.md](./docs/graviton.md) for the price table with its SKUs, th
 workload table, how to re-read a price or measure an image's platforms with
 curl, what a benchmark would have to show and in which order, the per-service
 mechanics of migrating something already running, and the sixteen gate rules.
+
+## Fargate Spot for the non-critical half
+
+`npm run audit:spot` classifies all **11** ECS services this repository
+synthesises and holds the classification true against `cdk.out`. **Two run on
+Spot** — the per-pull-request previews, and staging's burst above an on-demand
+base — and **nine stay on on-demand capacity with a recorded reason**. The nine
+are the content: Spot is the only cost lever here that changes what happens
+during an incident, so the interesting question is never which workloads can
+take a 70% discount but which ones cannot, and why.
+
+- **A release mechanism cannot run on reclaimable capacity.** CodeDeploy decides
+  a blue/green release on the replacement task set's health, and the canary
+  analyser decides a promotion by comparing the canary target group's error rate
+  and latency against the stable one's. A reclaim on either side moves one of
+  those numbers for a reason that has nothing to do with the revision under
+  test, and neither mechanism can tell the two apart: the failure is a **wrong
+  verdict**, not an outage, and it reads exactly like a correct one.
+- **The trace sampler is a hash ring.** Reclaiming an instance re-points ~1/N of
+  trace IDs, so for one Cloud Map resolver interval the agents disagree about
+  which instance owns which trace and the traces in flight are decided on
+  fragments. Every task stays healthy and a trace is missing its database span —
+  the same property that already keeps that tier off an autoscaling policy.
+- **`base` is a count, not a share, and zero is refused.** A strategy that is
+  100% `FARGATE_SPOT` does not fail loudly when there is no Spot capacity:
+  `RunTask` does not place, the desired count stays unmet, and the alarms that
+  would catch it are utilisation alarms on tasks that do not exist. The service
+  does not go red, it goes quiet.
+- **The drain budget is a sum, and the ELB default alone blows it.** On a
+  termination notice ECS deregisters the target *before* it sends `SIGTERM`, so
+  the target group's deregistration delay and the container's `stopTimeout` are
+  spent one after the other inside the same two minutes. The ELB default is 300
+  seconds and ECS's `stopTimeout` default is 30 — so a service that says nothing
+  is killed 180 seconds before it is asked to stop, and the only trace is a task
+  that went away, which is what a reclaim looks like anyway.
+- **It saves nothing on staging today, and the arithmetic says so.** Staging runs
+  at `desiredCount: 1` with a base of 1, so the one task it wants is the one task
+  the base places on on-demand capacity. `maximumSavingPercent` returns a
+  **bound** rather than an estimate — 0% at one task, 52.5% at four — and the
+  70% itself is marked `measured: false`, because it is AWS's advertised figure
+  and nothing here has ever run.
+
+`SpotInterruptionStack` records what Spot actually did: an EventBridge rule on
+`stopCode: SpotInterruption` (and on nothing else, or every deployment becomes
+an interruption), a recorder measuring `stoppedAt - stoppingAt` against the
+declared budget, and five alarms. The page is metric math over Container
+Insights' running and desired task counts with both terms `FILL()`ed and
+`treatMissingData: breaching` — because the symptom is an absence — and the
+ticket nobody else would raise is `spot-drain-overrun`, which is the difference
+between a task that drained and a task that was killed.
+
+See [docs/spot.md](./docs/spot.md) for the posture of every service with its
+reason, the drain-budget arithmetic, what the recorder publishes and why twice,
+how to move a workload on or off Spot, what is deliberately out of scope
+(EC2 Spot and the EKS node groups, one-shot `RunTask`), and the twenty gate
+rules.
 
 ## Spec Progress
 See [SPEC.md](./SPEC.md).

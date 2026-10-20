@@ -11,6 +11,7 @@ import {
   previewStackName,
   truncateTargetGroupName,
 } from '../lib/preview-pr-stack';
+import { spotWorkloadById } from '../lib/spot-capacity';
 import { flattenIntrinsic, resourceProps } from './support/cfn';
 
 const CERTIFICATE_ARN =
@@ -77,6 +78,43 @@ describe('PreviewPrStack', () => {
       // database, the listener-rule priority. A bad one is not recoverable
       // later, so it fails at synth.
       expect(() => makeStack({ prNumber })).toThrow(/must be a positive integer/);
+    });
+  });
+
+  describe('capacity posture', () => {
+    it('runs on Spot alone by default, with no on-demand base', () => {
+      // The one place in this repository where Spot is the default rather than
+      // an opt-in: a preview exists for one pull request, and its absence
+      // reaches the single person waiting for it without an alarm. See
+      // docs/spot.md §2.
+      const { template } = makeStack();
+      template.hasResourceProperties('AWS::ECS::Service', {
+        CapacityProviderStrategy: [{ CapacityProvider: 'FARGATE_SPOT', Weight: 1 }],
+      });
+      const [service] = resourceProps(template, 'AWS::ECS::Service');
+      expect(service.LaunchType).toBeUndefined();
+    });
+
+    it('declares the grace period rather than inheriting ECS\'s default', () => {
+      // Which happens to be the same 30 seconds. Stating it is what makes the
+      // budget enforceable: `npm run audit:spot` reads the template, and an
+      // absent StopTimeout is indistinguishable from one nobody chose.
+      const { template } = makeStack();
+      expect(appContainer(template).StopTimeout).toBe(30);
+      template.hasResourceProperties('AWS::ElasticLoadBalancingV2::TargetGroup', {
+        TargetGroupAttributes: Match.arrayWith([
+          Match.objectLike({ Key: 'deregistration_delay.timeout_seconds', Value: '5' }),
+        ]),
+      });
+    });
+
+    it('goes back to on-demand when handed the on-demand entry', () => {
+      const { template } = makeStack({
+        capacity: spotWorkloadById('production-application'),
+      });
+      template.hasResourceProperties('AWS::ECS::Service', { LaunchType: 'FARGATE' });
+      const [service] = resourceProps(template, 'AWS::ECS::Service');
+      expect(service.CapacityProviderStrategy).toBeUndefined();
     });
   });
 

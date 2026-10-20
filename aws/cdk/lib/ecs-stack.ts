@@ -7,6 +7,12 @@ import * as logs from 'aws-cdk-lib/aws-logs';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import { Construct } from 'constructs';
 import { NGINX_PLACEHOLDER_IMAGE } from './base-images';
+import {
+  type SpotWorkload,
+  assertValidSpotCatalogue,
+  spotCapacityProviderStrategies,
+  usesSpot,
+} from './spot-capacity';
 
 export interface EcsStackProps extends cdk.StackProps {
   /** VPC from VpcStack (required) */
@@ -29,6 +35,22 @@ export interface EcsStackProps extends cdk.StackProps {
   readonly healthCheckPath?: string;
   /** Enable ECS Exec for interactive container debugging (default: true) */
   readonly enableExecuteCommand?: boolean;
+  /**
+   * Capacity posture for this service, from `lib/spot-capacity.ts`.
+   *
+   * Omitted means what this stack has always done: `launchType: FARGATE`, every
+   * task on on-demand capacity, no capacity provider associated with the cluster.
+   * That is the posture `production-application` declares and it is the default
+   * because it is the safe one — a service that gains Spot capacity by being
+   * forgotten is the failure this whole item is about.
+   *
+   * Supplied with a Spot-bearing entry, the service gets that entry's capacity
+   * provider strategy, the container gets the entry's `stopTimeout`, and the
+   * target group gets its deregistration delay — all three out of the one
+   * declaration, because the three numbers are only correct together. See
+   * docs/spot.md.
+   */
+  readonly capacity?: SpotWorkload;
 }
 
 /**
@@ -66,13 +88,42 @@ export class EcsStack extends cdk.Stack {
     const desiredCount = props.desiredCount ?? 2;
     const healthCheckPath = props.healthCheckPath ?? '/health';
     const enableExecuteCommand = props.enableExecuteCommand ?? true;
+    const capacity = props.capacity;
+    const onSpot = capacity !== undefined && usesSpot(capacity);
+
+    // Offline arithmetic, so a posture that cannot be satisfied fails here
+    // rather than at deploy time or, worse, never.
+    if (capacity) assertValidSpotCatalogue([capacity]);
+
+    // What this stack used before any of this existed, and still uses without a
+    // Spot posture. Thirty seconds is long enough for an in-flight request to
+    // finish and short enough to fit a Spot reclaim's two-minute budget twice
+    // over.
+    const deregistrationDelaySeconds =
+      capacity?.drainBudget?.deregistrationDelaySeconds ?? 30;
 
     // ── ECS Cluster ───────────────────────────────────────────────────────────
     this.cluster = new ecs.Cluster(this, 'Cluster', {
       clusterName: `${envName}-cluster`,
       vpc: props.vpc,
+      // Required by the starvation alarm in `SpotInterruptionStack`:
+      // `RunningTaskCount` and `DesiredTaskCount` are Container Insights
+      // metrics, and without them the one signal that catches a Spot shortage
+      // has no inputs. It was already on for the dashboards.
       containerInsights: true,
     });
+
+    // A Fargate capacity provider is account-wide and does nothing until it is
+    // associated with a cluster — and a service naming `FARGATE_SPOT` on a
+    // cluster that has not associated it is rejected at deploy time, after the
+    // template has passed every gate in this repository. The association is
+    // made only where a Spot posture asks for it, so the production cluster's
+    // template is unchanged and `tools/audit-spot-capacity.ts` can hold the two
+    // halves together rather than registering both everywhere and never
+    // checking.
+    if (onSpot) {
+      this.cluster.enableFargateCapacityProviders();
+    }
 
     // ── Log Group ─────────────────────────────────────────────────────────────
     const logGroup = new logs.LogGroup(this, 'TaskLogGroup', {
@@ -186,6 +237,17 @@ export class EcsStack extends cdk.Stack {
       },
       readonlyRootFilesystem: false,
       essential: true,
+      // Only with a Spot posture, and then from the declared budget. ECS
+      // defaults an unset `stopTimeout` to 30 seconds, which is a quarter of
+      // the warning Spot gives and is a number nobody chose; on on-demand
+      // capacity the task is stopped by a deployment or a scale-in, both of
+      // which wait for the deregistration delay and neither of which has a
+      // deadline, so the default is harmless there and setting it would be a
+      // property added to a production template for a reason that does not
+      // apply to it.
+      ...(capacity?.drainBudget
+        ? { stopTimeout: cdk.Duration.seconds(capacity.drainBudget.stopTimeoutSeconds) }
+        : {}),
     });
 
     // ── Security Groups ───────────────────────────────────────────────────────
@@ -262,9 +324,21 @@ export class EcsStack extends cdk.Stack {
       vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
       minHealthyPercent: 50,
       maxHealthyPercent: 200,
+      // The circuit breaker and a Spot posture interact, and it is worth being
+      // explicit about why this combination is still safe: the breaker counts
+      // tasks that fail to reach a steady state during a deployment, and a
+      // reclaim mid-deployment is one of those. What keeps a good release from
+      // being rolled back by AWS reclaiming capacity is the on-demand `base` —
+      // it is placed before any weight applies, so the breaker's minimum
+      // healthy count can be met without Spot. A `spot-with-base` entry whose
+      // base is zero is refused by `validateSpotCatalogue` for this reason as
+      // much as for the starvation one.
       circuitBreaker: { rollback: true },
       enableExecuteCommand,
       propagateTags: ecs.PropagatedTagSource.SERVICE,
+      ...(onSpot && capacity
+        ? { capacityProviderStrategies: [...spotCapacityProviderStrategies(capacity)] }
+        : {}),
     });
 
     // ── Target Group ──────────────────────────────────────────────────────────
@@ -286,7 +360,11 @@ export class EcsStack extends cdk.Stack {
         unhealthyThresholdCount: 3,
         healthyHttpCodes: '200',
       },
-      deregistrationDelay: cdk.Duration.seconds(30),
+      // Spent *before* `SIGTERM` on a Spot reclaim — ECS deregisters the target
+      // first — so on a Spot posture this and the container's `stopTimeout` come
+      // out of the same two minutes. The ELB default is 300 seconds, which
+      // exceeds the whole window on its own.
+      deregistrationDelay: cdk.Duration.seconds(deregistrationDelaySeconds),
     });
 
     // ── Auto-scaling ──────────────────────────────────────────────────────────

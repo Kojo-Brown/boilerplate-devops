@@ -89,6 +89,19 @@ export interface PreviewEnvironmentStackProps extends cdk.StackProps {
   readonly containerPort?: number;
   /** Retention for the shared preview log group (default: two weeks). */
   readonly logRetention?: logs.RetentionDays;
+  /**
+   * Associate `FARGATE_SPOT` with the preview cluster (default: true).
+   *
+   * The shared half of the preview environment owns the cluster, and a service
+   * naming a capacity provider the cluster has not associated is rejected at
+   * deploy time — so this is what makes `PreviewPrStack`'s Spot posture
+   * deployable, and the two are only correct together. Default true because
+   * previews are the one workload in this repository whose absence reaches the
+   * person who cares without an alarm: see `preview-pr-service` in
+   * `lib/spot-capacity.ts`. Set it false to put previews back on on-demand
+   * capacity, and set `capacity` on `PreviewPrStack` to match.
+   */
+  readonly spotCapacityProvider?: boolean;
   /** Enable ALB deletion protection on the shared load balancer (default: false). */
   readonly albDeletionProtection?: boolean;
 }
@@ -192,6 +205,10 @@ export class PreviewEnvironmentStack extends cdk.Stack {
       vpc: props.vpc,
       containerInsights: true,
     });
+
+    if (props.spotCapacityProvider ?? true) {
+      this.cluster.enableFargateCapacityProviders();
+    }
 
     // ── Log group ─────────────────────────────────────────────────────────────
     // One group for every preview rather than one per pull request. A log group

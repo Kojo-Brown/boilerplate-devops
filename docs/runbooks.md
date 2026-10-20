@@ -362,7 +362,89 @@ source's retention period.
 
 ---
 
-## 12. When the incident ends
+## 12. Fargate Spot took the capacity, or the drain did not fit
+
+**Alarms:** `<env>-spot-capacity-starved`, `<env>-spot-interruptions-high`,
+`<env>-spot-drain-overrun`
+**Owner:** platform-team
+**First step:** `<env>-rb-ecs-service-state` — running against desired, and
+whether a deployment is in progress
+
+Two of the eleven ECS services in this account run on Fargate Spot: staging's
+burst above its on-demand base, and the per-pull-request previews. The postures
+and the reasons the other nine do not are in
+[docs/spot.md](./spot.md#2-the-posture-of-every-service). These three alarms are
+the two ways that arrangement goes wrong.
+
+### `<env>-spot-capacity-starved` — the page
+
+The service has been running fewer tasks than it wants for fifteen consecutive
+minutes. **An interruption is not this alarm.** A reclaimed task is replaced, and
+the replacement lands within a minute or two; what this alarm says is that the
+replacement is *not landing*, which on a Spot strategy means there is no Spot
+capacity in these availability zones for this task size.
+
+1. The first step has already read the service. `runningCount` against
+   `desiredCount` is the gap; `pendingCount` above zero means ECS is still
+   trying, and zero with a gap means it has stopped.
+2. `aws ecs describe-services --cluster <env>-cluster --services <env>-service
+   --query 'services[0].events[:10]'`. A Spot shortage says so in as many words:
+   `unable to place tasks ... no Fargate Spot capacity available`.
+3. If the gap is exactly the Spot half of the strategy and the on-demand base is
+   running, the environment is degraded, not down. The fix is a capacity
+   decision, not an incident: either wait, or raise the base.
+
+**The one-line change that makes it stop:** `capacity:` on the staging
+`EcsStack` in `bin/app.ts`. Dropping to `spotWorkloadById('production-application')`
+— the on-demand-only entry — puts the service back on `FARGATE` entirely. Do
+that deliberately and in a pull request; `npm run audit:spot` checks the
+template matches the catalogue, so a console edit is reverted by the next deploy
+with nothing to show for it.
+
+**Why this alarm fires on a brand-new environment.** It treats missing data as
+breaching, because a Spot shortage shows up as an *absence* — no tasks, so no
+utilisation metrics, so nothing for an ordinary alarm to breach on. A service
+whose Container Insights task counts have never been published looks exactly the
+same, and of the two, only that one can be fixed by whoever is reading this. If
+it is red immediately after a first deploy, check that `containerInsights` is on
+for the cluster.
+
+### `<env>-spot-interruptions-high` — a ticket
+
+More reclaims in an hour than the threshold in
+`SpotInterruptionStack`. This is not an outage and should not be treated as one:
+interruptions are what the discount buys. What it means is that the tasks are
+spending a large share of their lives starting up, and the answer is a capacity
+decision made in daylight — a different task size, a different posture, or
+accepting it for a workload where starting up is cheap.
+
+`Boilerplate/Spot` has the breakdown: the same metrics are published a second
+time dimensioned by `ClusterName` and `ServiceName`, so the question "is this
+the previews or is it staging" is one graph away.
+
+### `<env>-spot-drain-overrun` — a ticket, and the one that costs data
+
+A reclaimed task took longer to shut down than its declared budget, so it was
+killed rather than drained. The budget is the target group's deregistration
+delay plus the container's `stopTimeout`, and both are spent inside the
+two-minute warning — ECS deregisters the target *before* it sends `SIGTERM`, so
+they do not overlap.
+
+1. The recorder's log group, `/aws/lambda/<env>-spot-recorder`, has one JSON line
+   per reclaim with `drainSeconds`, `boundSeconds` and the task ARN.
+2. Compare against the declared budget in `lib/spot-capacity.ts`. The usual
+   cause is not Spot at all: it is a deregistration delay raised in the console,
+   or a request handler that stopped finishing inside the grace period.
+3. `npm run audit:spot` fails on a budget that does not fit the window, so an
+   overrun means the *template* is within budget and the process is not.
+
+An overrun is the only failure here that is invisible without this stack: a task
+killed at the end of its grace period and a task that drained cleanly both end
+as a task that is gone.
+
+---
+
+## 13. When the incident ends
 
 A runbook's job finishes when the page clears. The next runbook being better
 than this one is a separate piece of work, and it happens on Thursday afternoon
@@ -384,7 +466,7 @@ incident and impossible afterwards, so the correction goes into
 
 ---
 
-## 13. Adding a runbook
+## 14. Adding a runbook
 
 1. Add a section to this file. The heading's GitHub slug is the anchor.
 2. Add an entry to `RUNBOOK_CATALOGUE` in `lib/runbooks.ts` with that anchor and
@@ -398,7 +480,7 @@ incident and impossible afterwards, so the correction goes into
 
 ---
 
-## 14. The failures, and what each one looks like
+## 15. The failures, and what each one looks like
 
 | Rule | What it catches | What it looks like without the gate |
 | --- | --- | --- |
@@ -417,7 +499,7 @@ incident and impossible afterwards, so the correction goes into
 
 ---
 
-## 15. Known gaps
+## 16. Known gaps
 
 - **Nothing here has been deployed.** No automation in this repository has run
   against a real account, so the documents are checked for shape — a single

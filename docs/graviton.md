@@ -1,6 +1,6 @@
 # Graviton / ARM on this repository
 
-Everything in here is about one question: which of this repository's 87 compute
+Everything in here is about one question: which of this repository's 88 compute
 resources can run on AWS Graviton, what each one is worth, and what is actually
 stopping the rest.
 
@@ -130,6 +130,7 @@ reason §6 exists rather than a confident sentence about Graviton being faster.
 | `dora-recorder` | lambda | 1 | repository | none | migrated | — | redeploy |
 | `feature-flag-sweep` | lambda | 1 | repository | none | migrated | — | redeploy |
 | `preview-reaper` | lambda | 1 | repository | none | migrated | — | redeploy |
+| `spot-interruption-recorder` | lambda | 1 | repository | none | migrated | — | redeploy |
 | `cdk-eks-kubectl-handler` | lambda | 2 | cdk | aws-managed | unavailable | layer-binaries-x86 | none |
 | `cdk-eks-cluster-oneventhandler` | lambda | 2 | cdk | aws-managed | unavailable | layer-binaries-x86 | none |
 | `cdk-eks-cluster-iscompletehandler` | lambda | 2 | cdk | aws-managed | unavailable | layer-binaries-x86 | none |
@@ -334,7 +335,7 @@ the OIDC provider, S3 auto-delete, the default-security-group restriction, log
 retention, and the EKS cluster and kubectl providers — and nothing in `lib/` or
 `bin/` mentions a single one.
 
-So "migrate the Lambda fleet to arm64" tops out at 32 of 58 functions, and the
+So "migrate the Lambda fleet to arm64" tops out at 33 of 59 functions, and the
 gap is invisible to anyone reading the TypeScript. Two reasons, and they are
 different:
 
@@ -367,7 +368,7 @@ not a list.
 
 The cost of those 26 is real but small: they run on deployments and on custom
 resource lifecycle events, not on request traffic. The reason they matter is
-arithmetic. "We moved our Lambdas to Graviton" is 55% true here, and nothing in
+arithmetic. "We moved our Lambdas to Graviton" is 56% true here, and nothing in
 the repository would have said so.
 
 ## 8. Where there is no arm64 to move to

@@ -340,6 +340,29 @@ jobs:
       - name: Audit processor architectures and the Graviton migration
         run: npm run audit:graviton
 
+      # Every gate above is about what a workload is or what it costs to run.
+      # This one is about whether AWS is allowed to take it away. Spot is the
+      # only cost lever here that changes what happens during an incident, and
+      # both ways it goes wrong are quiet: a capacity provider strategy added to
+      # a service that carries an objective is cheaper and perfectly healthy
+      # until the reclaim lands in the error budget, and a service with no Spot
+      # capacity available does not fail — RunTask does not place, the desired
+      # count stays unmet, and the alarms that would have caught it are
+      # utilisation alarms on tasks that do not exist. The near misses are each
+      # one property and each leaves a green build: a target group with no
+      # deregistration delay, which ELB answers with 300 seconds against a
+      # 120-second warning, so the process is killed before it is asked to stop;
+      # a container with no `stopTimeout`, where ECS's 30-second default and a
+      # deliberate 30 produce the same template; `FARGATE_SPOT` named by a
+      # service whose cluster never associated it, which CloudFormation accepts
+      # and CreateService rejects; a task-state rule with no `stopCode` filter,
+      # which counts every deployment as an interruption; and the starvation
+      # alarm's `treatMissingData` moved off `breaching`, which leaves the one
+      # alarm whose symptom is an absence ignoring absences. Runs after synth
+      # because every rule is about what synth wrote. See docs/spot.md.
+      - name: Audit the Fargate Spot posture and its interruption handling
+        run: npm run audit:spot
+
       # The Checkov job scans the synthesised CloudFormation rather than the
       # TypeScript, so the templates have to cross the job boundary.
       #

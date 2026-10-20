@@ -61,6 +61,14 @@ export interface LoadOptions {
   readonly env: Record<string, string>;
   /** Collected `console.warn` output, for the tests that assert on a log line. */
   readonly warnings?: string[];
+  /**
+   * Collected `console.log` output.
+   *
+   * Separate from `warnings` because a handler whose whole output is a
+   * structured log line — `SpotInterruptionStack`'s recorder writes one per
+   * reclaim and the runbook reads it — has nothing to assert on otherwise.
+   */
+  readonly logs?: string[];
 }
 
 export const loadInlineHandler = <T>(options: LoadOptions): T => {
@@ -76,7 +84,7 @@ export const loadInlineHandler = <T>(options: LoadOptions): T => {
   try {
     const factory = new Function('require', 'module', 'exports', 'console', options.source);
     factory(requireStub, module, module.exports, {
-      log: () => undefined,
+      log: (line: string) => options.logs?.push(line),
       warn: (line: string) => options.warnings?.push(line),
       error: () => undefined,
     });
