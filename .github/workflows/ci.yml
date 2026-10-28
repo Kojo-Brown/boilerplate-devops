@@ -363,6 +363,31 @@ jobs:
       - name: Audit the Fargate Spot posture and its interruption handling
         run: npm run audit:spot
 
+      # The gate above is about whether AWS is allowed to take capacity away.
+      # This one is about whether AWS will tell us there is too much of it, and
+      # the answer for the two services that matter most is no — which it does
+      # not say. `GetECSServiceRecommendations` returns a list, and a service
+      # excluded by its own scaling policies is simply not in it: no
+      # `NotApplicable` finding, no reason code, nothing to count. `EcsStack`
+      # target-tracks both CPU and memory, which AWS documents as
+      # disqualifying, so the application services in staging and production
+      # produce no finding at all and a sweep that totals over-provisioned
+      # services publishes a zero — the number a right-sized account publishes.
+      # The near misses are each one property and each leaves a green build: a
+      # memory scaling policy added to the blue/green service, which silently
+      # ends every recommendation for it and makes the coverage alarm red
+      # forever; an `uncovered` entry still citing a scaling policy somebody
+      # removed, so a real finding arrives marked as impossible; one
+      # `ecs:UpdateService` added to the sweeper's role, which turns a proposal
+      # into drift the next deploy reverts as quietly as it was made; the
+      # staleness alarm's `treatMissingData` moved off `breaching`, which leaves
+      # the one alarm whose symptom is absence ignoring absences; and a task
+      # size of 512 CPU with 512 MiB, which synthesises, passes Checkov, and is
+      # rejected at `RegisterTaskDefinition`. Runs after synth because every
+      # rule is about what synth wrote. See docs/right-sizing.md.
+      - name: Audit right-sizing coverage and the Compute Optimizer sweep
+        run: npm run audit:right-sizing
+
       # The Checkov job scans the synthesised CloudFormation rather than the
       # TypeScript, so the templates have to cross the job boundary.
       #

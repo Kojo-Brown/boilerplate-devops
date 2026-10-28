@@ -322,6 +322,19 @@ export const RUNBOOK_CATALOGUE: readonly RunbookDefinition[] = [
       // instrument.
       '*-spot-recorder-errors',
       '*-spot-events-undelivered',
+      // The five right-sizing alarms, all of them. Unlike every other group
+      // here this one has no environment prefix, because `RightSizingStack` is
+      // account-scoped — Compute Optimizer answers per account and region, and
+      // both environments live in one account.
+      //
+      // All five belong to this section rather than to one of their own, and the
+      // reason is this section's own sentence: each of them means a signal is
+      // reading none. An account that was never enrolled, a sweep that stopped
+      // running, and a service AWS silently excluded from recommendations all
+      // publish the same thing — zero over-provisioned services — and zero is
+      // what a right-sized account publishes. None of them is a workload
+      // failure; every one of them makes a number quoted elsewhere stale.
+      'right-sizing-*',
     ],
     summary:
       'Something that measures the platform has failed, rather than the platform itself. ' +
