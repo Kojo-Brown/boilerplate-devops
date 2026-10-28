@@ -30,6 +30,7 @@
     "audit:chaos": "ts-node tools/audit-fis-experiments.ts",
     "audit:graviton": "ts-node tools/audit-graviton.ts",
     "audit:spot": "ts-node tools/audit-spot-capacity.ts",
+    "audit:right-sizing": "ts-node tools/audit-right-sizing.ts",
     "cdk": "cdk"
   },
   "devDependencies": {

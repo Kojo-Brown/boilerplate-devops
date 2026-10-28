@@ -218,7 +218,7 @@ state transitions.
 
 **Alarms:** `*-slo-budget-reporter-errors`, `*-runbook-enricher-errors`,
 `*lead-time-unmeasurable`, `*expired-feature-flags`, `*unreadable-flag-manifest`,
-`*-game-day-*`, `*-rehearsal-overdue-*`
+`*-game-day-*`, `*-rehearsal-overdue-*`, `right-sizing-*`
 **Owner:** platform-team
 **First step (already running):** `<env>-rb-alarm-history`.
 
@@ -252,6 +252,34 @@ stale data or none, which is why they are alarmed on at all.
    During a promotion the endpoint record changes and keeps resolving; a name
    that resolves to nothing is a deleted instance, a deleted hosted zone, or a
    VPC that has lost DNS resolution, and a failover fixes none of them.
+8. **`right-sizing-not-enrolled`** means AWS Compute Optimizer has never been
+   opted in for this account. Nothing is broken and nothing has ever been
+   measured: before the opt-in every recommendation call answers
+   `OptInRequiredException`, and a sweep that swallowed it would publish zero
+   over-provisioned services — which is the number a right-sized account
+   publishes. Opting in is one console action or one `update-enrollment-status`
+   call, and it is deliberately not something this repository's automation has
+   permission to do: the opt-in creates a service-linked role in the account.
+   Allow a day or two of metric collection before reading the first findings.
+   `docs/right-sizing.md` §4.
+9. **`right-sizing-sweep-stale`** means no sweep has completed in the staleness
+   window. It is the only alarm in this section whose symptom is the *absence* of
+   a metric, which is why it treats missing data as breaching — a disabled
+   EventBridge rule, a deleted schedule or a role that lost
+   `compute-optimizer:Get*` all produce no datapoints at all, and the other four
+   right-sizing alarms go quiet with them. If this is red, read it before
+   trusting any of the others.
+10. **`right-sizing-coverage-gap`** means a service the catalogue expects a
+    finding for did not get one. This is the alarm worth understanding before it
+    fires, because an absent finding is how three different things look: a
+    service AWS silently excluded from recommendations (a step scaling policy, or
+    target tracking on both CPU and memory), a service with under 24 hours of
+    metrics, and a service that no longer exists. None of the three is
+    distinguishable from "optimised" in a count of findings, which is why the
+    sweeper iterates `lib/right-sizing.ts` rather than iterating what AWS
+    returned. The log group named by the stack's `SweeperLogGroupName` output has
+    one `right-sizing-coverage` line per entry saying which. `docs/right-sizing.md`
+    §5.
 
 ---
 

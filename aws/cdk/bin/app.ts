@@ -44,6 +44,8 @@ import { SyntheticCanaryFleet } from '../lib/synthetic-canary-probes';
 import { FailoverGameDayStack } from '../lib/failover-game-day-stack';
 import { BackupRestoreDrillStack } from '../lib/backup-restore-drill-stack';
 import { ChaosFisStack } from '../lib/chaos-fis-stack';
+import { RightSizingStack } from '../lib/right-sizing-stack';
+import { RIGHT_SIZING_WORKLOADS } from '../lib/right-sizing';
 import { RunbookStack } from '../lib/runbook-stack';
 import { SpotInterruptionStack } from '../lib/spot-interruption-stack';
 import { spotWorkloadById } from '../lib/spot-capacity';
@@ -1533,6 +1535,64 @@ new SpotInterruptionStack(app, 'SpotInterruptionStack-Staging', {
     region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
   },
   description: 'Fargate Spot interruption recorder, drain-budget measurement, and alarms',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+// ── Right-sizing: the findings, and the services that cannot produce one ─────
+// `lib/right-sizing.ts` decides what an AWS Compute Optimizer finding about each
+// of the eleven ECS services is allowed to do. This stack reads the findings
+// once a day and publishes what it got — and, which is the point, what it did
+// not get.
+//
+// Three reasons this reads as nothing going wrong when something is:
+//
+//   • **Compute Optimizer is opt-in per account.** Before the opt-in every
+//     recommendation call answers `OptInRequiredException`. A sweep that caught
+//     that would log one warning and publish zero over-provisioned services,
+//     which is the number an optimised account publishes. So enrolment is read
+//     first, alone, and `right-sizing-not-enrolled` is the alarm on it.
+//
+//   • **AWS produces no ECS recommendation for a service with target tracking on
+//     both CPU and memory.** `EcsStack` attaches exactly that, so the two
+//     application services — the most expensive compute here and the only
+//     compute a customer reaches — are structurally invisible to this item. The
+//     response does not say so: the service is simply absent from the list. The
+//     sweeper therefore iterates the catalogue rather than the findings, and
+//     `right-sizing-coverage-gap` is what a missing finding reaches.
+//
+//   • **A sweep that does not run publishes nothing**, and an alarm on a metric
+//     with no datapoints does not fire. `right-sizing-sweep-stale` is the one
+//     alarm here treating missing data as breaching, which is why the other four
+//     need not: absence has one alarm, so one cause makes one ticket.
+//
+// One stack, not one per environment, and not for the usual cost reason:
+// Compute Optimizer answers per account and region, `bin/app.ts` puts both
+// environments in one account, and a second copy would read the same findings
+// again and double every count. That is also why the alarm names carry no
+// environment prefix and the stack carries no `Environment` tag.
+//
+// The alarms go to `cloudWatchAlarmsStackProduction.alarmTopic`, which
+// `RunbookStack-Production` already enriches; a topic of its own would be one
+// `npm run audit:runbooks` fails for, correctly.
+//
+// Nothing here has permission to resize anything. Every resource in this
+// account is tagged `ManagedBy: CDK`, a change applied outside CloudFormation is
+// reverted by the next deploy, and the revert is as quiet as the change — so the
+// output is a proposal in a log line and the change is a pull request.
+//
+// `npm run audit:right-sizing` holds the templates to the catalogue. See
+// docs/right-sizing.md.
+new RightSizingStack(app, 'RightSizingStack', {
+  alarmTopic: cloudWatchAlarmsStackProduction.alarmTopic,
+  // Every entry, including the three the catalogue declares uncovered: without
+  // them in the sweeper's hands a missing finding is just a missing finding, and
+  // the coverage gap is the metric this stack exists to publish.
+  workloads: RIGHT_SIZING_WORKLOADS,
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Compute Optimizer right-sizing sweep, proposals, and coverage alarms',
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
 

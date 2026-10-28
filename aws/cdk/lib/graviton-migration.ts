@@ -467,7 +467,7 @@ export interface Workload {
   readonly note?: string;
 }
 
-/** The 18 inline Node handlers this repository writes, all of them arm64. */
+/** The 20 inline Node handlers this repository writes, all of them arm64. */
 const REPOSITORY_LAMBDAS: readonly {
   readonly id: string;
   readonly path: string;
@@ -492,6 +492,7 @@ const REPOSITORY_LAMBDAS: readonly {
   { id: 'feature-flag-sweep', path: 'FeatureFlagSweepFunction/Resource', copies: 1 },
   { id: 'preview-reaper', path: 'PreviewReaperFunction/Resource', copies: 1 },
   { id: 'spot-interruption-recorder', path: 'SpotRecorder/Resource', copies: 1 },
+  { id: 'right-sizing-sweeper', path: 'RightSizingSweeper/Resource', copies: 1 },
 ];
 
 /**

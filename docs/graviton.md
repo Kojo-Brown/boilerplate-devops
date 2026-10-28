@@ -131,6 +131,7 @@ reason §6 exists rather than a confident sentence about Graviton being faster.
 | `feature-flag-sweep` | lambda | 1 | repository | none | migrated | — | redeploy |
 | `preview-reaper` | lambda | 1 | repository | none | migrated | — | redeploy |
 | `spot-interruption-recorder` | lambda | 1 | repository | none | migrated | — | redeploy |
+| `right-sizing-sweeper` | lambda | 1 | repository | none | migrated | — | redeploy |
 | `cdk-eks-kubectl-handler` | lambda | 2 | cdk | aws-managed | unavailable | layer-binaries-x86 | none |
 | `cdk-eks-cluster-oneventhandler` | lambda | 2 | cdk | aws-managed | unavailable | layer-binaries-x86 | none |
 | `cdk-eks-cluster-iscompletehandler` | lambda | 2 | cdk | aws-managed | unavailable | layer-binaries-x86 | none |
