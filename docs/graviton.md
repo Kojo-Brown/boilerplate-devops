@@ -132,6 +132,7 @@ reason §6 exists rather than a confident sentence about Graviton being faster.
 | `preview-reaper` | lambda | 1 | repository | none | migrated | — | redeploy |
 | `spot-interruption-recorder` | lambda | 1 | repository | none | migrated | — | redeploy |
 | `right-sizing-sweeper` | lambda | 1 | repository | none | migrated | — | redeploy |
+| `cost-allocation-reporter` | lambda | 1 | repository | none | migrated | — | redeploy |
 | `cdk-eks-kubectl-handler` | lambda | 2 | cdk | aws-managed | unavailable | layer-binaries-x86 | none |
 | `cdk-eks-cluster-oneventhandler` | lambda | 2 | cdk | aws-managed | unavailable | layer-binaries-x86 | none |
 | `cdk-eks-cluster-iscompletehandler` | lambda | 2 | cdk | aws-managed | unavailable | layer-binaries-x86 | none |
@@ -329,14 +330,14 @@ section honest.
 
 ## 7. The half of the Lambda fleet nobody names
 
-`cdk.out` holds **58** `AWS::Lambda::Function` resources. This repository writes
-**32** of them. The other 26 are created by the CDK framework — custom-resource
+`cdk.out` holds **61** `AWS::Lambda::Function` resources. This repository writes
+**35** of them. The other 26 are created by the CDK framework — custom-resource
 providers, the provider framework's `onEvent`/`isComplete`/`onTimeout` handlers,
 the OIDC provider, S3 auto-delete, the default-security-group restriction, log
 retention, and the EKS cluster and kubectl providers — and nothing in `lib/` or
 `bin/` mentions a single one.
 
-So "migrate the Lambda fleet to arm64" tops out at 33 of 59 functions, and the
+So "migrate the Lambda fleet to arm64" tops out at 35 of 61 functions, and the
 gap is invisible to anyone reading the TypeScript. Two reasons, and they are
 different:
 

@@ -335,6 +335,16 @@ export const RUNBOOK_CATALOGUE: readonly RunbookDefinition[] = [
       // what a right-sized account publishes. None of them is a workload
       // failure; every one of them makes a number quoted elsewhere stale.
       'right-sizing-*',
+      // The cost-allocation alarms, all of them, and for the same reason as the
+      // right-sizing ones above: an account-scoped stack, no environment
+      // prefix, and every alarm meaning a number quoted elsewhere has gone
+      // stale rather than a workload having failed. That includes the
+      // unattributed-share alarm, which is the least obviously an instrument
+      // and the most clearly covered by this section's own sentence — a rising
+      // untagged share means the attributed figures on the dashboard are
+      // increasingly not the bill, and a cost review reading them would not
+      // notice.
+      'cost-allocation-*',
     ],
     summary:
       'Something that measures the platform has failed, rather than the platform itself. ' +

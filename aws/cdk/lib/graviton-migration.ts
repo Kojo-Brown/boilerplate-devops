@@ -467,7 +467,7 @@ export interface Workload {
   readonly note?: string;
 }
 
-/** The 20 inline Node handlers this repository writes, all of them arm64. */
+/** The 21 inline Node handlers this repository writes, all of them arm64. */
 const REPOSITORY_LAMBDAS: readonly {
   readonly id: string;
   readonly path: string;
@@ -493,15 +493,16 @@ const REPOSITORY_LAMBDAS: readonly {
   { id: 'preview-reaper', path: 'PreviewReaperFunction/Resource', copies: 1 },
   { id: 'spot-interruption-recorder', path: 'SpotRecorder/Resource', copies: 1 },
   { id: 'right-sizing-sweeper', path: 'RightSizingSweeper/Resource', copies: 1 },
+  { id: 'cost-allocation-reporter', path: 'CostAllocationReporter/Resource', copies: 1 },
 ];
 
 /**
  * The functions the CDK framework creates on this repository's behalf.
  *
- * This group is the finding. Twenty-six of the fifty-eight `AWS::Lambda::Function`
+ * This group is the finding. Twenty-six of the sixty-one `AWS::Lambda::Function`
  * resources in `cdk.out` are here, nothing in `lib/` or `bin/` names any of
  * them, and `architecture` is not a property any of their constructs accepts —
- * so "migrate the Lambda fleet to arm64" tops out at 32 of 58 functions, and the
+ * so "migrate the Lambda fleet to arm64" tops out at 35 of 61 functions, and the
  * remainder is invisible to anyone reading the TypeScript. Six of them carry
  * layers whose binaries are ELF x86-64, measured by
  * `tools/audit-graviton.ts`'s `layer-binaries-x86` rule.

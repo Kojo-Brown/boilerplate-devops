@@ -50,10 +50,11 @@ governed_tag_types := {
 # `Stack` says which stack would recreate it. Together they are what makes an
 # orphan identifiable.
 #
-# `Environment` is deliberately *not* required. Four stacks here are
+# `Environment` is deliberately *not* required. Five stacks here are
 # account-scoped rather than environment-scoped — `AppConfigStack`,
-# `DoraMetricsStack`, `FeatureFlagLifecycleStack`, `RightSizingStack` — and carry
-# no `Environment` tag because there is no true value to give them.
+# `DoraMetricsStack`, `FeatureFlagLifecycleStack`, `RightSizingStack`,
+# `CostAllocationStack` — and carry no `Environment` tag because there is no
+# true value to give them.
 # (`RightSizingStack` is the clearest case: AWS Compute Optimizer answers per
 # account and region, so one sweep covers both environments and a second copy
 # would double every count it publishes.) Requiring one would mean
