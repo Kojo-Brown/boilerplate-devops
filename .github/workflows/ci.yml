@@ -388,6 +388,25 @@ jobs:
       - name: Audit right-sizing coverage and the Compute Optimizer sweep
         run: npm run audit:right-sizing
 
+      # The tag catalogue, the two Organizations documents it generates, the
+      # rego pack that governs a different population, and the stack that
+      # measures whether any of it worked. Nothing in this repository attaches
+      # an SCP — that happens in the management account — so the checked-in JSON
+      # is the artefact somebody copies, and a hand-edited copy is the quiet
+      # failure: the file still attaches, the catalogue still validates, and the
+      # two simply stop describing the same organization. The near misses are
+      # each one property and each leaves a green build: two required tag keys
+      # merged into one `Null` block, which reads as "require both" and enforces
+      # "require at least one"; a required key added to the rego pack and not to
+      # the SCP, leaving the console and every other pipeline ungoverned; an
+      # environment spelling added to one of the two copies of that set; a
+      # resource type governed by the rego pack with no create action behind it
+      # and no reason recorded for why it cannot have one; and an action list
+      # grown past the 5,120-byte cap, which fails at `AttachPolicy` in an
+      # account this pull request cannot see. See docs/cost-allocation.md.
+      - name: Audit the tagging policy and its cost-allocation dashboard
+        run: npm run audit:tagging
+
       # The Checkov job scans the synthesised CloudFormation rather than the
       # TypeScript, so the templates have to cross the job boundary.
       #

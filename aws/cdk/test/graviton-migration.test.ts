@@ -115,23 +115,23 @@ describe('the shipped catalogue', () => {
     }
   });
 
-  it('accounts for all 89 compute resources, split 42 / 11 / 36', () => {
+  it('accounts for all 90 compute resources, split 43 / 11 / 36', () => {
     const totals = verdictTotals();
-    expect(totals).toEqual({ migrated: 42, blocked: 11, unavailable: 36 });
+    expect(totals).toEqual({ migrated: 43, blocked: 11, unavailable: 36 });
     expect(totals.migrated + totals.blocked + totals.unavailable).toBe(
       COMPUTE_WORKLOADS.reduce((sum, entry) => sum + entry.expectedResources, 0),
     );
   });
 
   it('puts more Lambda functions beyond reach than this repository writes by hand', () => {
-    // 34 ours, 26 the framework's. The point of the number: "we moved our
+    // 35 ours, 26 the framework's. The point of the number: "we moved our
     // Lambdas to Graviton" is 57% true here, and nothing but this table says so.
     const lambdas = COMPUTE_WORKLOADS.filter((entry) => entry.kind === 'lambda');
     const count = (owner: Workload['owner']) =>
       lambdas
         .filter((entry) => entry.owner === owner)
         .reduce((sum, entry) => sum + entry.expectedResources, 0);
-    expect(count('repository')).toBe(34);
+    expect(count('repository')).toBe(35);
     expect(count('cdk')).toBe(26);
   });
 

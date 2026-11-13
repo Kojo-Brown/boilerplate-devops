@@ -1,0 +1,54 @@
+{
+  "tags": {
+    "ManagedBy": {
+      "tag_key": {
+        "@@assign": "ManagedBy"
+      },
+      "tag_value": {
+        "@@assign": [
+          "CDK",
+          "Terraform",
+          "Console-BreakGlass"
+        ]
+      }
+    },
+    "Stack": {
+      "tag_key": {
+        "@@assign": "Stack"
+      }
+    },
+    "Environment": {
+      "tag_key": {
+        "@@assign": "Environment"
+      },
+      "tag_value": {
+        "@@assign": [
+          "staging",
+          "production",
+          "preview"
+        ]
+      }
+    },
+    "Project": {
+      "tag_key": {
+        "@@assign": "Project"
+      },
+      "tag_value": {
+        "@@assign": [
+          "boilerplate"
+        ]
+      }
+    },
+    "CostCenter": {
+      "tag_key": {
+        "@@assign": "CostCenter"
+      },
+      "tag_value": {
+        "@@assign": [
+          "engineering",
+          "platform"
+        ]
+      }
+    }
+  }
+}

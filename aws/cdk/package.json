@@ -31,6 +31,8 @@
     "audit:graviton": "ts-node tools/audit-graviton.ts",
     "audit:spot": "ts-node tools/audit-spot-capacity.ts",
     "audit:right-sizing": "ts-node tools/audit-right-sizing.ts",
+    "audit:tagging": "ts-node tools/audit-tagging-policy.ts",
+    "policy:organizations": "ts-node tools/generate-organizations-policies.ts",
     "cdk": "cdk"
   },
   "devDependencies": {

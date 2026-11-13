@@ -1,0 +1,163 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyCreateWithoutManagedBy",
+      "Effect": "Deny",
+      "Action": [
+        "autoscaling:CreateAutoScalingGroup",
+        "dynamodb:CreateTable",
+        "ec2:CreateSecurityGroup",
+        "ec2:CreateVolume",
+        "ec2:CreateVpc",
+        "ecs:CreateCluster",
+        "ecs:CreateService",
+        "ecs:RegisterTaskDefinition",
+        "eks:CreateCluster",
+        "elasticache:CreateReplicationGroup",
+        "elasticloadbalancing:CreateLoadBalancer",
+        "kms:CreateKey",
+        "lambda:CreateFunction",
+        "rds:CreateDBCluster",
+        "rds:CreateDBInstance",
+        "sns:CreateTopic",
+        "sqs:CreateQueue"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "Null": {
+          "aws:RequestTag/ManagedBy": "true"
+        }
+      }
+    },
+    {
+      "Sid": "DenyCreateWithoutStack",
+      "Effect": "Deny",
+      "Action": [
+        "autoscaling:CreateAutoScalingGroup",
+        "dynamodb:CreateTable",
+        "ec2:CreateSecurityGroup",
+        "ec2:CreateVolume",
+        "ec2:CreateVpc",
+        "ecs:CreateCluster",
+        "ecs:CreateService",
+        "ecs:RegisterTaskDefinition",
+        "eks:CreateCluster",
+        "elasticache:CreateReplicationGroup",
+        "elasticloadbalancing:CreateLoadBalancer",
+        "kms:CreateKey",
+        "lambda:CreateFunction",
+        "rds:CreateDBCluster",
+        "rds:CreateDBInstance",
+        "sns:CreateTopic",
+        "sqs:CreateQueue"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "Null": {
+          "aws:RequestTag/Stack": "true"
+        }
+      }
+    },
+    {
+      "Sid": "DenyManagedByOutsideAllowedValues",
+      "Effect": "Deny",
+      "Action": [
+        "autoscaling:CreateAutoScalingGroup",
+        "dynamodb:CreateTable",
+        "ec2:CreateSecurityGroup",
+        "ec2:CreateVolume",
+        "ec2:CreateVpc",
+        "ecs:CreateCluster",
+        "ecs:CreateService",
+        "ecs:RegisterTaskDefinition",
+        "eks:CreateCluster",
+        "elasticache:CreateReplicationGroup",
+        "elasticloadbalancing:CreateLoadBalancer",
+        "kms:CreateKey",
+        "lambda:CreateFunction",
+        "rds:CreateDBCluster",
+        "rds:CreateDBInstance",
+        "sns:CreateTopic",
+        "sqs:CreateQueue"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringNotEqualsIfExists": {
+          "aws:RequestTag/ManagedBy": [
+            "CDK",
+            "Terraform",
+            "Console-BreakGlass"
+          ]
+        },
+        "Null": {
+          "aws:RequestTag/ManagedBy": "false"
+        }
+      }
+    },
+    {
+      "Sid": "DenyEnvironmentOutsideAllowedValues",
+      "Effect": "Deny",
+      "Action": [
+        "autoscaling:CreateAutoScalingGroup",
+        "dynamodb:CreateTable",
+        "ec2:CreateSecurityGroup",
+        "ec2:CreateVolume",
+        "ec2:CreateVpc",
+        "ecs:CreateCluster",
+        "ecs:CreateService",
+        "ecs:RegisterTaskDefinition",
+        "eks:CreateCluster",
+        "elasticache:CreateReplicationGroup",
+        "elasticloadbalancing:CreateLoadBalancer",
+        "kms:CreateKey",
+        "lambda:CreateFunction",
+        "rds:CreateDBCluster",
+        "rds:CreateDBInstance",
+        "sns:CreateTopic",
+        "sqs:CreateQueue"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringNotEqualsIfExists": {
+          "aws:RequestTag/Environment": [
+            "staging",
+            "production",
+            "preview"
+          ]
+        },
+        "Null": {
+          "aws:RequestTag/Environment": "false"
+        }
+      }
+    },
+    {
+      "Sid": "DenyRemovalOfGovernedTags",
+      "Effect": "Deny",
+      "Action": [
+        "autoscaling:DeleteTags",
+        "dynamodb:UntagResource",
+        "ec2:DeleteTags",
+        "ecs:UntagResource",
+        "eks:UntagResource",
+        "elasticache:RemoveTagsFromResource",
+        "elasticloadbalancing:RemoveTags",
+        "kms:UntagResource",
+        "lambda:UntagResource",
+        "rds:RemoveTagsFromResource",
+        "sns:UntagResource",
+        "sqs:UntagQueue"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "ForAnyValue:StringEquals": {
+          "aws:TagKeys": [
+            "Environment",
+            "ManagedBy",
+            "Stack"
+          ]
+        }
+      }
+    }
+  ]
+}

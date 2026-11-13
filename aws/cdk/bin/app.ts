@@ -25,6 +25,7 @@ import { SloBurnRateRollbackStack } from '../lib/slo-burn-rate-rollback-stack';
 import { SloStack } from '../lib/slo-stack';
 import { requireSlo, significanceFloorEvents } from '../lib/slo-definitions';
 import { CostAnomalyStack } from '../lib/cost-anomaly-stack';
+import { CostAllocationStack } from '../lib/cost-allocation-stack';
 import { SecurityHubStack } from '../lib/security-hub-stack';
 import { WafStack } from '../lib/waf-stack';
 import { StaticSiteStack } from '../lib/static-site-stack';
@@ -1593,6 +1594,62 @@ new RightSizingStack(app, 'RightSizingStack', {
     region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
   },
   description: 'Compute Optimizer right-sizing sweep, proposals, and coverage alarms',
+  tags: { Project: 'boilerplate', CostCenter: 'engineering' },
+});
+
+// ── Cost allocation: the tagging policy, and whether it actually worked ──────
+// `lib/tagging-policy.ts` holds the tag catalogue and generates the two
+// documents in `policy/organizations/`. Neither is deployed from here — an SCP
+// and a tag policy are attached in the organization's *management* account, not
+// by `cdk deploy` into a member account — so this stack is the half that can be
+// deployed: the measurement of whether the enforcement is reaching anything.
+//
+// It is a measurement and not a report because every way the enforcement can
+// fail produces a dashboard that looks fine:
+//
+//   • **A tag key nobody activated in Billing.** Cost Explorer accepts the
+//     grouping and returns no groups, so every series renders flat at zero,
+//     which is what a tag nobody spends against looks like. Activation is read
+//     first and alone — the same shape as the Compute Optimizer enrolment read
+//     above — and `cost-allocation-tag-not-activated-*` is the alarm on it.
+//
+//   • **Activation is not retroactive.** A key activated today has no data
+//     before today and never will. A correct, empty widget and a broken one are
+//     the same picture, which is why the dashboard's text widget leads with it.
+//
+//   • **The untagged bucket going missing.** Cost Explorer reports spend with no
+//     value for the grouping tag as the group `Environment$` — key, separator,
+//     nothing. A reporter that read that as a parse failure would publish a
+//     dashboard on which 100% of cost is attributed. It is the one series here
+//     that is supposed to shrink, so it is its own metric and its own alarm.
+//
+//   • **A value nobody declared.** A CloudWatch widget names its dimensions up
+//     front, so spend tagged `Environment=Prod` would appear in no series *and*
+//     in no untagged bucket — the chart would stop summing to the bill without
+//     anything looking wrong. `UnexpectedTagValue` is that count.
+//
+// The untagged share will never be nought and the alarm does not ask it to be:
+// tax, support and most data transfer are not attached to a taggable resource,
+// five account-scoped stacks here carry no `Environment` tag on purpose, and an
+// SCP never applies to the organization's management account. 15% is the
+// headroom those three need together.
+//
+// One stack, not one per environment: Cost Explorer answers per account, and a
+// second copy would pay for a second set of queries to return the same figures.
+// That is also why this stack carries no `Environment` tag — and why it is
+// itself a documented contributor to the untagged slice it draws.
+//
+// `ce:GetCostAndUsage` is billed per request and this makes one per activated
+// tag key per run — three a day here. `npm run audit:tagging` holds the
+// catalogue, the two generated documents, the rego pack and this wiring
+// together. See docs/cost-allocation.md.
+new CostAllocationStack(app, 'CostAllocationStack', {
+  alarmTopic: cloudWatchAlarmsStackProduction.alarmTopic,
+  env: {
+    account: process.env.CDK_DEFAULT_ACCOUNT,
+    region: process.env.CDK_DEFAULT_REGION ?? 'us-east-1',
+  },
+  description: 'Cost allocation tag coverage dashboard, activation checks, and untagged-share alarms',
   tags: { Project: 'boilerplate', CostCenter: 'engineering' },
 });
 
